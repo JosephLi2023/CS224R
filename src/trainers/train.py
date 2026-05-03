@@ -28,14 +28,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _pick_webshop_action(policy, state) -> str:
-    idx = policy.sample_action()
-    valid_actions = getattr(state, "valid_actions", [])
-    if valid_actions:
-        return str(valid_actions[idx % len(valid_actions)])
-    return "search[noop]"
-
-
 def collect_batch_toy(env, policy, batch_size: int, n_actions: int) -> tuple[list[float], list[float], float]:
     action_counts = [0.0 for _ in range(n_actions)]
     action_return_sum = [0.0 for _ in range(n_actions)]
@@ -68,7 +60,7 @@ def collect_batch_toy(env, policy, batch_size: int, n_actions: int) -> tuple[lis
     return action_counts, action_returns, avg_batch_return
 
 
-def collect_batch_webshop(env, policy, batch_size: int, n_actions: int) -> tuple[list[float], list[float], float]:
+def collect_batch_text(env, policy, batch_size: int, n_actions: int, fallback: str) -> tuple[list[float], list[float], float]:
     action_counts = [0.0 for _ in range(n_actions)]
     action_return_sum = [0.0 for _ in range(n_actions)]
     batch_episode_returns: list[float] = []
@@ -78,8 +70,7 @@ def collect_batch_webshop(env, policy, batch_size: int, n_actions: int) -> tuple
         done = False
         total = 0.0
         while not done:
-            action_idx = policy.sample_action()
-            action_cmd = _pick_webshop_action(policy=policy, state=state)
+            action_idx, action_cmd = policy.sample_text_action(state=state, fallback=fallback)
             state, reward, done, _ = env.step(action_cmd)
             action_counts[action_idx] += 1.0
             action_return_sum[action_idx] += reward
@@ -120,8 +111,8 @@ def main() -> None:
 
     env = make_env(cfg["env"], seed=seed)
 
-    # For text envs we keep a fixed policy output space and map indices to valid actions.
-    n_actions = int(cfg["env"].get("n_actions", 16 if env_name == "webshop" else cfg["env"]["n_actions"]))
+    text_envs = {"webshop", "alfworld"}
+    n_actions = int(cfg["env"].get("n_actions", 16 if env_name in text_envs else cfg["env"]["n_actions"]))
 
     if algorithm == "baseline":
         policy = SoftmaxPolicy(n_actions=n_actions, seed=seed)
@@ -154,12 +145,14 @@ def main() -> None:
     eval_log = []
 
     for episode in range(start_episode, total_episodes + 1):
-        if env_name == "webshop":
-            action_counts, action_returns, batch_return = collect_batch_webshop(
+        if env_name in text_envs:
+            fallback = "search[noop]" if env_name == "webshop" else "look"
+            action_counts, action_returns, batch_return = collect_batch_text(
                 env=env,
                 policy=policy,
                 batch_size=batch_size,
                 n_actions=n_actions,
+                fallback=fallback,
             )
         else:
             action_counts, action_returns, batch_return = collect_batch_toy(

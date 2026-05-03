@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import random
+from typing import Any
 
 
 def _softmax(logits: list[float]) -> list[float]:
@@ -38,6 +39,20 @@ class SoftmaxPolicy:
                 best = i
                 best_val = self.logits[i]
         return best
+
+    def sample_text_action(self, state: Any, fallback: str) -> tuple[int, str]:
+        idx = self.sample_action()
+        valid_actions = getattr(state, "valid_actions", [])
+        if valid_actions:
+            return idx, str(valid_actions[idx % len(valid_actions)])
+        return idx, fallback
+
+    def greedy_text_action(self, state: Any, fallback: str) -> tuple[int, str]:
+        idx = self.greedy_action()
+        valid_actions = getattr(state, "valid_actions", [])
+        if valid_actions:
+            return idx, str(valid_actions[idx % len(valid_actions)])
+        return idx, fallback
 
     def update(self, action_counts: list[float], action_returns: list[float], lr: float) -> None:
         # REINFORCE-style bandit surrogate update over averaged batch returns.

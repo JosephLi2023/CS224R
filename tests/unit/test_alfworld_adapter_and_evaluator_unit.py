@@ -84,15 +84,21 @@ class _EvalPolicy:
     def __init__(self) -> None:
         self.greedy_calls = 0
 
-    def greedy_action(self) -> int:
+    def greedy_text_action(self, state, fallback: str) -> tuple[int, str]:
         self.greedy_calls += 1
-        return 1
+        valid_actions = getattr(state, "valid_actions", [])
+        if valid_actions:
+            return 1, valid_actions[1]
+        return 0, fallback
 
-    def sample_action(self) -> int:
-        return 0
+    def sample_text_action(self, state, fallback: str) -> tuple[int, str]:
+        valid_actions = getattr(state, "valid_actions", [])
+        if valid_actions:
+            return 0, valid_actions[0]
+        return 0, fallback
 
 
-class TestEvaluatorWebShop(unittest.TestCase):
+class TestEvaluatorTextEnvs(unittest.TestCase):
     def test_evaluate_policy_uses_text_actions_for_webshop(self) -> None:
         env = _EvalWebShopEnv()
         policy = _EvalPolicy()
@@ -102,6 +108,15 @@ class TestEvaluatorWebShop(unittest.TestCase):
         self.assertEqual(result.avg_return, 2.0)
         self.assertTrue(all(a == "search[b]" for a in env.actions_seen))
         self.assertGreater(policy.greedy_calls, 0)
+
+    def test_evaluate_policy_uses_text_actions_for_alfworld(self) -> None:
+        env = _EvalWebShopEnv()
+        policy = _EvalPolicy()
+
+        result = evaluate_policy(env=env, policy=policy, episodes=1, env_name="alfworld", greedy=True)
+
+        self.assertEqual(result.avg_return, 2.0)
+        self.assertEqual(env.actions_seen, ["search[b]", "search[b]"])
 
 
 if __name__ == "__main__":
