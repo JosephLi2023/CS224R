@@ -144,7 +144,12 @@ class WebShopAdapter:
         return valid_actions[action]
 
     def reset(self, **kwargs: Any) -> WebShopState:
+        """Reset the env. Maps collector's `task_id=<int>` → WebShop's `session`
+        kwarg (which seeds goal selection); absorbs other unknown kwargs."""
         self._steps = 0
+        if "task_id" in kwargs:
+            session = kwargs.pop("task_id")
+            kwargs.setdefault("session", session)
         raw_obs, raw_info = self._normalize_reset(self._env.reset(**kwargs))
         state = self._make_state(raw_obs, raw_info)
         self._last_state = state
