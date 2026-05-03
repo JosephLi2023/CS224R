@@ -1,0 +1,70 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- Test / lint / type-check caches ---
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# --- Editor / IDE / OS ---
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- Project artifacts ---
+# Large run outputs are stored on the Modal Volume, not in git.
+experiments/manifests/
+*.sqlite
+*.sqlite3
+*.db
+
+# Local secrets and Modal token (never commit)
+.env
+.env.*
+!.env.example
+.modal.toml
+
+# Build/runtime caches downloaded by HF / Torch / vLLM
+.cache/
+hf_cache/
+.huggingface/
+
+# Reports working files (compile artifacts, not sources)
+reports/**/*.aux
+reports/**/*.log
+reports/**/*.out
+reports/**/*.toc
+reports/**/*.fdb_latexmk
+reports/**/*.fls
+reports/**/*.synctex.gz
+reports/**/build/
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# --- Local-only docs (kept out of the repo) ---
+# Plan files live in ~/.llms/plans/; the canonical copy is not tracked here.
+*.plan.md
+# Internal roadmap doc; tracked locally only.
+MEDIUM_FIXES.md

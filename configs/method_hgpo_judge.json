@@ -28,7 +28,14 @@
     "decomposer": "judge"
   },
   "judge": {
-    "backend": "openai",
+    "backend": "vllm",
+    "vllm": {
+      "endpoint": "https://REPLACE-WITH-MODAL-URL/score_turns",
+      "model": "qwen2.5-7b-instruct",
+      "timeout_s": 60.0,
+      "max_concurrency": 4,
+      "api_token": ""
+    },
     "openai": {
       "model": "gpt-4o-mini",
       "max_retries": 3,
@@ -47,5 +54,5 @@
   "logging": {
     "print_every": 10
   },
-  "_notes": "H-GRPO Method A: LLM-as-Judge via JudgeBackend. Default backend = OpenAI gpt-4o-mini per proposal §3.2. To switch to self-hosted Qwen, replace the judge block with the contents of configs/judge_qwen7b.json."
+  "_notes": "H-GRPO Method A: LLM-as-Judge via JudgeBackend. Currently defaulting to backend=vllm because no OpenAI API key is provisioned. Once the OPENAI_API_KEY Modal Secret is created, flip 'backend' to 'openai' to match the proposal §3.2 default."
 }
