@@ -1,0 +1,9 @@
+{
+  "env": {
+    "name": "toy_bandit",
+    "n_actions": 8,
+    "episode_length": 40,
+    "reward_noise_std": 0.05,
+    "action_means": [0.10, 0.20, 0.15, 0.35, 0.30, 0.50, 0.45, 0.40]
+  }
+}

@@ -1,0 +1,2 @@
+# Intentionally minimal scaffold dependencies.
+# Current code path uses Python standard library only.

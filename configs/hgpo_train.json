@@ -1,0 +1,25 @@
+{
+  "run": {
+    "name": "hgpo_toy",
+    "output_dir": "experiments/manifests",
+    "seed": 11
+  },
+  "train": {
+    "algorithm": "hgpo",
+    "total_episodes": 300,
+    "batch_size": 20,
+    "learning_rate": 0.08,
+    "checkpoint_every": 50,
+    "eval_every": 50
+  },
+  "hgpo": {
+    "groups": {
+      "0": [0, 1, 2, 3],
+      "1": [4, 5, 6, 7]
+    },
+    "group_regularization_alpha": 0.10
+  },
+  "logging": {
+    "print_every": 20
+  }
+}

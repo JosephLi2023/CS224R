@@ -1,0 +1,15 @@
+run:
+  name: baseline_toy
+  output_dir: experiments/manifests
+  seed: 7
+
+train:
+  algorithm: baseline
+  total_episodes: 300
+  batch_size: 20
+  learning_rate: 0.08
+  checkpoint_every: 50
+  eval_every: 50
+
+logging:
+  print_every: 20

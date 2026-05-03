@@ -1,0 +1,38 @@
+{
+  "env": {
+    "action_means": [
+      0.1,
+      0.2,
+      0.15,
+      0.35,
+      0.3,
+      0.5,
+      0.45,
+      0.4
+    ],
+    "episode_length": 40,
+    "n_actions": 8,
+    "name": "toy_bandit",
+    "reward_noise_std": 0.05
+  },
+  "eval": {
+    "episodes": 50,
+    "greedy": true
+  },
+  "logging": {
+    "print_every": 20
+  },
+  "run": {
+    "name": "baseline_toy",
+    "output_dir": "experiments/manifests",
+    "seed": 7
+  },
+  "train": {
+    "algorithm": "baseline",
+    "batch_size": 20,
+    "checkpoint_every": 50,
+    "eval_every": 50,
+    "learning_rate": 0.08,
+    "total_episodes": 300
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "env": {
+    "name": "alfworld",
+    "max_steps": 40,
+    "observation_mode": "text",
+    "task_split": "train"
+  }
+}

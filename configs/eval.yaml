@@ -1,0 +1,3 @@
+eval:
+  episodes: 50
+  greedy: true
