@@ -37,6 +37,7 @@ class OpenAIJudge:
         )
 
     def score_turns(self, request: JudgeRequest) -> list[TurnScore]:
+        del request  # implementation lands Day 10; signature must match JudgeBackend protocol
         self._ensure_client()
         # TODO Day 10:
         #   1. Render prompt via src.judge.prompts.render_prompt(request).
@@ -47,5 +48,6 @@ class OpenAIJudge:
         raise NotImplementedError("OpenAIJudge.score_turns: implement on Day 10.")
 
     async def score_turns_async(self, request: JudgeRequest) -> list[TurnScore]:
+        del request  # implementation lands Day 11; signature must match JudgeBackend protocol
         # TODO: use openai.AsyncOpenAI; gate concurrency with asyncio.Semaphore(max_concurrency).
         raise NotImplementedError("OpenAIJudge.score_turns_async: implement on Day 11.")
