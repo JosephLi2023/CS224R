@@ -61,8 +61,10 @@ image: modal.Image = (
     # Expose /workspace on PYTHONPATH so `from src.* import ...` and
     # `from infra.* import ...` both work inside the container (Modal CLI
     # copies the entrypoint file to /root/ so we can't rely on the file's
-    # parent dir). Must come BEFORE add_local_dir per Modal's image rules.
-    .env({"PYTHONPATH": "/workspace"})
+    # parent dir). Also point HuggingFace's cache at the shared Volume so
+    # Qwen2.5-1.5B downloads (~3 GB) survive container restarts. Must come
+    # BEFORE add_local_dir per Modal's image rules.
+    .env({"PYTHONPATH": "/workspace", "HF_HOME": "/vol/hf_cache"})
     # add_local_* must be the last step in the image chain.
     .add_local_dir(
         local_path=".",
