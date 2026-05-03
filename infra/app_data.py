@@ -245,8 +245,40 @@ def main(action: str = "verify", small: bool = True) -> None:
         result = verify_webshop_data.remote()
     elif action == "show_setup":
         result = show_setup_sh.remote()
+    elif action == "show_layout":
+        result = show_webshop_layout.remote()
     else:
-        raise ValueError(f"Unknown action: {action!r} (expected 'download'/'verify'/'show_setup')")
+        raise ValueError(f"Unknown action: {action!r} (expected 'download'/'verify'/'show_setup'/'show_layout')")
 
     import json as _json
     print(_json.dumps(result, indent=2, default=str))
+
+
+@app.function(image=data_image, volumes={VOLUME_MOUNT: volume}, timeout=10 * 60)
+def show_webshop_layout() -> dict:
+    """Inspect /vol/code/webshop layout + requirements.txt for Track B."""
+    import os
+    base = WEBSHOP_REPO_DIR
+    out = {"base": base, "exists": os.path.isdir(base)}
+    if not out["exists"]:
+        return out
+    out["top_level"] = sorted(os.listdir(base))
+    req = os.path.join(base, "requirements.txt")
+    if os.path.isfile(req):
+        with open(req) as f:
+            out["requirements_txt"] = f.read()
+    se = os.path.join(base, "search_engine")
+    if os.path.isdir(se):
+        out["search_engine"] = sorted(os.listdir(se))
+        for fname in ("convert_product_file_format.py", "run_indexing.sh"):
+            p = os.path.join(se, fname)
+            if os.path.isfile(p):
+                with open(p) as f:
+                    out[f"se_{fname}"] = f.read()[:2000]
+    pkg = os.path.join(base, "web_agent_site")
+    if os.path.isdir(pkg):
+        out["web_agent_site"] = sorted(os.listdir(pkg))
+        envs = os.path.join(pkg, "envs")
+        if os.path.isdir(envs):
+            out["web_agent_site_envs"] = sorted(os.listdir(envs))
+    return out

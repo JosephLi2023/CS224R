@@ -46,9 +46,24 @@ class WebShopAdapter:
         """
         Build a WebShop env instance from common install layouts.
 
-        Supports the canonical package path from public WebShop repos.
+        Tries the canonical upstream package path `web_agent_site.envs.web_agent_text_env`,
+        then the legacy alias `webshop.envs.web_agent_site_env` as a fallback.
         """
         import_error: Exception | None = None
+        try:
+            from importlib import import_module
+
+            module = import_module("web_agent_site.envs.web_agent_text_env")
+            env_cls = getattr(module, "WebAgentTextEnv")
+            return env_cls(
+                observation_mode=self.observation_mode,
+                **self.env_kwargs,
+            )
+        except Exception as exc:  # pragma: no cover - depends on install
+            import_error = exc
+
+        # Legacy fallback in case a user installs an older WebShop fork that
+        # remapped the module tree under `webshop.`.
         try:
             from importlib import import_module
 
@@ -59,12 +74,12 @@ class WebShopAdapter:
                 split=self.task_split,
                 **self.env_kwargs,
             )
-        except Exception as exc:  # pragma: no cover - depends on local install
+        except Exception as exc:  # pragma: no cover - depends on install
             import_error = exc
 
         raise ImportError(
-            "Failed to import WebShop environment. Install WebShop and ensure "
-            "`webshop.envs.web_agent_site_env.WebAgentTextEnv` is importable. "
+            "Failed to import WebShop env. Install via Modal app infra/app_webshop_install.py "
+            "or ensure `web_agent_site` is on PYTHONPATH. "
             f"Original error: {import_error}"
         )
 
