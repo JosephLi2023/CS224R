@@ -1,0 +1,35 @@
+{
+  "run": {
+    "name": "archer_webshop",
+    "output_dir": "experiments/manifests",
+    "seed": 11
+  },
+  "train": {
+    "algorithm": "archer",
+    "total_episodes": 200,
+    "batch_size": 4,
+    "learning_rate": 1e-6,
+    "checkpoint_every": 50,
+    "eval_every": 25,
+    "K_trajectories_per_task": 4,
+    "kl_coeff": 0.04,
+    "clip_eps": 0.2,
+    "grad_accum_steps": 2
+  },
+  "policy": {
+    "backbone": "Qwen2.5-1.5B-Instruct",
+    "lora": true,
+    "lora_target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+    "lora_rank": 16
+  },
+  "archer": {
+    "value_head_hidden": 512,
+    "gae_lambda": 0.95,
+    "gamma": 0.99,
+    "value_loss_coeff": 0.5
+  },
+  "logging": {
+    "print_every": 10
+  },
+  "_notes": "Scaled-down ArCHer baseline: small value head over hidden states + GAE. Shares the rollout collector with the GRPO trainer."
+}

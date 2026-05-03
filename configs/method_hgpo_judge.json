@@ -1,0 +1,51 @@
+{
+  "run": {
+    "name": "hgpo_judge_webshop",
+    "output_dir": "experiments/manifests",
+    "seed": 11
+  },
+  "train": {
+    "algorithm": "hgpo",
+    "total_episodes": 200,
+    "batch_size": 4,
+    "learning_rate": 1e-6,
+    "checkpoint_every": 50,
+    "eval_every": 25,
+    "K_trajectories_per_task": 4,
+    "kl_coeff": 0.04,
+    "clip_eps": 0.2,
+    "grad_accum_steps": 2
+  },
+  "policy": {
+    "backbone": "Qwen2.5-1.5B-Instruct",
+    "lora": true,
+    "lora_target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+    "lora_rank": 16
+  },
+  "hgpo": {
+    "alpha": 0.5,
+    "lambda_consistency": 0.1,
+    "decomposer": "judge"
+  },
+  "judge": {
+    "backend": "openai",
+    "openai": {
+      "model": "gpt-4o-mini",
+      "max_retries": 3,
+      "temperature": 0.0,
+      "timeout_s": 30.0,
+      "max_concurrency": 8
+    },
+    "cache": {
+      "path": "/vol/cache/judge.sqlite"
+    },
+    "limits": {
+      "max_judge_calls_per_run": 5000,
+      "warn_at_calls": 4000
+    }
+  },
+  "logging": {
+    "print_every": 10
+  },
+  "_notes": "H-GRPO Method A: LLM-as-Judge via JudgeBackend. Default backend = OpenAI gpt-4o-mini per proposal §3.2. To switch to self-hosted Qwen, replace the judge block with the contents of configs/judge_qwen7b.json."
+}

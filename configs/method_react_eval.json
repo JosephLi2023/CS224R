@@ -1,0 +1,24 @@
+{
+  "run": {
+    "name": "react_eval_webshop",
+    "output_dir": "experiments/manifests",
+    "seed": 11
+  },
+  "train": {
+    "algorithm": "react_eval",
+    "total_episodes": 0,
+    "batch_size": 1,
+    "learning_rate": 0.0,
+    "checkpoint_every": 1,
+    "eval_every": 1
+  },
+  "policy": {
+    "backbone": "Qwen2.5-1.5B-Instruct",
+    "lora": false,
+    "decoding": "greedy"
+  },
+  "logging": {
+    "print_every": 50
+  },
+  "_notes": "ReAct (no-train) baseline: pure 200-episode evaluation pass over the frozen Qwen2.5-1.5B-Instruct policy. Total episodes=0 means trainer skips the optimizer loop and runs eval only."
+}

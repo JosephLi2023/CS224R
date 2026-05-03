@@ -1,0 +1,43 @@
+{
+  "run": {
+    "name": "hgpo_turnrd_webshop",
+    "output_dir": "experiments/manifests",
+    "seed": 11
+  },
+  "train": {
+    "algorithm": "hgpo",
+    "total_episodes": 200,
+    "batch_size": 4,
+    "learning_rate": 1e-6,
+    "checkpoint_every": 50,
+    "eval_every": 25,
+    "K_trajectories_per_task": 4,
+    "kl_coeff": 0.04,
+    "clip_eps": 0.2,
+    "grad_accum_steps": 2
+  },
+  "policy": {
+    "backbone": "Qwen2.5-1.5B-Instruct",
+    "lora": true,
+    "lora_target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+    "lora_rank": 16
+  },
+  "hgpo": {
+    "alpha": 0.5,
+    "lambda_consistency": 0.1,
+    "decomposer": "turnrd"
+  },
+  "turnrd": {
+    "mode": 1,
+    "layers": 4,
+    "hidden_size": 256,
+    "cls_token": true,
+    "refresh_every_episodes": 20,
+    "replay_buffer_path": "/vol/cache/turnrd_replay.jsonl",
+    "distill_source": null
+  },
+  "logging": {
+    "print_every": 10
+  },
+  "_notes": "H-GRPO Method B: learned TurnRD decomposer. Mode 1 (default) predicts R from [CLS]; attention weights → per-turn credit. Mode 2 distills OpenAI judge scores (set turnrd.mode=2 and distill_source to a Method A run's cached scores)."
+}
