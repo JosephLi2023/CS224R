@@ -32,6 +32,14 @@ class TurnRecord:
     # Per-turn intermediate reward as observed from the env (often 0 for
     # sparse-reward tasks; populated by `progress` decomposer for Method C).
     raw_env_reward: float = 0.0
+    # ----- token-level fields populated by the rollout collector (Day 4) -----
+    # Token ids of the model-generated action (matches `action_text` after detokenization).
+    action_token_ids: tuple[int, ...] = ()
+    # Per-token log-probs under the rollout-time policy (used by the PPO
+    # importance-weight ratio at training time).
+    action_token_logprobs: tuple[float, ...] = ()
+    # Number of tokens in the prompt at this turn (for context-budget tracking).
+    prompt_token_count: int = 0
 
 
 @dataclass(frozen=True)

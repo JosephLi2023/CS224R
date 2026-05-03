@@ -34,6 +34,21 @@ class SamplingParams:
     top_p: float = 0.95
     max_tokens: int = 256
     stop: list[str] = field(default_factory=list)
+    # When True, generate_rich() pulls per-token logprobs back from vLLM. Costs
+    # a small amount of extra CPU but is required by the GRPO trainer's
+    # importance-weight calculation.
+    return_logprobs: bool = True
+
+
+@dataclass(frozen=True)
+class GenerationOutput:
+    """Token-level generation result returned by `VLLMRunner.generate_rich`."""
+
+    text: str
+    token_ids: tuple[int, ...]
+    token_logprobs: tuple[float, ...]
+    prompt_token_count: int
+    finish_reason: str
 
 
 class VLLMRunner:
@@ -73,6 +88,58 @@ class VLLMRunner:
         # vLLM returns one RequestOutput per prompt; each has .outputs which
         # contains .n CompletionOutputs.
         return [[o.text for o in req.outputs] for req in outputs]
+
+    def generate_rich(
+        self, prompts: list[str], sampling: SamplingParams
+    ) -> list[list[GenerationOutput]]:
+        """Generate with per-token ids + log-probs preserved.
+
+        Used by the rollout collector so the trainer has the rollout-time
+        policy log-probs needed for the PPO importance-weight ratio.
+        """
+        from vllm import SamplingParams as VLLMSamplingParams  # type: ignore[import-not-found]
+
+        params = VLLMSamplingParams(
+            n=sampling.n,
+            temperature=sampling.temperature,
+            top_p=sampling.top_p,
+            max_tokens=sampling.max_tokens,
+            stop=sampling.stop or None,
+            seed=self.cfg.seed,
+            logprobs=1 if sampling.return_logprobs else None,
+        )
+        request_outputs = self.llm.generate(prompts, params)
+
+        results: list[list[GenerationOutput]] = []
+        for req in request_outputs:
+            prompt_token_count = len(req.prompt_token_ids or [])
+            per_prompt: list[GenerationOutput] = []
+            for o in req.outputs:
+                token_ids = tuple(int(t) for t in (o.token_ids or ()))
+                logprobs: tuple[float, ...] = ()
+                if sampling.return_logprobs and getattr(o, "logprobs", None) is not None:
+                    extracted: list[float] = []
+                    for tok_id, dist in zip(token_ids, o.logprobs):
+                        if dist is None:
+                            extracted.append(0.0)
+                            continue
+                        entry = dist.get(tok_id) if hasattr(dist, "get") else None
+                        if entry is None:
+                            extracted.append(0.0)
+                            continue
+                        extracted.append(float(getattr(entry, "logprob", entry)))
+                    logprobs = tuple(extracted)
+                per_prompt.append(
+                    GenerationOutput(
+                        text=o.text,
+                        token_ids=token_ids,
+                        token_logprobs=logprobs,
+                        prompt_token_count=prompt_token_count,
+                        finish_reason=str(getattr(o, "finish_reason", "")),
+                    )
+                )
+            results.append(per_prompt)
+        return results
 
     # ------------------------------------------------------------------
     # Weight sync (the core Day-3 deliverable)
