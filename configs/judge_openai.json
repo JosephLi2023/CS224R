@@ -1,0 +1,19 @@
+{
+  "judge": {
+    "backend": "openai",
+    "openai": {
+      "model": "gpt-4o-mini",
+      "max_retries": 3,
+      "temperature": 0.0,
+      "timeout_s": 30.0,
+      "max_concurrency": 8
+    },
+    "cache": {
+      "path": "/vol/cache/judge.sqlite"
+    },
+    "limits": {
+      "max_judge_calls_per_run": 5000,
+      "warn_at_calls": 4000
+    }
+  }
+}

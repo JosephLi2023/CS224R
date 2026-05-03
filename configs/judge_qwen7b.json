@@ -1,0 +1,19 @@
+{
+  "judge": {
+    "backend": "vllm",
+    "vllm": {
+      "endpoint": "https://REPLACE-WITH-MODAL-URL/score_turns",
+      "model": "qwen2.5-7b-instruct",
+      "timeout_s": 60.0,
+      "max_concurrency": 4,
+      "api_token": ""
+    },
+    "cache": {
+      "path": "/vol/cache/judge.sqlite"
+    },
+    "limits": {
+      "max_judge_calls_per_run": 5000,
+      "warn_at_calls": 4000
+    }
+  }
+}
