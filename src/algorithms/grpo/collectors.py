@@ -107,6 +107,7 @@ class RolloutCollector:
                 token_ids = tuple(getattr(gen, "token_ids", ()) or ())
                 token_logprobs = tuple(getattr(gen, "token_logprobs", ()) or ())
                 prompt_token_count = int(getattr(gen, "prompt_token_count", 0) or 0)
+                prompt_token_ids = tuple(getattr(gen, "prompt_token_ids", ()) or ())
 
                 obs_text = getattr(states[i], "observation_text", "") or ""
                 turn = TurnRecord(
@@ -117,6 +118,7 @@ class RolloutCollector:
                     action_token_ids=token_ids,
                     action_token_logprobs=token_logprobs,
                     prompt_token_count=prompt_token_count,
+                    prompt_token_ids=prompt_token_ids,
                 )
                 traj_turns[i].append(turn)
                 rewards_so_far[i] += float(reward)

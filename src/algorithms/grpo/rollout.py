@@ -40,6 +40,9 @@ class TurnRecord:
     action_token_logprobs: tuple[float, ...] = ()
     # Number of tokens in the prompt at this turn (for context-budget tracking).
     prompt_token_count: int = 0
+    # Token ids of the prompt the policy was conditioned on at this turn.
+    # Required by `HGPOTrainer.compute_loss` to recompute new-policy logprobs.
+    prompt_token_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)

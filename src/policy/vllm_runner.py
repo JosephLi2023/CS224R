@@ -48,6 +48,7 @@ class GenerationOutput:
     token_ids: tuple[int, ...]
     token_logprobs: tuple[float, ...]
     prompt_token_count: int
+    prompt_token_ids: tuple[int, ...]
     finish_reason: str
 
 
@@ -112,7 +113,8 @@ class VLLMRunner:
 
         results: list[list[GenerationOutput]] = []
         for req in request_outputs:
-            prompt_token_count = len(req.prompt_token_ids or [])
+            prompt_ids_tup = tuple(int(t) for t in (req.prompt_token_ids or ()))
+            prompt_token_count = len(prompt_ids_tup)
             per_prompt: list[GenerationOutput] = []
             for o in req.outputs:
                 token_ids = tuple(int(t) for t in (o.token_ids or ()))
@@ -135,6 +137,7 @@ class VLLMRunner:
                         token_ids=token_ids,
                         token_logprobs=logprobs,
                         prompt_token_count=prompt_token_count,
+                        prompt_token_ids=prompt_ids_tup,
                         finish_reason=str(getattr(o, "finish_reason", "")),
                     )
                 )

@@ -14,6 +14,7 @@ class _FakeGen:
     token_ids: tuple
     token_logprobs: tuple
     prompt_token_count: int
+    prompt_token_ids: tuple = ()
     finish_reason: str = "stop"
 
 

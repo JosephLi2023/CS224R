@@ -150,16 +150,11 @@ class HGPOTrainer:
         target = torch.tensor(action_token_ids, dtype=torch.long, device=device)
         return log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1)  # [Tk]
 
-    def compute_loss(
-        self, group: TrajectoryGroup, prompt_token_ids_per_turn: list[list[list[int]]]
-    ) -> tuple["torch.Tensor", TrainStepStats]:
+    def compute_loss(self, group: TrajectoryGroup) -> tuple["torch.Tensor", TrainStepStats]:
         """Compute the H-GRPO total loss for one group.
 
-        `prompt_token_ids_per_turn[i][t]` = the prompt token id list that
-        the rollout collector tokenized at turn t of trajectory i. The
-        collector exposes `prompt_token_count` but NOT the ids — Day 6
-        will widen the rollout schema to carry ids. For Day 5 we accept
-        them as an explicit argument so unit tests / smoke can supply them.
+        Reads `prompt_token_ids` and `action_token_ids` directly from each
+        `TurnRecord` (the rollout collector populates both as of Day 5.5).
         """
         import torch  # type: ignore[import-not-found]
 
@@ -168,17 +163,19 @@ class HGPOTrainer:
 
         device = next(self.policy.model.parameters()).device
 
-        # Concatenate per-trajectory per-token quantities.
         all_new_lp: list[torch.Tensor] = []
         all_old_lp: list[torch.Tensor] = []
         all_adv: list[torch.Tensor] = []
         for i, traj in enumerate(group.trajectories):
             for t, turn in enumerate(traj.turns):
                 ids = list(turn.action_token_ids)
-                if not ids:
+                prompt_ids = list(turn.prompt_token_ids)
+                if not ids or not prompt_ids:
                     continue
-                old_lp = torch.tensor(turn.action_token_logprobs, dtype=torch.float32, device=device)
-                new_lp = self._new_logprobs_for_turn(prompt_token_ids_per_turn[i][t], ids)
+                old_lp = torch.tensor(
+                    turn.action_token_logprobs, dtype=torch.float32, device=device
+                )
+                new_lp = self._new_logprobs_for_turn(prompt_ids, ids)
                 a_t = combined[i][t]
                 adv_vec = torch.full((len(ids),), float(a_t), dtype=torch.float32, device=device)
                 all_new_lp.append(new_lp)
@@ -193,14 +190,12 @@ class HGPOTrainer:
         old_lp_t = torch.cat(all_old_lp).to(torch.float32)
         adv_t = torch.cat(all_adv).to(torch.float32)
 
-        # Importance ratio + PPO clipped surrogate
         ratio = torch.exp(new_lp_t - old_lp_t)
         clip_eps = self.cfg.clip_eps
         clipped = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv_t
         unclipped = ratio * adv_t
         policy_loss = -torch.minimum(unclipped, clipped).mean()
 
-        # KL k1 estimator + adaptive coefficient
         kl_per_tok = (new_lp_t - old_lp_t)
         observed_kl = float(kl_per_tok.mean().detach().item())
         kl_coef = self.kl_controller.coef
@@ -227,19 +222,16 @@ class HGPOTrainer:
         )
         return total, stats
 
-    def train_step(
-        self, group: TrajectoryGroup, prompt_token_ids_per_turn: list[list[list[int]]]
-    ) -> TrainStepStats:
+    def train_step(self, group: TrajectoryGroup) -> TrainStepStats:
         """One AdamW step on a single TrajectoryGroup."""
         import torch  # type: ignore[import-not-found]
 
         self._ensure_optimizer()
         self.policy.model.train()
 
-        loss, stats = self.compute_loss(group, prompt_token_ids_per_turn)
+        loss, stats = self.compute_loss(group)
         loss.backward()
 
-        # Grad clip + step.
         grad_norm = torch.nn.utils.clip_grad_norm_(
             self.policy.trainable_parameters(), self.cfg.max_grad_norm
         )
@@ -248,7 +240,6 @@ class HGPOTrainer:
         self._optimizer.step()
         self._optimizer.zero_grad(set_to_none=True)
 
-        # Adaptive KL update.
         new_coef = self.kl_controller.update(stats.observed_kl)
         stats.kl_coef = new_coef
         self._step += 1
