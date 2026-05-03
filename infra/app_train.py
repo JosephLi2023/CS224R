@@ -67,8 +67,8 @@ def env_probe() -> dict:
         info["cuda_available"] = torch.cuda.is_available()
         if torch.cuda.is_available():
             info["cuda_device"] = torch.cuda.get_device_name(0)
-            info["cuda_capability"] = torch.cuda.get_device_capability(0)
-            info["bf16_supported"] = torch.cuda.is_bf16_supported()
+            info["cuda_capability"] = list(torch.cuda.get_device_capability(0))  # tuple → list, deserializable on non-torch host
+            info["bf16_supported"] = bool(torch.cuda.is_bf16_supported())
     except Exception as e:
         info["torch_error"] = repr(e)
 

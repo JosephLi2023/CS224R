@@ -56,7 +56,12 @@ image: modal.Image = (
     modal.Image.debian_slim(python_version=PYTHON_VERSION)
     .apt_install(*_WEBSHOP_INSTALL)
     .pip_install(*_PIP_PACKAGES)
-    # Mount the project source so all apps can `from src.* import ...`.
+    # Expose /workspace on PYTHONPATH so `from src.* import ...` and
+    # `from infra.* import ...` both work inside the container (Modal CLI
+    # copies the entrypoint file to /root/ so we can't rely on the file's
+    # parent dir). Must come BEFORE add_local_dir per Modal's image rules.
+    .env({"PYTHONPATH": "/workspace"})
+    # add_local_* must be the last step in the image chain.
     .add_local_dir(
         local_path=".",
         remote_path="/workspace",
