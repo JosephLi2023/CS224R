@@ -41,6 +41,8 @@ _PIP_PACKAGES = [
     "PyYAML>=6.0",
     "tqdm>=4.66",
     "matplotlib>=3.9",
+    # Data acquisition (used by infra/app_data.py to pull WebShop JSONs)
+    "gdown>=5.2",
 ]
 
 # WebShop install — bake from a pinned commit. Kept as a separate layer so
