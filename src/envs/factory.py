@@ -26,6 +26,10 @@ def make_env(env_cfg: dict, seed: int):
         )
 
     if name == "alfworld":
-        return ALFWorldAdapter(max_steps=int(env_cfg["max_steps"]))
+        return ALFWorldAdapter(
+            max_steps=int(env_cfg.get("max_steps", 40)),
+            task_split=str(env_cfg.get("task_split", "train")),
+            env_kwargs=dict(env_cfg.get("env_kwargs", {})),
+        )
 
     raise ValueError(f"Unsupported env name: {env_cfg['name']}")

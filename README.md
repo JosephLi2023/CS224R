@@ -49,6 +49,13 @@ WebShop adapter details:
   - step normalization to `(state, reward, done, info)`,
   - action resolution from `str` command or `int` candidate index.
 
+ALFWorld adapter details:
+- `/Users/shoupeili/Desktop/classifiers/CS224R/project/CS224R/src/envs/alfworld_adapter.py` now supports ALFWorld API wiring with:
+  - common module bootstrap paths in `alfworld.agents.environment`,
+  - reset normalization across variants,
+  - step normalization for 4-tuple and 5-tuple APIs,
+  - admissible action extraction and `str`/`int` action resolution.
+
 Each run writes to `experiments/manifests/<run_name>_<timestamp>/`:
 - `config_snapshot.json`
 - `train_log.json`
