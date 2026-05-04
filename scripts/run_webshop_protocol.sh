@@ -9,6 +9,13 @@
 # Each method config is merged with configs/env_webshop_llm.yaml + configs/eval.json
 # and dispatched as a Modal job (or local fallback). Run dirs land under
 # experiments/manifests/<method>_webshop_seed<seed>_<ts>/.
+#
+# Method-B (TurnRD) is special-cased to dispatch through
+# `scripts/run_turnrd_modal.py` (the producer ↔ standalone-trainer
+# orchestrator). All other methods take the legacy single-process
+# `python -m src.trainers.train` path. See
+# `docs/METHOD_B_SWEEP_INTEGRATION.md` for the rationale + cost
+# estimates + sanity-check sequence.
 set -euo pipefail
 
 SEED="11"
@@ -40,6 +47,30 @@ for METHOD in "${METHODS[@]}"; do
     exit 1
   fi
   echo "=== launching ${METHOD} seed=${SEED} ==="
+
+  # ---------------------------------------------------------------
+  # Method B (TurnRD): special-cased — needs the producer ↔
+  # standalone-trainer orchestration. Methods A/C and the baselines
+  # take the legacy single-process dispatch path below.
+  # ---------------------------------------------------------------
+  if [[ "${METHOD}" == "method_hgpo_turnrd" ]]; then
+    if [[ "${DRY_RUN}" == "1" ]]; then
+      echo "DRY RUN: would invoke scripts/run_turnrd_modal.py --config ${CONFIG} --seed ${SEED} --rounds 5 --episodes-per-round 40 --turnrd-epochs 3"
+      continue
+    fi
+    scripts/run_turnrd_modal.py \
+      --config "${CONFIG}" \
+      --seed "${SEED}" \
+      --rounds 5 \
+      --episodes-per-round 40 \
+      --turnrd-epochs 3
+    continue
+  fi
+
+  # ---------------------------------------------------------------
+  # All other methods (A, C, ReAct eval, flat GRPO, ArCHer):
+  # legacy local-Python dispatcher. Unchanged from before.
+  # ---------------------------------------------------------------
   if [[ "${DRY_RUN}" == "1" ]]; then
     echo "DRY RUN: would invoke train with --train-config ${CONFIG} --env-config configs/env_webshop.json --seed ${SEED}"
     continue

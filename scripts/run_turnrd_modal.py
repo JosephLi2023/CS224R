@@ -73,10 +73,39 @@ class OrchestrationConfig:
     replay_path: str = "/vol/cache/turnrd_replay.jsonl"
     ckpt_path: str = "/vol/cache/turnrd_ckpt.pt"
     run_name_prefix: str = "method_b_orchestrated"
+    # Multi-seed protocol support. None ⇒ no seed-specific offset
+    # applied (legacy single-run behavior). When set, each seed gets a
+    # disjoint task_id range so different seeds never train on the same
+    # WebShop tasks. Also tags the run-name-prefix with `_seed{N}`.
+    seed: int | None = None
     dry_run: bool = False
     skip_warmup_fit: bool = False
     extra_train_loop_args: list[str] = field(default_factory=list)
     extra_turnrd_args: list[str] = field(default_factory=list)
+
+    @property
+    def base_task_id_offset(self) -> int:
+        """Per-seed deterministic task_id starting offset.
+
+        Each seed gets a slice of length `rounds * episodes_per_round`
+        starting at `seed * rounds * episodes_per_round`. Two seeds
+        are guaranteed to operate on disjoint task ranges as long as
+        the per-run cap stays the same.
+
+        When `seed is None`, returns 0 (legacy behavior — preserves
+        the single-run case where the caller may want to manually
+        thread a `--task-id-offset` through `--extra-train-loop-args`).
+        """
+        if self.seed is None:
+            return 0
+        return int(self.seed) * int(self.rounds) * int(self.episodes_per_round)
+
+    @property
+    def effective_run_name_prefix(self) -> str:
+        """`run_name_prefix` with the seed appended when set."""
+        if self.seed is None:
+            return self.run_name_prefix
+        return f"{self.run_name_prefix}_seed{int(self.seed)}"
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +174,18 @@ def _parse_args(argv: Sequence[str]) -> OrchestrationConfig:
     parser.add_argument(
         "--run-name-prefix",
         default="method_b_orchestrated",
-        help="Prefix for per-round run names (default: method_b_orchestrated).",
+        help="Prefix for per-round run names (default: method_b_orchestrated). "
+             "When --seed is set, '_seed{N}' is appended.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Optional protocol seed. When set, drives a deterministic "
+             "task_id_offset slice (seed * rounds * episodes_per_round) so "
+             "different seeds train on disjoint WebShop tasks, AND tags the "
+             "run-name-prefix with '_seed{N}'. Required for the multi-seed "
+             "protocol sweep; omit for ad-hoc single-run launches.",
     )
     parser.add_argument(
         "--dry-run",
@@ -177,6 +217,7 @@ def _parse_args(argv: Sequence[str]) -> OrchestrationConfig:
         replay_path=args.replay_path,
         ckpt_path=args.ckpt_path,
         run_name_prefix=args.run_name_prefix,
+        seed=args.seed,
         dry_run=args.dry_run,
         skip_warmup_fit=args.skip_warmup_fit,
         extra_train_loop_args=list(args.extra_train_loop_args or []),
@@ -269,15 +310,17 @@ def _train_loop_cmd(cfg: OrchestrationConfig, round_idx: int) -> list[str]:
       --kl-warmup-episodes / --gpu-mem-util / --config
 
     We rely on the JSON config to set most of these (per the Day-14
-    `--config` switch); only `--n-episodes` and `--run-name` are
-    overridden round-by-round.
+    `--config` switch); only `--n-episodes`, `--task-id-offset`, and
+    `--run-name` are overridden round-by-round (and seed-by-seed).
     """
     return [
         "modal", "run", "infra/app_train_loop.py",
         "--config", str(cfg.config_path),
         "--n-episodes", str(cfg.episodes_per_round),
-        "--task-id-offset", str(round_idx * cfg.episodes_per_round),
-        "--run-name", f"{cfg.run_name_prefix}_round{round_idx:02d}",
+        "--task-id-offset", str(
+            cfg.base_task_id_offset + round_idx * cfg.episodes_per_round
+        ),
+        "--run-name", f"{cfg.effective_run_name_prefix}_round{round_idx:02d}",
         *cfg.extra_train_loop_args,
     ]
 
@@ -331,7 +374,9 @@ def _orchestrate(cfg: OrchestrationConfig) -> int:
     print(f"  turnrd mode        : {cfg.turnrd_mode}")
     print(f"  replay path (vol)  : {cfg.replay_path}")
     print(f"  ckpt   path (vol)  : {cfg.ckpt_path}")
-    print(f"  run name prefix    : {cfg.run_name_prefix}")
+    print(f"  run name prefix    : {cfg.effective_run_name_prefix}")
+    print(f"  seed               : {cfg.seed if cfg.seed is not None else '(none)'}")
+    print(f"  base task offset   : {cfg.base_task_id_offset}")
     print(f"  dry-run            : {cfg.dry_run}")
     print(f"  skip warmup fit    : {cfg.skip_warmup_fit}")
 
