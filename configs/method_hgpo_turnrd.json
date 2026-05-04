@@ -34,6 +34,7 @@
     "cls_token": true,
     "refresh_every_episodes": 20,
     "replay_buffer_path": "/vol/cache/turnrd_replay.jsonl",
+    "ckpt_path": "/vol/cache/turnrd_ckpt.pt",
     "distill_source": null
   },
   "logging": {
