@@ -37,6 +37,7 @@ def train_loop_smoke(
     use_sft_as_ref: bool = True,
     kl_warmup_episodes: int = 0,
     gpu_mem_util: float = 0.30,
+    config: str = "",  # Day 14: when non-empty, build trainer from this JSON config.
 ) -> dict:
     import json
     import os
@@ -57,6 +58,24 @@ def train_loop_smoke(
     from src.envs.prompts.react_webshop import parse_react_action, render_webshop_turn_prompt
     from src.policy.lora_policy import LoRAPolicy, LoRAPolicyConfig
     from src.policy.vllm_runner import SamplingParams, VLLMRunner, VLLMRunnerConfig
+
+    # Day 14: optional JSON config — overrides the per-flag trainer/decomposer
+    # construction with a `build_trainer_from_config` call. When config is
+    # empty, the legacy flag-driven path runs unchanged (preserves all
+    # existing callers' behavior — Methods A/C and the flat-GRPO smoke tests).
+    cfg_dict: dict | None = None
+    if config:
+        with open(config) as fh:
+            cfg_dict = json.load(fh)
+        # Per-config overrides for the loop knobs that the JSON owns.
+        train_block = cfg_dict.get("train", {}) if cfg_dict else {}
+        if "total_episodes" in train_block:
+            n_episodes = int(train_block["total_episodes"])
+        if "K_trajectories_per_task" in train_block:
+            k = int(train_block["K_trajectories_per_task"])
+        run_block = cfg_dict.get("run", {}) if cfg_dict else {}
+        if "name" in run_block:
+            run_name = str(run_block["name"])
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     run_dir = f"/vol/manifests/{run_name}_{timestamp}"
@@ -102,29 +121,52 @@ def train_loop_smoke(
             env_kwargs={"num_products": num_products},
         )
 
-    collector = RolloutCollector(
-        runner=runner,
-        env_factory=env_factory,
-        prompt_renderer=render_webshop_turn_prompt,
-        action_parser=parse_react_action,
-        cfg=RolloutCollectorConfig(max_turns=max_turns),
-    )
+    # Day 14: choose between the legacy flag-driven trainer/collector
+    # construction and the JSON-config-driven path.
+    if cfg_dict is not None:
+        from src.trainers.train_hgpo import build_trainer_from_config
+
+        (
+            trainer,
+            _refresh_fn,
+            turnrd_emit_path,
+            turnrd_embedder,
+            judge_decomposer,
+        ) = build_trainer_from_config(cfg_dict, policy=policy)
+        collector = RolloutCollector(
+            runner=runner,
+            env_factory=env_factory,
+            prompt_renderer=render_webshop_turn_prompt,
+            action_parser=parse_react_action,
+            cfg=RolloutCollectorConfig(max_turns=max_turns),
+            turnrd_emit_path=turnrd_emit_path,
+            turnrd_embedder=turnrd_embedder,
+            judge_decomposer=judge_decomposer,
+        )
+    else:
+        collector = RolloutCollector(
+            runner=runner,
+            env_factory=env_factory,
+            prompt_renderer=render_webshop_turn_prompt,
+            action_parser=parse_react_action,
+            cfg=RolloutCollectorConfig(max_turns=max_turns),
+        )
+        trainer = HGPOTrainer(
+            policy=policy,
+            decomposer=progress_decomposer,
+            cfg=HGPOTrainerConfig(
+                alpha=1.0,                 # flat GRPO: drop turn-level signal
+                lambda_consistency=0.0,
+                clip_eps=0.2,
+                learning_rate=1e-6,
+                max_grad_norm=1.0,
+                kl_warmup_episodes=kl_warmup_episodes,
+            ),
+        )
+
     sampling = SamplingParams(
         n=1, temperature=1.0, top_p=0.95, max_tokens=48,
         return_logprobs=True, seed=None,  # fresh sampling each call → diverse K trajectories
-    )
-
-    trainer = HGPOTrainer(
-        policy=policy,
-        decomposer=progress_decomposer,
-        cfg=HGPOTrainerConfig(
-            alpha=1.0,                 # flat GRPO: drop turn-level signal
-            lambda_consistency=0.0,
-            clip_eps=0.2,
-            learning_rate=1e-6,
-            max_grad_norm=1.0,
-            kl_warmup_episodes=kl_warmup_episodes,
-        ),
     )
 
     if sft_loaded and use_sft_as_ref:
@@ -242,6 +284,7 @@ def main(
     use_sft_as_ref: bool = True,
     kl_warmup_episodes: int = 0,
     gpu_mem_util: float = 0.30,
+    config: str = "",
 ) -> None:
     import json as _json
     print(_json.dumps(
@@ -253,6 +296,7 @@ def main(
             use_sft_as_ref=use_sft_as_ref,
             kl_warmup_episodes=kl_warmup_episodes,
             gpu_mem_util=gpu_mem_util,
+            config=config,
         ),
         indent=2, default=str,
     ))
