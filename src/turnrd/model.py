@@ -178,6 +178,19 @@ class TurnRD(nn.Module):
                 f"forward: T={T} exceeds cfg.max_turns={self.cfg.max_turns}; "
                 "either truncate the trajectory or rebuild the model with a larger max_turns."
             )
+        # Reject fully-padded rows. `nn.TransformerEncoder` with an all-True
+        # `src_key_padding_mask` row produces NaN in the self-attention softmax
+        # (well-known PyTorch behavior), and the post-pool clamp_min(1e-12) won't
+        # rescue an already-NaN attention weight tensor. The TurnRDDecomposer
+        # adapter short-circuits empty trajectories before they reach forward,
+        # so this only fires for direct callers (Day-13 standalone trainer,
+        # ad-hoc debugging) — fail loudly rather than silently emit NaN rewards.
+        if not bool((attention_mask.sum(dim=-1) > 0).all().item()):
+            raise ValueError(
+                "forward: every row of attention_mask must have at least one real "
+                "(unmasked) turn. A fully-padded row produces NaN in the encoder "
+                "softmax. Drop empty trajectories before batching."
+            )
 
         # 1. Project to internal hidden_size.
         h = self.input_proj(turn_embeds)  # [B, T, H]

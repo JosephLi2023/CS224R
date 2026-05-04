@@ -238,3 +238,93 @@ def test_build_decomposer_turnrd_requires_model_and_embedder() -> None:
     assert len(out) == 2
     assert abs(sum(out[0]) - 0.7) < 1e-5
     assert abs(sum(out[1]) - (-0.3)) < 1e-5
+
+
+# ---------------------------------------------------------------------------
+# Hardening regressions (post-review)
+# ---------------------------------------------------------------------------
+
+
+def test_turnrd_decomposer_defaults_device_from_model_params() -> None:
+    """When `device=None`, the adapter must read the device from the model's
+    parameters rather than from the embedder's tensor. This prevents the
+    `TurnRDDecomposer(cuda_model, cpu_embedder)` foot-gun from silently
+    landing tensors on CPU and crashing inside `model.input_proj` with a
+    device-mismatch error.
+    """
+    model = _make_model()
+    embedder, _ = _deterministic_embedder()
+    decomposer = TurnRDDecomposer(model=model, embedder=embedder, device=None)
+
+    expected = next(model.parameters()).device
+    assert decomposer.device == expected
+
+
+def test_turnrd_decomposer_casts_stacked_to_model_dtype() -> None:
+    """Embedder may return a different dtype than the model's parameters.
+    The adapter must cast `stacked` to the model dtype before forward;
+    otherwise `nn.Linear(input_proj)` would raise dtype-mismatch on the
+    Day-14 production wiring (LoRAPolicy fp16/bf16 hidden states feeding
+    a fp32 TurnRD).
+    """
+    model = _make_model()  # fp32 by default
+    expected_dtype = next(model.parameters()).dtype
+    assert expected_dtype == torch.float32
+
+    # Embedder returns fp64 to make the cast visible.
+    seen_dtypes: list[torch.dtype] = []
+
+    def fp64_embedder(traj: Trajectory) -> torch.Tensor:
+        T_i = len(traj.turns)
+        return torch.arange(T_i * INPUT_DIM, dtype=torch.float64).view(T_i, INPUT_DIM)
+
+    # Hook the model forward to record the dtype of the input tensor at
+    # the moment forward runs.
+    orig_forward = model.forward
+
+    def recording_forward(turn_embeds: torch.Tensor, attention_mask: torch.Tensor):
+        seen_dtypes.append(turn_embeds.dtype)
+        return orig_forward(turn_embeds, attention_mask)
+
+    model.forward = recording_forward  # type: ignore[method-assign]
+
+    decomposer = TurnRDDecomposer(model=model, embedder=fp64_embedder)
+    decomposer.decompose(_make_group([2, 3], [1.0, 0.5]))
+
+    assert seen_dtypes == [expected_dtype], (
+        f"adapter did not cast stacked to model dtype: saw {seen_dtypes}, "
+        f"expected [{expected_dtype}]"
+    )
+
+
+def test_turnrd_decomposer_neutralises_grad_tracking_embedder() -> None:
+    """A careless embedder that returns a `requires_grad=True` tensor must
+    NOT propagate the autograd graph through to the adapter's outputs.
+    The adapter wraps the embedder loop in `torch.no_grad()` and detaches
+    each returned tensor as belt-and-suspenders against memory leaks
+    (see `decomposers/turnrd.py` "Contract requirements (c)").
+    """
+    model = _make_model()
+
+    seen_requires_grad: list[bool] = []
+
+    def grad_tracking_embedder(traj: Trajectory) -> torch.Tensor:
+        T_i = len(traj.turns)
+        # Build outside no_grad — would normally produce a grad-tracking tensor.
+        leaf = torch.arange(T_i * INPUT_DIM, dtype=torch.float32, requires_grad=True).view(T_i, INPUT_DIM)
+        # A dependent computation that retains the graph IFF grad mode is on.
+        out = leaf * 1.0
+        seen_requires_grad.append(out.requires_grad)
+        return out
+
+    decomposer = TurnRDDecomposer(model=model, embedder=grad_tracking_embedder)
+    out = decomposer.decompose(_make_group([2, 3], [1.0, 0.5]))
+
+    # The embedder was invoked under `no_grad`, so `out.requires_grad` should
+    # be False inside the embedder body.
+    assert seen_requires_grad == [False, False], (
+        f"embedder ran outside torch.no_grad(): saw requires_grad={seen_requires_grad}"
+    )
+    # Sanity: §3.2 invariant still holds.
+    assert abs(sum(out[0]) - 1.0) < 1e-5
+    assert abs(sum(out[1]) - 0.5) < 1e-5

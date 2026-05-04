@@ -179,3 +179,19 @@ def test_turnrd_raises_on_T_exceeding_max_turns() -> None:
     mask = torch.ones(1, 9, dtype=torch.long)
     with pytest.raises(ValueError, match=r"max_turns"):
         model(embeds, mask)
+
+
+def test_turnrd_raises_on_fully_padded_row() -> None:
+    """A batch row with `attention_mask.sum(-1) == 0` must raise rather than
+    return NaN. `nn.TransformerEncoder` softmax produces NaN for an all-True
+    `src_key_padding_mask` row; the post-pool clamp can't recover it. The
+    decomposer adapter short-circuits empty trajectories before they reach
+    forward, so this guard only fires for direct callers.
+    """
+    model = _make_model(input_dim=16, max_turns=8)
+    model.eval()
+    embeds = torch.randn(2, 4, 16)
+    mask = torch.ones(2, 4, dtype=torch.long)
+    mask[1] = 0  # row 1 is fully padded
+    with pytest.raises(ValueError, match=r"fully-padded|at least one real"):
+        model(embeds, mask)

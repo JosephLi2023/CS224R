@@ -24,9 +24,24 @@ from src.turnrd.model import TurnRD
 
 
 # Embedder contract: per-trajectory callable returning a per-turn embedding
-# tensor of shape `[T_i, D]` (D == TurnRD.input_dim). Production wires this
-# from `LoRAPolicy.model.eval()` mean-pooled hidden states (Day 14); tests
-# pass a deterministic stub.
+# tensor of shape `[T_i, D]` (D == TurnRD.input_dim).
+#
+# Production wires this from `LoRAPolicy.model.eval()` mean-pooled hidden
+# states (Day 14); tests pass a deterministic stub.
+#
+# Contract requirements (the adapter enforces (a)+(b) defensively, (c) is
+# the embedder's responsibility but the adapter wraps the call in
+# `torch.no_grad()` belt-and-suspenders so a forgetful caller doesn't leak
+# memory):
+#   (a) shape: `[T_i, D]` (asserted in `decompose`).
+#   (b) device + dtype: free; the adapter casts to the model's parameter
+#       device + dtype before forward (so the embedder MAY return e.g. CPU
+#       fp32 tensors even when the model lives on a CUDA bf16 device).
+#   (c) gradient: ideally `.detach()` or computed under `torch.no_grad()`,
+#       since the adapter only needs the values. The adapter's `no_grad`
+#       wrapper neutralises a careless implementation but does NOT free a
+#       graph that already exists on tensors returned BEFORE the wrapper
+#       takes effect — so production embedders SHOULD still detach.
 TurnEmbedder = Callable[[Trajectory], torch.Tensor]
 
 
@@ -44,14 +59,38 @@ class TurnRDDecomposer:
     ) -> None:
         self.model = model
         self.embedder = embedder
-        self.device = device
+        # Resolve the target device once. Default to the model's parameter
+        # device so a caller doing `TurnRDDecomposer(cuda_model, cpu_embedder)`
+        # without specifying `device` doesn't silently land tensors on CPU and
+        # crash inside `model.input_proj` with a device-mismatch error.
+        if device is not None:
+            self.device: torch.device = torch.device(device)
+        else:
+            try:
+                self.device = next(self.model.parameters()).device
+            except StopIteration:
+                # No parameters (extremely unusual; only happens if someone
+                # constructs a stripped TurnRD). Fall back to CPU.
+                self.device = torch.device("cpu")
+        # Resolve the model's parameter dtype too: the embedder is allowed to
+        # return any dtype, and we'll cast `stacked` into the model dtype
+        # before forward. This avoids the fp16-embedder vs fp32-input_proj
+        # dtype-mismatch RuntimeError that would otherwise greet the Day-14
+        # production wiring.
+        try:
+            self._model_dtype: torch.dtype = next(self.model.parameters()).dtype
+        except StopIteration:
+            self._model_dtype = torch.float32
 
     def decompose(self, group: TrajectoryGroup) -> list[list[float]]:
         """Return list[K] of list[T_i] per-turn rewards `r̂_t = α_t · R`.
 
         Steps:
-        1. Embed each non-empty trajectory via `self.embedder` → `[T_i, D]`.
-        2. Pad to `[K, T_max, D]` and build `attention_mask = [K, T_max]`.
+        1. Embed each non-empty trajectory via `self.embedder` → `[T_i, D]`,
+           inside `torch.no_grad()` so a careless embedder can't leak the
+           policy's autograd graph into our K×T padded stack.
+        2. Pad to `[K, T_max, D]` (cast to the model's param device+dtype)
+           and build `attention_mask = [K, T_max]`.
         3. Forward through `model` under `torch.no_grad()` + `eval()`.
         4. Multiply attention weights by per-trajectory `final_reward`.
         5. Slice each row back to its real T_i and convert to Python floats.
@@ -62,24 +101,31 @@ class TurnRDDecomposer:
         if K == 0:
             return []
 
-        # 1. Embed each non-empty trajectory.
+        # 1. Embed each non-empty trajectory under `no_grad` so a careless
+        #    embedder (one that forgot its own `with torch.no_grad():` /
+        #    `.detach()`) doesn't keep the LoRA-policy backward graph alive
+        #    across rollout groups.
         per_traj_embeds: list[Optional[torch.Tensor]] = []
-        for traj in group.trajectories:
-            if not traj.turns:
-                per_traj_embeds.append(None)
-                continue
-            embed = self.embedder(traj)
-            if embed.dim() != 2:
-                raise ValueError(
-                    f"embedder(traj) must return [T_i, D]; got shape "
-                    f"{tuple(embed.shape)} for task_id={traj.task_id}."
-                )
-            if embed.shape[0] != len(traj.turns):
-                raise ValueError(
-                    f"embedder returned T={embed.shape[0]} but trajectory has "
-                    f"{len(traj.turns)} turns (task_id={traj.task_id})."
-                )
-            per_traj_embeds.append(embed)
+        with torch.no_grad():
+            for traj in group.trajectories:
+                if not traj.turns:
+                    per_traj_embeds.append(None)
+                    continue
+                embed = self.embedder(traj)
+                if embed.dim() != 2:
+                    raise ValueError(
+                        f"embedder(traj) must return [T_i, D]; got shape "
+                        f"{tuple(embed.shape)} for task_id={traj.task_id}."
+                    )
+                if embed.shape[0] != len(traj.turns):
+                    raise ValueError(
+                        f"embedder returned T={embed.shape[0]} but trajectory has "
+                        f"{len(traj.turns)} turns (task_id={traj.task_id})."
+                    )
+                # Defense in depth: detach in case the embedder built its
+                # tensor BEFORE the `no_grad` context took effect (e.g. it
+                # captured a closure over a grad-enabled tensor).
+                per_traj_embeds.append(embed.detach())
 
         # If all trajectories are empty, short-circuit before allocating
         # an empty-T tensor (the model would reject T=0).
@@ -103,27 +149,30 @@ class TurnRDDecomposer:
         nonempty_indices = [i for i, e in enumerate(per_traj_embeds) if e is not None]
         K_real = len(nonempty_indices)
 
-        ref_dtype = non_empty[0].dtype
-        ref_device = non_empty[0].device
-        target_device = (
-            torch.device(self.device) if self.device is not None else ref_device
-        )
+        # Cast to the model's param device + dtype (resolved once in __init__).
+        # The embedder is allowed to return any device/dtype combo per the
+        # documented contract; the adapter normalises here so the model's
+        # `input_proj` never trips on a device-mismatch / dtype-mismatch error.
+        target_device = self.device
+        target_dtype = self._model_dtype
 
-        stacked = torch.zeros(K_real, T_max, D, dtype=ref_dtype, device=target_device)
+        stacked = torch.zeros(K_real, T_max, D, dtype=target_dtype, device=target_device)
         attn_mask = torch.zeros(K_real, T_max, dtype=torch.long, device=target_device)
         for row, traj_idx in enumerate(nonempty_indices):
             e = per_traj_embeds[traj_idx]
             assert e is not None  # narrowed for the type checker
             T_i = e.shape[0]
-            stacked[row, :T_i] = e.to(device=target_device, dtype=ref_dtype)
+            stacked[row, :T_i] = e.to(device=target_device, dtype=target_dtype)
             attn_mask[row, :T_i] = 1
 
-        # 3. Forward in eval mode with no grad.
+        # 3. Forward in eval mode with no grad. Use `__call__` (not `.forward`)
+        #    so any `nn.Module` forward-pre/post hooks the trainer attaches
+        #    on Day 14 (e.g. refresh-cadence telemetry) still fire.
         was_training = self.model.training
         self.model.eval()
         try:
             with torch.no_grad():
-                out = self.model.forward(stacked, attn_mask)
+                out = self.model(stacked, attn_mask)
         finally:
             if was_training:
                 self.model.train()
