@@ -28,7 +28,7 @@
     "decomposer": "judge"
   },
   "judge": {
-    "backend": "vllm",
+    "backend": "openai",
     "vllm": {
       "endpoint": "https://REPLACE-WITH-MODAL-URL/score_turns",
       "model": "qwen2.5-7b-instruct",
@@ -54,5 +54,5 @@
   "logging": {
     "print_every": 10
   },
-  "_notes": "H-GRPO Method A: LLM-as-Judge via JudgeBackend. Currently defaulting to backend=vllm because no OpenAI API key is provisioned. Once the OPENAI_API_KEY Modal Secret is created, flip 'backend' to 'openai' to match the proposal §3.2 default."
+  "_notes": "H-GRPO Method A: LLM-as-Judge via JudgeBackend. Defaults to backend=openai per proposal §3.2. The Modal Secret 'openai-secret' (key OPENAI_API_KEY) is mounted onto the trainer container by infra/app_train.py::train. Flip backend to 'vllm' to A/B against the self-hosted Qwen2.5-7B-Instruct judge served by infra/app_judge.py."
 }

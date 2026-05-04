@@ -151,21 +151,26 @@ The Volume persists across deploys and is shared by `app_train`,
 
 ## 7. 🟢 (Later, when needed) Add the OpenAI Secret
 
-Skip until you have an OpenAI API key. Method A judge currently defaults to
-the vLLM Qwen backend (`configs/method_hgpo_judge.json::judge.backend = "vllm"`).
+Skip until you have an OpenAI API key. Once you provision the key, the
+`backend=openai` Method A path becomes runnable end-to-end.
 
 When you're ready:
 
 ```bash
-modal secret create openai-key OPENAI_API_KEY=sk-...
+modal secret create openai-secret OPENAI_API_KEY=sk-...
 ```
 
-Then flip the config:
+The Modal Secret is named `openai-secret` (the secret's payload key is
+`OPENAI_API_KEY`, which is what the OpenAI client reads at runtime). Then
+flip the config (or just use the value already shipped in
+`configs/method_hgpo_judge.json`, which defaults to `backend=openai`):
 ```bash
 sed -i '' 's/"backend": "vllm"/"backend": "openai"/' configs/method_hgpo_judge.json
 ```
 
-`infra/common.py::maybe_openai_secret()` will pick it up automatically.
+`infra/common.py::maybe_openai_secret()` resolves `openai-secret` and
+`infra/app_train.py::train` (and `infra/app_judge.py`) mount it onto the
+function container, so `OPENAI_API_KEY` is in the env automatically.
 
 ---
 

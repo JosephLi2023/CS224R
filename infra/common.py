@@ -23,10 +23,13 @@ volume: modal.Volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=Tru
 VOLUME_MOUNT = "/vol"
 
 # Secrets we'll reference (none required for the baseline path).
-# Created via: modal secret create openai-key OPENAI_API_KEY=sk-...
+# Created via: modal secret create openai-secret OPENAI_API_KEY=sk-...
+# (Secret name is "openai-secret" with key "OPENAI_API_KEY"; the runtime
+# environment then exposes os.environ["OPENAI_API_KEY"] inside any function
+# that mounts this secret.)
 def maybe_openai_secret() -> list[modal.Secret]:
-    """Returns [Secret] if OPENAI_API_KEY is configured, else []."""
+    """Returns [Secret] if the openai-secret Modal Secret exists, else []."""
     try:
-        return [modal.Secret.from_name("openai-key")]
+        return [modal.Secret.from_name("openai-secret")]
     except Exception:
         return []

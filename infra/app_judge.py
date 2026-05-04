@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import modal  # type: ignore[import-not-found]
 
-from infra.common import VOLUME_MOUNT, volume
+from infra.common import VOLUME_MOUNT, maybe_openai_secret, volume
 from infra.image import image
 
 APP_NAME = "cs224r-hgpo-judge"
@@ -22,6 +22,7 @@ app = modal.App(APP_NAME)
 @app.function(
     image=image,
     volumes={VOLUME_MOUNT: volume},
+    secrets=maybe_openai_secret(),
     timeout=300,
 )
 def hello() -> str:

@@ -17,7 +17,7 @@ from pathlib import Path
 
 import modal  # type: ignore[import-not-found]
 
-from infra.common import VOLUME_MOUNT, volume
+from infra.common import VOLUME_MOUNT, maybe_openai_secret, volume
 from infra.image import image
 
 APP_NAME = "cs224r-hgpo-train"
@@ -55,6 +55,7 @@ def hello() -> str:
     image=image,
     gpu="A100-80GB",
     volumes={VOLUME_MOUNT: volume},
+    secrets=maybe_openai_secret(),
     timeout=SMOKE_TIMEOUT,
 )
 def env_probe() -> dict:
@@ -77,6 +78,11 @@ def env_probe() -> dict:
             info[mod] = __import__(mod).__version__
         except Exception as e:
             info[f"{mod}_error"] = repr(e)
+
+    # Confirm the OpenAI Modal Secret reached the container env when
+    # `openai-secret` is provisioned. Used by Method A end-to-end smoke.
+    import os
+    info["openai_api_key_present"] = bool(os.getenv("OPENAI_API_KEY"))
     print(info)
     return info
 
@@ -85,6 +91,7 @@ def env_probe() -> dict:
     image=image,
     gpu="A100-80GB",
     volumes={VOLUME_MOUNT: volume},
+    secrets=maybe_openai_secret(),
     timeout=TRAIN_TIMEOUT,
 )
 def train(
@@ -99,6 +106,14 @@ def train(
     `src/trainers/train_hgpo.py` lands (Week 1 Day 6), swap the import.
     """
     sys.path.insert(0, "/workspace")
+    # Confirm the OpenAI secret reached us when judge.backend=openai.
+    # Cheap one-line probe so failures surface in `modal app logs` rather than
+    # at first JudgeBackend.score_turns call.
+    import os
+    print(
+        f"[train] OPENAI_API_KEY present in container env: "
+        f"{bool(os.getenv('OPENAI_API_KEY'))}"
+    )
     # Import lazily so the CPU `hello` smoke test doesn't pull torch.
     import argparse  # noqa: F401
     from src.trainers import train as toy_train  # type: ignore
