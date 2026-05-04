@@ -38,6 +38,9 @@ class SamplingParams:
     # a small amount of extra CPU but is required by the GRPO trainer's
     # importance-weight calculation.
     return_logprobs: bool = True
+    # If None, vLLM uses fresh randomness on every call (preferred for
+    # diverse K-trajectory rollouts). Set to an int for deterministic tests.
+    seed: int | None = None
 
 
 @dataclass(frozen=True)
@@ -83,11 +86,9 @@ class VLLMRunner:
             top_p=sampling.top_p,
             max_tokens=sampling.max_tokens,
             stop=sampling.stop or None,
-            seed=self.cfg.seed,
+            seed=sampling.seed,  # None ⇒ fresh randomness each call
         )
         outputs = self.llm.generate(prompts, params)
-        # vLLM returns one RequestOutput per prompt; each has .outputs which
-        # contains .n CompletionOutputs.
         return [[o.text for o in req.outputs] for req in outputs]
 
     def generate_rich(
@@ -106,7 +107,7 @@ class VLLMRunner:
             top_p=sampling.top_p,
             max_tokens=sampling.max_tokens,
             stop=sampling.stop or None,
-            seed=self.cfg.seed,
+            seed=sampling.seed,  # None ⇒ fresh randomness each call
             logprobs=1 if sampling.return_logprobs else None,
         )
         request_outputs = self.llm.generate(prompts, params)

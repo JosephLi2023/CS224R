@@ -49,6 +49,7 @@ def render_webshop_turn_prompt(
     *,
     instruction: str | None = None,
     valid_actions: list[str] | None = None,
+    max_history_turns: int = 3,
 ) -> str:
     """Build the prompt for the agent's next turn.
 
@@ -60,6 +61,10 @@ def render_webshop_turn_prompt(
                      if available, else the empty string.
         valid_actions: explicit action whitelist; defaults to
                        `state.valid_actions` if available, else None.
+        max_history_turns: keep only the most recent N turns of history in
+                           the prompt to bound vLLM context growth (Day 6
+                           hardening; default 3 keeps prompts well under
+                           the 2048-token cap).
 
     Returns:
         Prompt string ending with `Thought:` so the model is prompted to
@@ -76,7 +81,12 @@ def render_webshop_turn_prompt(
         parts.append(f"User instruction: {instruction}")
         parts.append("")
 
-    history_text = _format_history(history)
+    history_list = list(history)
+    if max_history_turns > 0 and len(history_list) > max_history_turns:
+        dropped = len(history_list) - max_history_turns
+        parts.append(f"... ({dropped} earlier turns omitted) ...")
+        history_list = history_list[-max_history_turns:]
+    history_text = _format_history(history_list)
     if history_text:
         parts.append(history_text)
 
