@@ -44,10 +44,11 @@ class HGPOTrainerConfig:
     recompute_logprobs: bool = True
     # Cap on total tokens (sum of len(prompt) + len(action) across rows) per
     # padded forward in `_batched_logprobs`. Keeps activation memory within
-    # GPU bounds when K×T padded sequences would otherwise OOM A100-80GB.
-    # Default 8192 fits Qwen2.5-1.5B comfortably with bf16; raise for
-    # higher-throughput cards or smaller models.
-    max_tokens_per_microbatch: int = 8192
+    # GPU bounds when K×T padded sequences would otherwise OOM A100-80GB
+    # while sharing the GPU with vLLM's ~31 GiB KV cache.
+    # Default 2048 keeps forward+backward activations under ~10 GiB for
+    # Qwen2.5-1.5B; raise on larger cards or single-tenant GPUs.
+    max_tokens_per_microbatch: int = 2048
 
 
 @dataclass

@@ -179,8 +179,10 @@ class LoRAPolicy:
                 # delta = (B @ A) * scaling — one tensor of base_weight shape
                 delta = (lora_B @ lora_A) * scaling
                 merged = base_weight + delta
-                # Canonical name is the parent module's `.weight`
-                full_name = f"base_model.model.{mod_name}.weight"
+                # `mod_name` from named_modules() already carries the full
+                # `base_model.model.<...>` PEFT prefix (since `self.model` IS
+                # the wrapped PeftModel). Don't double-prefix here.
+                full_name = f"{mod_name}.weight"
                 yield canonicalize_lora_target_name(full_name), merged
                 # `merged` and `delta` go out of scope here → freed before
                 # next iteration.
