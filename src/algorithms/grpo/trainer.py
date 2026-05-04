@@ -150,6 +150,34 @@ class HGPOTrainer:
         target = torch.tensor(action_token_ids, dtype=torch.long, device=device)
         return log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1)  # [Tk]
 
+    def _ref_logprobs_for_turn(
+        self, prompt_token_ids: list[int], action_token_ids: list[int]
+    ) -> "torch.Tensor":
+        """Per-token logprobs under the *frozen reference* policy (LoRA disabled).
+
+        Used for the KL-to-reference penalty (review C2). PEFT's
+        `disable_adapter()` context manager temporarily bypasses the LoRA
+        adapter so the forward sees only the original SFT base weights.
+        Returned tensor is detached (no grad needed for the reference side).
+        """
+        import torch  # type: ignore[import-not-found]
+        from torch.nn import functional as F  # type: ignore[import-not-found]
+
+        full = prompt_token_ids + list(action_token_ids)
+        if not action_token_ids:
+            return torch.zeros(0)
+
+        device = next(self.policy.model.parameters()).device
+        input_ids = torch.tensor([full], dtype=torch.long, device=device)
+        with torch.no_grad(), self.policy.model.disable_adapter():
+            logits = self.policy.model(input_ids).logits  # [1, L, V]
+        start = len(prompt_token_ids) - 1
+        end = start + len(action_token_ids)
+        slice_logits = logits[0, start:end, :]
+        log_probs = F.log_softmax(slice_logits, dim=-1)
+        target = torch.tensor(action_token_ids, dtype=torch.long, device=device)
+        return log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1).detach()
+
     def compute_loss(self, group: TrajectoryGroup) -> tuple["torch.Tensor", TrainStepStats]:
         """Compute the H-GRPO total loss for one group.
 
@@ -165,6 +193,7 @@ class HGPOTrainer:
 
         all_new_lp: list[torch.Tensor] = []
         all_old_lp: list[torch.Tensor] = []
+        all_ref_lp: list[torch.Tensor] = []
         all_adv: list[torch.Tensor] = []
         for i, traj in enumerate(group.trajectories):
             for t, turn in enumerate(traj.turns):
@@ -176,10 +205,12 @@ class HGPOTrainer:
                     turn.action_token_logprobs, dtype=torch.float32, device=device
                 )
                 new_lp = self._new_logprobs_for_turn(prompt_ids, ids)
+                ref_lp = self._ref_logprobs_for_turn(prompt_ids, ids)
                 a_t = combined[i][t]
                 adv_vec = torch.full((len(ids),), float(a_t), dtype=torch.float32, device=device)
                 all_new_lp.append(new_lp)
                 all_old_lp.append(old_lp)
+                all_ref_lp.append(ref_lp)
                 all_adv.append(adv_vec)
 
         if not all_new_lp:
@@ -188,23 +219,31 @@ class HGPOTrainer:
 
         new_lp_t = torch.cat(all_new_lp).to(torch.float32)
         old_lp_t = torch.cat(all_old_lp).to(torch.float32)
+        ref_lp_t = torch.cat(all_ref_lp).to(torch.float32)
         adv_t = torch.cat(all_adv).to(torch.float32)
 
+        # PPO importance ratio uses (new vs old=rollout) — that's correct.
         ratio = torch.exp(new_lp_t - old_lp_t)
         clip_eps = self.cfg.clip_eps
         clipped = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv_t
         unclipped = ratio * adv_t
         policy_loss = -torch.minimum(unclipped, clipped).mean()
 
-        kl_per_tok = (new_lp_t - old_lp_t)
+        # KL penalty uses (new vs ref=frozen base) — anchors policy to SFT prior
+        # per proposal §3.1 (review item C2). k3 estimator: kl = (rho - 1) - log(rho),
+        # non-negative per-token AND unbiased estimator of KL(ref||new).
+        ref_log_ratio = new_lp_t - ref_lp_t
+        ref_ratio = torch.exp(ref_log_ratio)
+        kl_per_tok = (ref_ratio - 1.0) - ref_log_ratio
         observed_kl = float(kl_per_tok.mean().detach().item())
         kl_coef = self.kl_controller.coef
         kl_term = kl_coef * kl_per_tok.mean()
 
         cons = float(adv["consistency"])
-        cons_term = torch.tensor(cons, dtype=torch.float32, device=device)
-
-        total = policy_loss + kl_term + cons_term
+        # Consistency reg has zero gradient for Methods A/C — see comment below.
+        # Excluded from `total` (review C3). Will be re-added on TurnRD's params
+        # when Method B lands.
+        total = policy_loss + kl_term
 
         traj_adv = adv["traj_adv"]
         flat_turn_adv: list[float] = [v for row in adv["turn_adv"] for v in row]

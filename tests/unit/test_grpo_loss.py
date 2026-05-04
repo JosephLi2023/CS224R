@@ -78,3 +78,12 @@ def test_kl_k3_is_nonnegative_and_zero_at_match():
     # k3 ≥ 0 always (Jensen inequality)
     assert out[1] > 0
     assert out[2] > 0
+
+
+def test_kl_k3_is_non_negative_for_all_inputs():
+    """C1 regression test: k3 estimator is non-negative per-token, so the
+    sign confusion in trainer.compute_loss can't recur."""
+    new = [0.0, -1.0, 1.0, 0.5, -0.5, 2.0, -2.0]
+    old = [0.0, 0.0, 0.0, -0.5, 0.5, -1.0, 1.0]
+    out = kl_k3_per_token(new, old)
+    assert all(x >= 0 for x in out), f"k3 produced negative entry: {out}"
