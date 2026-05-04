@@ -24,9 +24,9 @@ The `/vol/...` paths are shared across Modal container instances via
 the cs224r project Volume — see `infra/common.py::volume`.
 
 Usage:
-  scripts/run_method_b_modal.py --rounds 5 --episodes-per-round 40
-  scripts/run_method_b_modal.py --dry-run    # print commands only
-  scripts/run_method_b_modal.py --rounds 1 --episodes-per-round 2 --turnrd-epochs 1   # tiny smoke
+  scripts/run_turnrd_modal.py --rounds 5 --episodes-per-round 40
+  scripts/run_turnrd_modal.py --dry-run    # print commands only
+  scripts/run_turnrd_modal.py --rounds 1 --episodes-per-round 2 --turnrd-epochs 1   # tiny smoke
 
 Requires `modal` on PATH. The two Modal app entrypoints invoked are:
   - infra/app_train_loop.py::train_loop_smoke  (parent H-GRPO + producer)
