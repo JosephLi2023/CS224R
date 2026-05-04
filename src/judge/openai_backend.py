@@ -52,15 +52,22 @@ class OpenAIJudge:
 
         Reads `OPENAI_API_KEY` implicitly from the process env (Modal Secret
         injects it; tests can monkeypatch this method to avoid network).
+
+        `max_retries=0` disables the OpenAI SDK's built-in retry layer so
+        the in-house retry loop in `score_turns` / `score_turns_async` is
+        the single source of truth. Without this, transient bursts could
+        trigger up to (sdk_retries + 1) * (self.max_retries + 1) HTTP
+        attempts per call, blowing through `max_judge_calls_per_run`
+        budgets and rate-limit headroom (review item I1).
         """
         if self._client is not None and self._async_client is not None:
             return
         from openai import AsyncOpenAI, OpenAI  # local import to avoid hard dep at import time
 
         if self._client is None:
-            self._client = OpenAI(timeout=self.timeout_s)
+            self._client = OpenAI(timeout=self.timeout_s, max_retries=0)
         if self._async_client is None:
-            self._async_client = AsyncOpenAI(timeout=self.timeout_s)
+            self._async_client = AsyncOpenAI(timeout=self.timeout_s, max_retries=0)
 
     # ------------------------------------------------------------------
     # Shared helpers
@@ -162,7 +169,10 @@ class OpenAIJudge:
                 if content is None:
                     raise ValueError("OpenAIJudge: response content was None")
                 return self._parse_response_to_turn_scores(content, request)
-            except BaseException as exc:
+            except Exception as exc:  # noqa: BLE001 — transient classification done in helper
+                # Narrowed from BaseException so KeyboardInterrupt /
+                # SystemExit / asyncio.CancelledError propagate as Python
+                # intends (review item I2).
                 if self._is_transient(exc) and attempt < self.max_retries:
                     last_exc = exc
                     time.sleep(self._backoff_seconds(attempt))
@@ -189,7 +199,10 @@ class OpenAIJudge:
                 if content is None:
                     raise ValueError("OpenAIJudge: response content was None")
                 return self._parse_response_to_turn_scores(content, request)
-            except BaseException as exc:
+            except Exception as exc:  # noqa: BLE001 — transient classification done in helper
+                # Narrowed from BaseException so asyncio.CancelledError
+                # (a BaseException subclass) propagates the gather cancel
+                # cascade transparently per Python's contract (review I2).
                 if self._is_transient(exc) and attempt < self.max_retries:
                     last_exc = exc
                     await asyncio.sleep(self._backoff_seconds(attempt))

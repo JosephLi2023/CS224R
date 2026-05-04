@@ -251,6 +251,44 @@ def test_openai_judge_score_turns_exhausts_retries_then_raises() -> None:
     assert len(call_log) == 3
 
 
+def test_openai_judge_constructs_clients_with_sdk_retries_disabled() -> None:
+    """Clients must be constructed with `max_retries=0` so the in-house
+    retry loop is the single source of truth (review item I1: SDK's own
+    retry layer would otherwise compound, blowing through the budget)."""
+    constructed: dict[str, dict[str, Any]] = {}
+
+    class _FakeClient:
+        def __init__(self, **kwargs: Any) -> None:
+            constructed.setdefault("sync", {}).update(kwargs)
+
+    class _FakeAsyncClient:
+        def __init__(self, **kwargs: Any) -> None:
+            constructed.setdefault("async", {}).update(kwargs)
+
+    import src.judge.openai_backend as backend_mod
+
+    monkeypatch_attrs: dict[str, Any] = {}
+
+    def _ensure_clients_real(self: OpenAIJudge) -> None:
+        # Mirror the production lazy import path but inject our fakes.
+        if self._client is None:
+            self._client = _FakeClient(timeout=self.timeout_s, max_retries=0)
+        if self._async_client is None:
+            self._async_client = _FakeAsyncClient(timeout=self.timeout_s, max_retries=0)
+
+    judge = OpenAIJudge({"model": "gpt-4o-mini", "timeout_s": 9.5})
+    judge._ensure_clients = _ensure_clients_real.__get__(judge, OpenAIJudge)  # type: ignore[method-assign]
+    judge._ensure_clients()
+
+    assert "sync" in constructed and "async" in constructed
+    assert constructed["sync"]["max_retries"] == 0
+    assert constructed["sync"]["timeout"] == 9.5
+    assert constructed["async"]["max_retries"] == 0
+    assert constructed["async"]["timeout"] == 9.5
+    # Silence "unused" noise for backend_mod / monkeypatch_attrs (kept for grep).
+    del backend_mod, monkeypatch_attrs
+
+
 def test_openai_judge_score_turns_does_not_retry_non_transient_errors() -> None:
     """Generic RuntimeError (e.g. auth failure) should NOT be retried."""
     judge = OpenAIJudge(
@@ -271,6 +309,57 @@ def test_openai_judge_score_turns_does_not_retry_non_transient_errors() -> None:
     with pytest.raises(RuntimeError, match="auth failure"):
         judge.score_turns(req)
     assert len(call_log) == 1  # no retry
+
+
+def test_openai_judge_score_turns_propagates_keyboard_interrupt() -> None:
+    """KeyboardInterrupt is a BaseException; it MUST escape the retry loop
+    untouched (review item I2: narrowed `except BaseException` to `except
+    Exception` precisely so Ctrl-C and asyncio.CancelledError propagate)."""
+    judge = OpenAIJudge(
+        {"model": "gpt-4o-mini", "max_retries": 5, "backoff_base_s": 0.0}
+    )
+    req = _request(reward=1.0, n_turns=1)
+    call_log: list[int] = []
+
+    def _create(**_kwargs: Any) -> Any:
+        call_log.append(1)
+        raise KeyboardInterrupt("user pressed Ctrl-C")
+
+    async def _async_create(**_kwargs: Any) -> Any:
+        return _completion_with_content('{"scores": [{"turn": 0, "score": 1.0}]}')
+
+    _install_fake_clients(judge, _create, _async_create)
+
+    with pytest.raises(KeyboardInterrupt):
+        judge.score_turns(req)
+    # Crucially: no retry — the BaseException blew straight through.
+    assert len(call_log) == 1
+
+
+def test_openai_judge_score_turns_async_propagates_cancellation() -> None:
+    """asyncio.CancelledError (BaseException in 3.8+) must escape the
+    retry loop so `gather(...)` cancellation cascades work (review I2)."""
+    judge = OpenAIJudge(
+        {"model": "gpt-4o-mini", "max_retries": 5, "backoff_base_s": 0.0}
+    )
+    req = _request(reward=1.0, n_turns=1)
+    call_log: list[int] = []
+
+    def _create(**_kwargs: Any) -> Any:
+        return _completion_with_content('{"scores": [{"turn": 0, "score": 1.0}]}')
+
+    async def _async_create(**_kwargs: Any) -> Any:
+        call_log.append(1)
+        raise asyncio.CancelledError()
+
+    _install_fake_clients(judge, _create, _async_create)
+
+    async def _run() -> None:
+        await judge.score_turns_async(req)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(_run())
+    assert len(call_log) == 1  # no retry on cancellation
 
 
 # ---------------------------------------------------------------------------

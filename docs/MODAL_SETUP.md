@@ -172,6 +172,17 @@ sed -i '' 's/"backend": "vllm"/"backend": "openai"/' configs/method_hgpo_judge.j
 `infra/app_train.py::train` (and `infra/app_judge.py`) mount it onto the
 function container, so `OPENAI_API_KEY` is in the env automatically.
 
+If the secret resolution would block your deploy (you haven't created it
+yet but you only want to run the baseline / vLLM-judge path for now),
+opt out with:
+```bash
+export CS224R_SKIP_OPENAI_SECRET=1
+modal run infra/app_train.py::hello
+```
+This prints a WARNING and skips attaching the secret to every function.
+Method A (`judge.backend=openai`) will then fail at first
+`OpenAIJudge.score_turns` call with a clear missing-key error.
+
 ---
 
 ## 8. Cost dashboard

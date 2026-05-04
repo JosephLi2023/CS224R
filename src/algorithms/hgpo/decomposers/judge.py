@@ -30,11 +30,24 @@ _logger = logging.getLogger(__name__)
 def _build_request(group_task_id: str, env_name: str, traj: Trajectory, k_index: int) -> JudgeRequest:
     """Build a JudgeRequest for one trajectory.
 
-    `task_id` is qualified with the K-sample index so cache entries from
-    different samples of the same task never collide. The cache's
-    `prefix_hash` already keys on the action sequence, so two K-samples
-    with identical action prefixes would naturally share entries; we
-    nonetheless keep task_id distinct as a defensive uniqueness invariant.
+    `task_id` is qualified as `{group_task_id}#k{k_index}` for a
+    correctness reason (NOT defensive uniqueness): the cache stores
+    `normalized` scores that are pre-rescaled against THIS trajectory's
+    `final_reward`. If two K-samples in a group shared cache entries
+    (because their action prefixes match) and they had different `R`s,
+    reading the stored `normalized` values would silently produce
+    per-turn rewards that DO NOT sum to that trajectory's `R`,
+    violating the proposal §3.2 invariant the cache exists to preserve.
+    Per-K qualification makes the entries disjoint so this can't happen.
+
+    Side effect: this defeats the cross-K prefix-sharing that the cache's
+    `prefix_hash` was designed to enable (`src/judge/cache.py::prefix_hash`).
+    That's acceptable today because `OpenAIJudge` sends the FULL trajectory
+    to the model (so per-turn raw scores are not actually prefix-conditioned
+    anyway, and cross-K sharing was aspirational). If future judges become
+    truly prefix-conditioned, the right fix is to cache `raw_score` only and
+    re-normalize at read time using `request.final_reward` — then the
+    `#k{i}` qualifier can be dropped.
     """
     qualified_task_id = f"{group_task_id}#k{k_index}"
     turns = [
