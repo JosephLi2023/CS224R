@@ -8,12 +8,17 @@ which is structurally identical.
 
 from __future__ import annotations
 
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Callable, Optional, Protocol, runtime_checkable
 
 from src.algorithms.grpo.rollout import TrajectoryGroup
 from src.algorithms.grpo.trainer import PerTurnDecomposer, progress_decomposer
 from src.judge.backend import JudgeBackend
 from src.judge.cache import JudgeCache
+
+if TYPE_CHECKING:
+    import torch
+
+    from src.turnrd.model import TurnRD
 
 
 @runtime_checkable
@@ -36,6 +41,9 @@ def build_decomposer(
     *,
     backend: JudgeBackend | None = None,
     cache: JudgeCache | None = None,
+    model: "TurnRD | None" = None,
+    embedder: Optional[Callable[..., "torch.Tensor"]] = None,
+    device: str | None = None,
 ) -> PerTurnDecomposer:
     """Dispatch to the decomposer named in `cfg["hgpo"]["decomposer"]`.
 
@@ -43,7 +51,13 @@ def build_decomposer(
       (re-exported from `src.algorithms.grpo.trainer`).
     - "judge":    requires `backend` + `cache`; returns a callable wrapping
       `JudgeDecomposer.decompose`.
-    - "turnrd":   not yet implemented (Day 12; MEDIUM_FIXES.md M1).
+    - "turnrd":   requires `model` (a `TurnRD` nn.Module) + `embedder` (a
+      `Callable[[Trajectory], torch.Tensor]` returning per-turn embeddings of
+      shape `[T_i, D]`); returns a callable wrapping
+      `TurnRDDecomposer.decompose`. HGPOTrainer integration + refresh hook
+      lands Day 14 — today's surface is the model + adapter + tests only
+      (see `MEDIUM_FIXES.md::M1` and the
+      `~/.llms/plans/cs224r_hgpo_method_b_turnrd_m1.plan.md` plan).
 
     Returns a callable matching the `PerTurnDecomposer` signature so the
     trainer can plug it in directly.
@@ -68,9 +82,14 @@ def build_decomposer(
         )
         return decomposer.decompose
     if name == "turnrd":
-        raise NotImplementedError(
-            "TurnRD decomposer (Method B) lands Day 12 per MEDIUM_FIXES.md M1."
-        )
+        if model is None or embedder is None:
+            raise ValueError(
+                "build_decomposer(decomposer='turnrd'): both `model` and `embedder` "
+                "must be provided."
+            )
+        from src.algorithms.hgpo.decomposers.turnrd import build_turnrd_decomposer
+
+        return build_turnrd_decomposer(cfg, model=model, embedder=embedder, device=device)
     raise ValueError(
         f"Unknown decomposer name {name!r}; expected 'progress' | 'judge' | 'turnrd'."
     )
