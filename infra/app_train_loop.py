@@ -48,6 +48,13 @@ def train_loop_smoke(
     sys.path.insert(0, "/vol/code/webshop")
     sys.path.insert(0, "/workspace")
 
+    # Modal Volumes are eventually-consistent across containers. Reload
+    # at startup so this round's refresh fn (when Method B's
+    # cfg.turnrd.ckpt_path is set) sees the ckpt written by the
+    # standalone train_turnrd in the PREVIOUS orchestration round
+    # (which called volume.commit() before exiting).
+    volume.reload()
+
     from src.algorithms.grpo.collectors import RolloutCollector, RolloutCollectorConfig
     from src.algorithms.grpo.trainer import (
         HGPOTrainer,

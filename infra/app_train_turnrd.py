@@ -60,6 +60,12 @@ def train_turnrd_run(
 
     import torch  # type: ignore[import-not-found]
 
+    # Modal Volumes are eventually-consistent across containers. Reload
+    # at startup so we see the latest replay JSONL written by the parent
+    # train_loop in the previous orchestration round (which called
+    # volume.commit() before exiting).
+    volume.reload()
+
     from src.turnrd.model import TurnRD, TurnRDConfig
     from src.turnrd.train import train_turnrd
 

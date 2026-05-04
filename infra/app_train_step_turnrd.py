@@ -84,6 +84,11 @@ def train_step_turnrd_smoke(
     from src.turnrd.embedders import policy_hidden_state_embedder
     from src.turnrd.model import TurnRD, TurnRDConfig
 
+    # Modal Volumes are eventually-consistent — reload at startup so a
+    # repeated smoke invocation sees the freshly-truncated replay file
+    # if `os.path.exists()` is checked below.
+    volume.reload()
+
     # -----------------------------------------------------------------
     # 1. Policy + vLLM runner (same as the flat-GRPO smoke)
     # -----------------------------------------------------------------

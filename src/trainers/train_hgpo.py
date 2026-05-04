@@ -177,6 +177,23 @@ def _build_turnrd_branch(
         ckpt_path_resolved = Path(ckpt_path)
 
         def _refresh() -> None:
+            # The standalone train_turnrd writes the ckpt in a separate
+            # Modal container and calls volume.commit() before exiting.
+            # Reload here so this container's view of /vol/cache/ picks
+            # up the freshly-written ckpt (Modal Volumes are
+            # eventually-consistent across containers). No-op when the
+            # parent train_loop and the standalone trainer happen to
+            # share a container (single-process tests).
+            try:
+                from infra.common import volume as _shared_volume  # type: ignore[import-not-found]
+
+                _shared_volume.reload()
+            except Exception:
+                # `infra.common` is only importable inside a Modal
+                # container. Outside of Modal (e.g. CPU smoke test) the
+                # ckpt is on the local filesystem and reload is a no-op
+                # by definition — silently skip.
+                pass
             if not ckpt_path_resolved.is_file():
                 logger.warning(
                     "TurnRD refresh: ckpt %s not found yet; skipping load.",

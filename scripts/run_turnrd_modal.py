@@ -301,6 +301,28 @@ def _preflight(cfg: OrchestrationConfig) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _to_container_path(local_path: Path) -> str:
+    """Translate a local config path to its mounted location inside Modal.
+
+    `infra/image.py::_add_workspace` mounts the repo root at `/workspace`
+    inside the container. The orchestrator runs on the host with absolute
+    paths under `REPO_ROOT`; passing those raw to `modal run` would land
+    `open("/Users/.../config.json")` inside a container where that path
+    doesn't exist. Translate to `/workspace/<relative-to-repo>` so the
+    container reads from the mounted source tree.
+    """
+    abs_path = local_path.resolve()
+    try:
+        rel = abs_path.relative_to(REPO_ROOT)
+    except ValueError as e:
+        raise SystemExit(
+            f"ERROR: config {abs_path} is outside REPO_ROOT={REPO_ROOT}; "
+            "cannot map to a Modal /workspace path. Place the config "
+            "inside the repo before launching."
+        ) from e
+    return f"/workspace/{rel.as_posix()}"
+
+
 def _train_loop_cmd(cfg: OrchestrationConfig, round_idx: int) -> list[str]:
     """`modal run infra/app_train_loop.py --config <cfg> --n-episodes M ...`
 
@@ -312,10 +334,13 @@ def _train_loop_cmd(cfg: OrchestrationConfig, round_idx: int) -> list[str]:
     We rely on the JSON config to set most of these (per the Day-14
     `--config` switch); only `--n-episodes`, `--task-id-offset`, and
     `--run-name` are overridden round-by-round (and seed-by-seed).
+
+    `--config` is translated to its in-container `/workspace/...` path
+    so `open(...)` inside the Modal function actually finds the file.
     """
     return [
         "modal", "run", "infra/app_train_loop.py",
-        "--config", str(cfg.config_path),
+        "--config", _to_container_path(cfg.config_path),
         "--n-episodes", str(cfg.episodes_per_round),
         "--task-id-offset", str(
             cfg.base_task_id_offset + round_idx * cfg.episodes_per_round
