@@ -142,3 +142,58 @@ def test_render_includes_observation_and_valid_actions():
     assert "search[laptop bag]" in prompt
     assert "Thought:" in prompt
     assert state.observation_text in prompt
+
+
+def test_env_pool_is_reused_across_collect_group_calls():
+    """M2 regression: with reuse_envs=True (default), the same env instances
+    are reused on subsequent collect_group calls."""
+    r = _FakeRunner(["Action: search[bag]", "Action: click[item-0]", "Action: click[buy]"])
+    built: list[FakeWebShopEnv] = []
+
+    def factory():
+        e = FakeWebShopEnv(max_steps=8)
+        built.append(e)
+        return e
+
+    coll = RolloutCollector(
+        runner=r,
+        env_factory=factory,
+        prompt_renderer=render_webshop_turn_prompt,
+        action_parser=parse_react_action,
+        cfg=RolloutCollectorConfig(max_turns=5),
+    )
+    coll.collect_group(task_id=0, env_name="webshop", K=3, sampling=_S())
+    assert len(built) == 3, "first call should build K=3 envs"
+    coll.collect_group(task_id=1, env_name="webshop", K=3, sampling=_S())
+    assert len(built) == 3, "second call should reuse, NOT build new envs"
+
+
+def test_env_pool_grows_when_K_increases():
+    r = _FakeRunner(["Action: search[bag]", "Action: click[item-0]", "Action: click[buy]"])
+    built: list[FakeWebShopEnv] = []
+    coll = RolloutCollector(
+        runner=r,
+        env_factory=lambda: (built.append(FakeWebShopEnv(max_steps=8)), built[-1])[1],
+        prompt_renderer=render_webshop_turn_prompt,
+        action_parser=parse_react_action,
+        cfg=RolloutCollectorConfig(max_turns=5),
+    )
+    coll.collect_group(task_id=0, env_name="webshop", K=2, sampling=_S())
+    coll.collect_group(task_id=1, env_name="webshop", K=4, sampling=_S())
+    assert len(built) == 4, "pool should grow from 2 → 4 on the larger call"
+
+
+def test_reuse_envs_off_builds_fresh_each_call():
+    r = _FakeRunner(["Action: search[bag]", "Action: click[item-0]", "Action: click[buy]"])
+    built: list[FakeWebShopEnv] = []
+    coll = RolloutCollector(
+        runner=r,
+        env_factory=lambda: (built.append(FakeWebShopEnv(max_steps=8)), built[-1])[1],
+        prompt_renderer=render_webshop_turn_prompt,
+        action_parser=parse_react_action,
+        cfg=RolloutCollectorConfig(max_turns=5),
+        reuse_envs=False,
+    )
+    coll.collect_group(task_id=0, env_name="webshop", K=2, sampling=_S())
+    coll.collect_group(task_id=1, env_name="webshop", K=2, sampling=_S())
+    assert len(built) == 4, "with reuse_envs=False each call rebuilds K envs"

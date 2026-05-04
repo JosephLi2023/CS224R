@@ -189,6 +189,62 @@ class HGPOTrainer:
         target = torch.tensor(action_token_ids, dtype=torch.long, device=device)
         return log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1).detach()
 
+    def _batched_logprobs(
+        self,
+        prompt_action_pairs: list[tuple[list[int], list[int]]],
+        *,
+        use_ref: bool,
+    ) -> list["torch.Tensor"]:
+        """Single padded forward → per-turn action logprobs (review M6).
+
+        Replaces the K×T per-turn forward loop with one batched call. For
+        each (prompt_ids, action_ids) pair, returns a 1-D tensor of length
+        len(action_ids) with per-token logprobs under the current policy
+        (use_ref=False) or the frozen base (use_ref=True, LoRA disabled).
+        """
+        import torch  # type: ignore[import-not-found]
+        from torch.nn import functional as F  # type: ignore[import-not-found]
+
+        device = next(self.policy.model.parameters()).device
+        pad_id = int(getattr(self.policy.tokenizer, "pad_token_id", 0) or 0)
+
+        # Filter out empty pairs and remember original order.
+        non_empty: list[tuple[int, list[int], list[int]]] = []
+        for idx, (prompt_ids, action_ids) in enumerate(prompt_action_pairs):
+            if prompt_ids and action_ids:
+                non_empty.append((idx, prompt_ids, action_ids))
+
+        N = len(prompt_action_pairs)
+        out: list[torch.Tensor] = [torch.zeros(0, device=device) for _ in range(N)]
+        if not non_empty:
+            return out
+
+        full_seqs = [p + a for _, p, a in non_empty]
+        max_len = max(len(s) for s in full_seqs)
+
+        input_ids = torch.full((len(full_seqs), max_len), pad_id, dtype=torch.long, device=device)
+        attention_mask = torch.zeros((len(full_seqs), max_len), dtype=torch.long, device=device)
+        for i, s in enumerate(full_seqs):
+            input_ids[i, : len(s)] = torch.tensor(s, dtype=torch.long, device=device)
+            attention_mask[i, : len(s)] = 1
+
+        if use_ref:
+            with torch.no_grad(), self.policy.model.disable_adapter():
+                logits = self.policy.model(input_ids, attention_mask=attention_mask).logits
+        else:
+            with torch.set_grad_enabled(True):
+                logits = self.policy.model(input_ids, attention_mask=attention_mask).logits
+
+        for row, (orig_idx, prompt_ids, action_ids) in enumerate(non_empty):
+            start = len(prompt_ids) - 1
+            end = start + len(action_ids)
+            slice_logits = logits[row, start:end, :].to(torch.float32)
+            log_probs = F.log_softmax(slice_logits, dim=-1)
+            target = torch.tensor(action_ids, dtype=torch.long, device=device)
+            lp = log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1)
+            out[orig_idx] = lp.detach() if use_ref else lp
+        return out
+
     def compute_loss(self, group: TrajectoryGroup) -> tuple["torch.Tensor", TrainStepStats]:
         """Compute the H-GRPO total loss for one group.
 
@@ -206,23 +262,38 @@ class HGPOTrainer:
         all_old_lp: list[torch.Tensor] = []
         all_ref_lp: list[torch.Tensor] = []
         all_adv: list[torch.Tensor] = []
+        # Collect all (prompt, action) pairs first; the heavy forward passes
+        # (one new, one ref) happen ONCE per group via _batched_logprobs (M6).
+        pa_pairs: list[tuple[list[int], list[int]]] = []
+        per_turn_meta: list[tuple[int, int]] = []  # (i_traj, t_turn)
         for i, traj in enumerate(group.trajectories):
             for t, turn in enumerate(traj.turns):
                 ids = list(turn.action_token_ids)
                 prompt_ids = list(turn.prompt_token_ids)
                 if not ids or not prompt_ids:
                     continue
-                old_lp = torch.tensor(
-                    turn.action_token_logprobs, dtype=torch.float32, device=device
-                )
-                new_lp = self._new_logprobs_for_turn(prompt_ids, ids)
-                ref_lp = self._ref_logprobs_for_turn(prompt_ids, ids)
-                a_t = combined[i][t]
-                adv_vec = torch.full((len(ids),), float(a_t), dtype=torch.float32, device=device)
-                all_new_lp.append(new_lp)
-                all_old_lp.append(old_lp)
-                all_ref_lp.append(ref_lp)
-                all_adv.append(adv_vec)
+                pa_pairs.append((prompt_ids, ids))
+                per_turn_meta.append((i, t))
+
+        if not pa_pairs:
+            zero = torch.zeros((), device=device, requires_grad=True)
+            return zero, TrainStepStats()
+
+        new_lps = self._batched_logprobs(pa_pairs, use_ref=False)
+        ref_lps = self._batched_logprobs(pa_pairs, use_ref=True)
+
+        for k, ((prompt_ids, ids), (i, t)) in enumerate(zip(pa_pairs, per_turn_meta)):
+            old_lp = torch.tensor(
+                group.trajectories[i].turns[t].action_token_logprobs,
+                dtype=torch.float32,
+                device=device,
+            )
+            a_t = combined[i][t]
+            adv_vec = torch.full((len(ids),), float(a_t), dtype=torch.float32, device=device)
+            all_new_lp.append(new_lps[k])
+            all_old_lp.append(old_lp)
+            all_ref_lp.append(ref_lps[k])
+            all_adv.append(adv_vec)
 
         if not all_new_lp:
             zero = torch.zeros((), device=device, requires_grad=True)

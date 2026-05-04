@@ -63,12 +63,32 @@ class RolloutCollector:
         prompt_renderer: PromptRenderer,
         action_parser: ActionParser,
         cfg: RolloutCollectorConfig | None = None,
+        reuse_envs: bool = True,
     ) -> None:
+        """K-trajectory rollout collector.
+
+        Args:
+            reuse_envs: when True (default), env instances built on the first
+                `collect_group` call are cached and reused across episodes
+                via `env.reset()`. Skips the ~5–8 s of WebShop product/goal
+                loading per episode (review M2). Set False for unit tests
+                that require fresh env state on every call.
+        """
         self.runner = runner
         self.env_factory = env_factory
         self.render = prompt_renderer
         self.parse = action_parser
         self.cfg = cfg or RolloutCollectorConfig()
+        self.reuse_envs = reuse_envs
+        self._env_pool: list[Any] = []
+
+    def _acquire_envs(self, K: int) -> list[Any]:
+        """Return K env instances, growing the pool lazily when reuse is on."""
+        if not self.reuse_envs:
+            return [self.env_factory() for _ in range(K)]
+        while len(self._env_pool) < K:
+            self._env_pool.append(self.env_factory())
+        return self._env_pool[:K]
 
     def collect_group(
         self,
@@ -81,7 +101,7 @@ class RolloutCollector:
         if getattr(sampling, "n", 1) != 1:
             sampling = _override_n(sampling, 1)
 
-        envs = [self.env_factory() for _ in range(K)]
+        envs = self._acquire_envs(K)
         states: list[Any] = [_safe_reset(env, task_id) for env in envs]
 
         traj_turns: list[list[TurnRecord]] = [[] for _ in range(K)]
