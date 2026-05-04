@@ -247,6 +247,14 @@ def main(action: str = "verify", small: bool = True) -> None:
         result = show_setup_sh.remote()
     elif action == "show_layout":
         result = show_webshop_layout.remote()
+    elif action == "show_human_ins":
+        result = show_human_ins_schema.remote()
+    elif action == "download_human_trajs":
+        result = download_human_trajectories.remote()
+    elif action == "show_human_trajs":
+        result = show_human_trajs_schema.remote()
+    elif action == "show_one_traj":
+        result = show_one_trajectory_full.remote()
     else:
         raise ValueError(f"Unknown action: {action!r} (expected 'download'/'verify'/'show_setup'/'show_layout')")
 
@@ -282,3 +290,118 @@ def show_webshop_layout() -> dict:
         if os.path.isdir(envs):
             out["web_agent_site_envs"] = sorted(os.listdir(envs))
     return out
+
+
+@app.function(image=data_image, volumes={VOLUME_MOUNT: volume}, timeout=10 * 60)
+def show_human_ins_schema() -> dict:
+    """Inspect items_human_ins.json to confirm whether it's full trajectories
+    or just instructions."""
+    import json
+    p = "/vol/data/webshop/items_human_ins.json"
+    with open(p) as f:
+        data = json.load(f)
+    out: dict = {"path": p, "type": type(data).__name__}
+    if isinstance(data, list):
+        out["n_records"] = len(data)
+        out["sample_first"] = data[0] if data else None
+        if data and isinstance(data[0], dict):
+            out["sample_keys"] = sorted(list(data[0].keys()))
+    elif isinstance(data, dict):
+        keys = list(data.keys())[:5]
+        out["n_top_keys"] = len(data)
+        out["first_5_keys"] = keys
+        if keys:
+            sv = data[keys[0]]
+            out["sample_value_type"] = type(sv).__name__
+            if isinstance(sv, list) and sv:
+                out["sample_value_first"] = sv[0] if not isinstance(sv[0], dict) else {k: type(v).__name__ for k, v in sv[0].items()}
+            elif isinstance(sv, dict):
+                out["sample_value_keys"] = sorted(list(sv.keys()))
+            else:
+                out["sample_value_preview"] = str(sv)[:300]
+    return out
+
+
+@app.function(image=data_image, volumes={VOLUME_MOUNT: volume}, timeout=20 * 60)
+def download_human_trajectories() -> dict:
+    """Download the released human-trajectory gdrive folder used by
+    setup.sh::get_human_trajs(). ~50 example trajectories the WebShop
+    paper authors made public for IL warm-start.
+
+    URL is hard-coded in WebShop's setup.sh (verified).
+    """
+    import os
+    import gdown  # type: ignore[import-not-found]
+    dst = "/vol/data/webshop/human_trajs"
+    os.makedirs(dst, exist_ok=True)
+    folder_url = "https://drive.google.com/drive/u/1/folders/16H7LZe2otq4qGnKw_Ic1dkt-o3U9Zsto"
+    print(">>> gdown.download_folder", folder_url)
+    files = gdown.download_folder(folder_url, output=dst, quiet=True)
+    volume.commit()
+    listing = sorted(os.listdir(dst))
+    return {"dst": dst, "n_files_returned": len(files) if files else 0, "n_files_on_disk": len(listing), "first_5": listing[:5]}
+
+
+@app.function(image=data_image, volumes={VOLUME_MOUNT: volume}, timeout=10 * 60)
+def show_human_trajs_schema() -> dict:
+    """Inspect the downloaded human-trajectory folder so we can build the
+    SFT dataset loader against the right schema."""
+    import json
+    import os
+    base = "/vol/data/webshop/human_trajs"
+    if not os.path.isdir(base):
+        return {"error": f"{base} does not exist; run download_human_trajectories first"}
+    files = sorted(os.listdir(base))
+    sample_files = []
+    for f in files[:3]:
+        p = os.path.join(base, f)
+        if not os.path.isfile(p):
+            continue
+        try:
+            with open(p) as fh:
+                content = fh.read()
+            head = content[:600]
+            try:
+                parsed = json.loads(content)
+                if isinstance(parsed, list):
+                    sample_files.append({"file": f, "len": len(content), "type": "list", "n_items": len(parsed), "first_item_keys": sorted(list(parsed[0].keys())) if parsed and isinstance(parsed[0], dict) else None, "first_item_preview": str(parsed[0])[:300] if parsed else None})
+                elif isinstance(parsed, dict):
+                    sample_files.append({"file": f, "len": len(content), "type": "dict", "top_keys": sorted(list(parsed.keys()))[:10]})
+            except Exception:
+                sample_files.append({"file": f, "len": len(content), "type": "text", "head": head})
+        except Exception as e:
+            sample_files.append({"file": f, "error": repr(e)})
+    return {"base": base, "n_files": len(files), "first_10": files[:10], "sample_files": sample_files}
+
+
+@app.function(image=data_image, volumes={VOLUME_MOUNT: volume}, timeout=10 * 60)
+def show_one_trajectory_full() -> dict:
+    """Dump ONE complete trajectory file (all rows) so we can build the loader."""
+    import json
+    import os
+    base = "/vol/data/webshop/human_trajs"
+    files = sorted(f for f in os.listdir(base) if os.path.isfile(os.path.join(base, f)))
+    if not files:
+        return {"error": "no trajectory files on disk"}
+    p = os.path.join(base, files[0])
+    rows = []
+    with open(p) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except Exception as e:
+                rows.append({"_parse_error": repr(e), "raw": line[:200]})
+    row_summaries = []
+    for r in rows:
+        if isinstance(r, dict):
+            row_summaries.append({k: (str(v)[:120] if not isinstance(v, (dict, list)) else type(v).__name__) for k, v in r.items()})
+    return {
+        "file": files[0],
+        "total_files": len(files),
+        "first_3_filenames": files[:3],
+        "n_rows_in_file": len(rows),
+        "row_summaries": row_summaries,
+    }
