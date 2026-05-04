@@ -328,3 +328,74 @@ def test_turnrd_decomposer_neutralises_grad_tracking_embedder() -> None:
     # Sanity: §3.2 invariant still holds.
     assert abs(sum(out[0]) - 1.0) < 1e-5
     assert abs(sum(out[1]) - 0.5) < 1e-5
+
+
+# ---------------------------------------------------------------------------
+# Day-13 learnable surface
+# ---------------------------------------------------------------------------
+
+
+def test_turnrd_decomposer_advertises_learnable_params() -> None:
+    """`has_learnable_params` is True for TurnRD; the trainer reads this via
+    `getattr` so other decomposers (Methods A/C) inherit False."""
+    model = _make_model()
+    embedder, _ = _deterministic_embedder()
+    decomposer = TurnRDDecomposer(model=model, embedder=embedder)
+    assert decomposer.has_learnable_params is True
+    # Sanity: the bare function `progress_decomposer` is the contrast case.
+    from src.algorithms.grpo.trainer import progress_decomposer
+
+    assert getattr(progress_decomposer, "has_learnable_params", False) is False
+
+
+def test_turnrd_decomposer_parameters_match_model_parameters() -> None:
+    """`decomposer.parameters()` yields the same tensors as `model.parameters()`."""
+    model = _make_model()
+    embedder, _ = _deterministic_embedder()
+    decomposer = TurnRDDecomposer(model=model, embedder=embedder)
+    a = list(decomposer.parameters())
+    b = list(model.parameters())
+    assert len(a) == len(b)
+    for pa, pb in zip(a, b):
+        # Same Parameter object, not just allclose.
+        assert pa is pb
+
+
+def test_turnrd_decomposer_decompose_with_grad_returns_grad_tracking_alpha() -> None:
+    """`decompose_with_grad(group)["alpha"].requires_grad is True` and
+    `.sum().backward()` populates non-zero `cls_query.grad`."""
+    model = _make_model()
+    embedder, _ = _deterministic_embedder()
+    decomposer = TurnRDDecomposer(model=model, embedder=embedder)
+    model.train()  # the trainer is responsible for this; mimic that here
+
+    group = _make_group([2, 3], [1.0, 0.5])
+    out = decomposer.decompose_with_grad(group)
+
+    assert out["alpha"].requires_grad
+    assert out["alpha"].shape == (2, 3)  # K_real=2, T_max=3
+    assert out["attention_mask"].shape == (2, 3)
+    assert out["nonempty_indices"] == [0, 1]
+    assert out["final_R"].shape == (2,)
+
+    # Backward through a non-trivial scalar must populate cls_query.grad.
+    # Note: `alpha.sum()` is always ≈ K (each row sums to 1 by softmax),
+    # so its gradient is 0. Use a position-weighted sum to inject a real
+    # gradient signal into TurnRD's params.
+    model.zero_grad(set_to_none=True)
+    weights = torch.arange(out["alpha"].shape[1], dtype=out["alpha"].dtype)
+    (out["alpha"] * weights).sum().backward()
+    assert model.cls_query.grad is not None
+    assert model.cls_query.grad.abs().sum().item() > 0.0
+
+
+def test_turnrd_decomposer_is_directly_callable() -> None:
+    """`__call__` forwards to `.decompose` so the trainer can pass the object
+    directly as the `decomposer` arg and still call `self.decomposer(group)`."""
+    model = _make_model()
+    embedder, _ = _deterministic_embedder()
+    decomposer = TurnRDDecomposer(model=model, embedder=embedder)
+    group = _make_group([2, 3], [0.5, -0.3])
+    out_a = decomposer(group)
+    out_b = decomposer.decompose(group)
+    assert out_a == out_b

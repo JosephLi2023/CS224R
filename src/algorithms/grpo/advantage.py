@@ -187,3 +187,70 @@ def consistency_loss(
         delta = sum(turn_row) - traj_a
         sq += delta * delta
     return lam * (sq / K)
+
+
+def consistency_loss_tensor(
+    lam: float,
+    traj_adv,
+    turn_adv,
+    attention_mask,
+):
+    """Torch-tensor twin of `consistency_loss` (Day 13).
+
+    Mirrors the same math but returns a scalar `torch.Tensor` so the
+    gradient can flow back into a learnable decomposer (Method B/TurnRD).
+    The pure-Python `consistency_loss` above stays as the source of
+    truth for stats reporting on Methods A/C; `consistency_loss_tensor`
+    is only invoked from the trainer when
+    `decomposer.has_learnable_params is True`.
+
+    Args:
+        lam: weight on the regularizer (0.0 returns a zero scalar tensor
+            that still has a graph parent so `.backward()` doesn't fail).
+        traj_adv: `[B]` tensor of `Â_traj(τ_i)`.
+        turn_adv: `[B, T]` tensor of `Â_turn(t, τ_i)`.
+        attention_mask: `[B, T]` long/bool tensor (1 = real, 0 = padded).
+
+    Returns:
+        Scalar `torch.Tensor` `lam * mean_i ‖ Σ_t Â_turn(t, τ_i)·m_t − Â_traj(τ_i) ‖²`.
+    """
+    # Local import: keep module load torch-free for pure-Python tests.
+    import torch  # type: ignore[import-not-found]
+
+    if traj_adv.dim() != 1:
+        raise ValueError(
+            f"consistency_loss_tensor: traj_adv must be [B], got shape "
+            f"{tuple(traj_adv.shape)}."
+        )
+    if turn_adv.dim() != 2:
+        raise ValueError(
+            f"consistency_loss_tensor: turn_adv must be [B, T], got shape "
+            f"{tuple(turn_adv.shape)}."
+        )
+    if attention_mask.dim() != 2:
+        raise ValueError(
+            f"consistency_loss_tensor: attention_mask must be [B, T], got shape "
+            f"{tuple(attention_mask.shape)}."
+        )
+    if traj_adv.shape[0] != turn_adv.shape[0]:
+        raise ValueError(
+            f"consistency_loss_tensor: B mismatch: traj_adv={traj_adv.shape[0]}, "
+            f"turn_adv={turn_adv.shape[0]}."
+        )
+    if turn_adv.shape != attention_mask.shape:
+        raise ValueError(
+            f"consistency_loss_tensor: turn_adv shape {tuple(turn_adv.shape)} "
+            f"!= attention_mask shape {tuple(attention_mask.shape)}."
+        )
+
+    if turn_adv.shape[0] == 0:
+        # Empty batch — return a 0 that still depends on traj_adv so the
+        # graph stays connected if the caller wants .backward() on it.
+        return lam * (traj_adv.sum() * 0.0)
+
+    mask_f = attention_mask.to(dtype=turn_adv.dtype)
+    summed_per_traj = (turn_adv * mask_f).sum(dim=-1)  # [B]
+    diff = (summed_per_traj - traj_adv.to(dtype=turn_adv.dtype)) ** 2  # [B]
+    # Cast lam through a tensor so the result follows turn_adv.dtype rather
+    # than promoting to float64 on a Python multiply.
+    return torch.as_tensor(lam, dtype=turn_adv.dtype, device=turn_adv.device) * diff.mean()

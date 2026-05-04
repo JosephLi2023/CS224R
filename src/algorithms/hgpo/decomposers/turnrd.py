@@ -15,7 +15,7 @@ The §3.2 invariant `Σ_t r̂_t = R` per trajectory holds by construction
 
 from __future__ import annotations
 
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterator, Optional
 
 import torch
 
@@ -201,6 +201,158 @@ class TurnRDDecomposer:
             cursor += 1
         return out_list
 
+    # -------------------------------------------------------------------
+    # Learnable surface (Day 13)
+    # -------------------------------------------------------------------
+
+    def __call__(self, group: TrajectoryGroup) -> list[list[float]]:
+        """Make the decomposer object directly callable.
+
+        The trainer's `build_advantages` invokes `self.decomposer(group)`
+        for stats reporting (Methods A/C path); making the object
+        callable lets the user pass a `TurnRDDecomposer` instance as the
+        trainer's `decomposer` argument and still reach
+        `decompose_with_grad` / `parameters` / `has_learnable_params`
+        on the same object.
+        """
+        return self.decompose(group)
+
+    @property
+    def has_learnable_params(self) -> bool:
+        """TurnRD is the learnable Method B decomposer.
+
+        The trainer (`HGPOTrainer.__init__` + `compute_loss`) reads this
+        via `getattr(decomposer, "has_learnable_params", False)` so other
+        decomposers (Methods A/C) need NOT define it — they implicitly
+        read False and the trainer skips the second optimizer + the C3
+        consistency-loss reattach for them.
+        """
+        return True
+
+    def parameters(self) -> Iterator[torch.nn.Parameter]:
+        """Forward to `self.model.parameters()` so the trainer can build a
+        separate AdamW for the TurnRD params (`turnrd_lr` in the config)."""
+        return self.model.parameters()
+
+    def state_dict(self) -> dict[str, torch.Tensor]:
+        """Forward to `self.model.state_dict()` for the refresh hook +
+        Modal checkpoint persistence."""
+        return self.model.state_dict()
+
+    def load_state_dict(
+        self,
+        sd: dict[str, torch.Tensor],
+        *,
+        strict: bool = True,
+    ) -> Any:
+        """Forward to `self.model.load_state_dict(...)`. Returned value is
+        whatever PyTorch returns (an `IncompatibleKeys` namedtuple); kept
+        as `Any` so we don't add a torch internals dep here."""
+        return self.model.load_state_dict(sd, strict=strict)
+
+    def decompose_with_grad(self, group: TrajectoryGroup) -> dict[str, Any]:
+        """Grad-enabled twin of `decompose`, used by `HGPOTrainer.compute_loss`
+        to build the C3 consistency loss against TurnRD params.
+
+        Differences from `decompose`:
+        - Does NOT enter `torch.no_grad()` around the model forward (we
+          want grad to flow back to TurnRD params).
+        - Does NOT call `model.eval()` (TurnRD is *training* on this path).
+        - Returns a dict of tensors instead of a Python list, so the
+          caller can compute torch-tensor advantages without re-padding:
+            * `alpha`:           `[K_real, T_max]` (the model's α weights)
+            * `attention_mask`:  `[K_real, T_max]` long
+            * `nonempty_indices`: `list[int]` (indices into `group.trajectories`
+                                  for the rows present in `alpha`)
+            * `final_R`:         `[K_real]` aligned with `alpha` rows.
+
+        Important: the embedder loop still runs under `torch.no_grad()`
+        and detaches each returned tensor — the gradient path we care
+        about is α_t → TurnRD params (NOT into the policy backbone the
+        embedder hits).
+        """
+        K = len(group.trajectories)
+        if K == 0:
+            return {
+                "alpha": torch.zeros(0, 0, device=self.device, dtype=self._model_dtype),
+                "attention_mask": torch.zeros(0, 0, dtype=torch.long, device=self.device),
+                "nonempty_indices": [],
+                "final_R": torch.zeros(0, device=self.device, dtype=self._model_dtype),
+            }
+
+        # 1. Embed each non-empty trajectory under no_grad (same rationale
+        #    as `decompose`: we only want gradient through TurnRD params).
+        per_traj_embeds: list[Optional[torch.Tensor]] = []
+        with torch.no_grad():
+            for traj in group.trajectories:
+                if not traj.turns:
+                    per_traj_embeds.append(None)
+                    continue
+                embed = self.embedder(traj)
+                if embed.dim() != 2:
+                    raise ValueError(
+                        f"embedder(traj) must return [T_i, D]; got shape "
+                        f"{tuple(embed.shape)} for task_id={traj.task_id}."
+                    )
+                if embed.shape[0] != len(traj.turns):
+                    raise ValueError(
+                        f"embedder returned T={embed.shape[0]} but trajectory has "
+                        f"{len(traj.turns)} turns (task_id={traj.task_id})."
+                    )
+                per_traj_embeds.append(embed.detach())
+
+        non_empty = [e for e in per_traj_embeds if e is not None]
+        if not non_empty:
+            return {
+                "alpha": torch.zeros(0, 0, device=self.device, dtype=self._model_dtype),
+                "attention_mask": torch.zeros(0, 0, dtype=torch.long, device=self.device),
+                "nonempty_indices": [],
+                "final_R": torch.zeros(0, device=self.device, dtype=self._model_dtype),
+            }
+
+        D = non_empty[0].shape[1]
+        for e in non_empty[1:]:
+            if e.shape[1] != D:
+                raise ValueError(
+                    "embedder returned inconsistent D across trajectories: "
+                    f"first={D}, this={e.shape[1]}."
+                )
+        T_max = max(e.shape[0] for e in non_empty)
+        nonempty_indices = [i for i, e in enumerate(per_traj_embeds) if e is not None]
+        K_real = len(nonempty_indices)
+
+        target_device = self.device
+        target_dtype = self._model_dtype
+
+        stacked = torch.zeros(K_real, T_max, D, dtype=target_dtype, device=target_device)
+        attn_mask = torch.zeros(K_real, T_max, dtype=torch.long, device=target_device)
+        for row, traj_idx in enumerate(nonempty_indices):
+            e = per_traj_embeds[traj_idx]
+            assert e is not None
+            T_i = e.shape[0]
+            stacked[row, :T_i] = e.to(device=target_device, dtype=target_dtype)
+            attn_mask[row, :T_i] = 1
+
+        # NOTE: no torch.no_grad(), no eval() — we WANT grad through the
+        # model. The trainer is responsible for putting the model in
+        # train() mode before calling this.
+        out = self.model(stacked, attn_mask)
+        # alpha == cls_attn_weights (already mask-zeroed inside the model).
+        alpha = out.cls_attn_weights  # [K_real, T_max], grad-tracking
+
+        final_R = torch.tensor(
+            [float(group.trajectories[i].final_reward) for i in nonempty_indices],
+            dtype=stacked.dtype,
+            device=stacked.device,
+        )
+
+        return {
+            "alpha": alpha,
+            "attention_mask": attn_mask,
+            "nonempty_indices": nonempty_indices,
+            "final_R": final_R,
+        }
+
 
 def build_turnrd_decomposer(
     cfg: dict[str, Any],
@@ -208,15 +360,18 @@ def build_turnrd_decomposer(
     model: TurnRD,
     embedder: TurnEmbedder,
     device: Optional[str] = None,
-) -> Callable[[TrajectoryGroup], list[list[float]]]:
+) -> "TurnRDDecomposer":
     """Factory used by `build_decomposer` for the `"turnrd"` branch.
 
-    Reads no extra config today; placeholder for future Day 14 hooks
-    (e.g. refresh cadence wiring). Returns the decomposer's `decompose`
-    method so it satisfies the `PerTurnDecomposer` callable type.
+    Returns the `TurnRDDecomposer` *object* (not its `.decompose` method)
+    so the trainer can reach the Day-13 learnable surface
+    (`has_learnable_params`, `parameters`, `decompose_with_grad`,
+    `state_dict`, `load_state_dict`). `TurnRDDecomposer.__call__` forwards
+    to `.decompose`, so the returned value is still a valid
+    `PerTurnDecomposer` per the existing call-site contract
+    `self.decomposer(group)` in `HGPOTrainer.build_advantages`.
     """
     # cfg is accepted for symmetry with the other build_* factories; future
-    # Day 14 work will read e.g. cfg["turnrd"]["refresh_every_n_episodes"].
+    # config-loader work will read e.g. cfg["turnrd"]["refresh_every_n_episodes"].
     _ = cfg
-    decomposer = TurnRDDecomposer(model=model, embedder=embedder, device=device)
-    return decomposer.decompose
+    return TurnRDDecomposer(model=model, embedder=embedder, device=device)

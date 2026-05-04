@@ -19,7 +19,25 @@ class _StubPolicy:
     """Stand-in for LoRAPolicy used so the trainer can instantiate in tests."""
 
     class _M:
+        def __init__(self):
+            # Provide a real (1-element) parameter so AdamW can be built when
+            # tests exercise `train_step` (e.g. the Day-13 refresh-hook
+            # tests). Lazy-imported torch keeps the module load torch-free
+            # for the pure-Python tests above.
+            try:
+                import torch  # type: ignore[import-not-found]
+                self._param = torch.nn.Parameter(torch.zeros(1))
+            except Exception:
+                self._param = None
+
         def parameters(self):
+            if self._param is None:
+                return iter([])
+            return iter([self._param])
+
+        def named_modules(self):
+            # No LoRA-shaped modules; snapshot_current_lora_as_ref filters
+            # by `hasattr(module, "lora_A")` so an empty iterator is fine.
             return iter([])
 
         def train(self):
@@ -29,7 +47,9 @@ class _StubPolicy:
         self.model = self._M()
 
     def trainable_parameters(self):
-        return []
+        if self.model._param is None:
+            return []
+        return [self.model._param]
 
 
 def _group(K: int = 3) -> TrajectoryGroup:
@@ -157,3 +177,76 @@ def test_snapshot_returns_count_for_stub_policy():
     n = trainer.snapshot_current_lora_as_ref()
     assert n == 0
     assert trainer._ref_lora_snapshot == {}
+
+
+# ---------------------------------------------------------------------------
+# Day 13: refresh hook + C3 reattach
+# ---------------------------------------------------------------------------
+
+
+def test_refresh_every_episodes_default_zero():
+    """Default disables the refresh hook (preserves prior behavior)."""
+    cfg = HGPOTrainerConfig()
+    assert cfg.refresh_every_episodes == 0
+    assert cfg.turnrd_lr == 1e-4
+
+
+def test_refresh_hook_fires_at_correct_cadence():
+    """With `refresh_every_episodes=2`, the hook fires at _step=2 and _step=4
+    over 5 train_step invocations (skipping _step=0). Uses a stub trainer
+    that bypasses the heavy compute path by short-circuiting via the
+    `n_action_tokens == 0` branch (the test group has no token ids).
+    """
+    pytest.importorskip("torch")
+    refresh_count: list[int] = []
+
+    def refresh_fn() -> None:
+        refresh_count.append(1)
+
+    cfg = HGPOTrainerConfig(refresh_every_episodes=2)
+    trainer = HGPOTrainer(
+        _StubPolicy(),
+        progress_decomposer,
+        cfg,
+        refresh_decomposer_fn=refresh_fn,
+    )
+
+    # Build a trivial group whose turns have no token ids → compute_loss
+    # short-circuits via the n_action_tokens==0 path. The refresh hook
+    # runs BEFORE the short-circuit so the cadence test still works.
+    group = _group(K=2)
+
+    for _ in range(5):
+        trainer.train_step(group)
+
+    # _step ∈ {0..4} as it's incremented after each call. The hook fires
+    # iff (_step > 0 AND _step % 2 == 0) → _step in {2, 4} → 2 fires.
+    assert len(refresh_count) == 2
+
+
+def test_refresh_hook_disabled_when_cadence_zero():
+    """`refresh_every_episodes=0` disables the hook (default)."""
+    pytest.importorskip("torch")
+    refresh_count: list[int] = []
+
+    cfg = HGPOTrainerConfig(refresh_every_episodes=0)
+    trainer = HGPOTrainer(
+        _StubPolicy(),
+        progress_decomposer,
+        cfg,
+        refresh_decomposer_fn=lambda: refresh_count.append(1),
+    )
+    group = _group(K=2)
+    for _ in range(5):
+        trainer.train_step(group)
+    assert refresh_count == []
+
+
+def test_decomposer_optimizer_only_built_for_learnable_decomposer():
+    """Non-learnable decomposer (progress_decomposer) → no second optimizer."""
+    pytest.importorskip("torch")
+    trainer = HGPOTrainer(_StubPolicy(), progress_decomposer, HGPOTrainerConfig())
+    assert trainer._decomposer_learnable is False
+    # train_step on a group with no token ids exercises _ensure_optimizer.
+    trainer.train_step(_group(K=2))
+    assert trainer._decomposer_optimizer is None

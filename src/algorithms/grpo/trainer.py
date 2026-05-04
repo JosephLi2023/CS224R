@@ -16,6 +16,7 @@ from src.algorithms.grpo.advantage import (
     compute_traj_advantages,
     compute_turn_advantages,
     consistency_loss,
+    consistency_loss_tensor,
 )
 from src.algorithms.grpo.kl import AdaptiveKLConfig, AdaptiveKLController
 from src.algorithms.grpo.rollout import TrajectoryGroup
@@ -55,6 +56,15 @@ class HGPOTrainerConfig:
     # Default 2048 keeps forward+backward activations under ~10 GiB for
     # Qwen2.5-1.5B; raise on larger cards or single-tenant GPUs.
     max_tokens_per_microbatch: int = 2048
+    # H-GRPO Method B (TurnRD) integration knobs (Day 13).
+    # Re-load the TurnRD checkpoint every N rollout groups (0 disables —
+    # preserves prior behavior for Methods A/C and existing tests).
+    refresh_every_episodes: int = 0
+    # Separate AdamW learning rate for the TurnRD parameters. Kept distinct
+    # from `learning_rate` (1e-6 for the LoRA policy) since TurnRD is a
+    # small standalone Transformer that benefits from a higher rate (~1e-4
+    # is the standalone trainer default).
+    turnrd_lr: float = 1e-4
 
 
 @dataclass
@@ -95,7 +105,41 @@ class HGPOTrainer:
         policy: "LoRAPolicy",
         decomposer: PerTurnDecomposer,
         cfg: HGPOTrainerConfig | None = None,
+        *,
+        refresh_decomposer_fn: Callable[[], None] | None = None,
     ) -> None:
+        """Construct an H-GRPO trainer.
+
+        Args:
+            policy: the trainable LoRA-wrapped policy.
+            decomposer: a per-turn reward decomposer. May be a plain
+                callable (Methods A/C) or a `TurnRDDecomposer` *object*
+                (Method B); the trainer detects the learnable surface via
+                `getattr(decomposer, "has_learnable_params", False)`.
+            cfg: optional `HGPOTrainerConfig`; defaults are used if omitted.
+            refresh_decomposer_fn: optional callable invoked at
+                `cfg.refresh_every_episodes` cadence inside `train_step`
+                (skipping `_step=0`). Intended for periodic re-loading of
+                the TurnRD checkpoint from disk.
+
+                Contract: the refresh fn MUST mutate the decomposer's
+                parameters IN PLACE (e.g. via
+                `decomposer.load_state_dict(...)`), not by reassigning
+                `decomposer.model = new_TurnRD(...)`. The trainer's
+                second AdamW is built once over the parameter tensors
+                returned by `decomposer.parameters()`; an in-place load
+                preserves those tensor identities, while a model swap
+                would leave the optimizer holding stale references that
+                update params nobody reads.
+
+                Safety with `grad_accum_steps > 1`: pick
+                `refresh_every_episodes` as a multiple of
+                `grad_accum_steps` so the refresh never lands inside an
+                in-progress gradient accumulation window (otherwise
+                accumulated TurnRD grads from before the refresh would
+                be applied to post-refresh parameters). With the default
+                `grad_accum_steps=1` this is automatic.
+        """
         self.policy = policy
         self.decomposer = decomposer
         self.cfg = cfg or HGPOTrainerConfig()
@@ -108,6 +152,17 @@ class HGPOTrainer:
         # weights afterwards. None ⇒ ref is the C2 frozen-base path
         # (LoRA disabled). Populate via `snapshot_current_lora_as_ref()`.
         self._ref_lora_snapshot: dict[str, dict[str, Any]] | None = None
+        # H-GRPO Method B integration (Day 13).
+        # Detect whether the decomposer is a learnable Method B (TurnRD)
+        # decomposer. Other decomposers (Methods A/C) inherit the False
+        # default via `getattr` so they don't need to declare anything.
+        self._decomposer_learnable: bool = bool(
+            getattr(self.decomposer, "has_learnable_params", False)
+        )
+        self._refresh_fn: Callable[[], None] | None = refresh_decomposer_fn
+        # Built lazily inside _ensure_optimizer (matches the policy
+        # optimizer's lazy init); kept None for non-learnable decomposers.
+        self._decomposer_optimizer: Any = None
 
     def snapshot_current_lora_as_ref(self) -> int:
         """Capture the current LoRA tensors as the frozen KL reference.
@@ -171,6 +226,23 @@ class HGPOTrainer:
             self._trainable_params,
             lr=self.cfg.learning_rate,
         )
+        # Day 13: also build a separate AdamW for the TurnRD parameters
+        # when the decomposer is learnable. Kept separate from the policy
+        # optimizer so each param group can use its own lr (`turnrd_lr`
+        # vs `learning_rate`) without sharing AdamW state.
+        if self._decomposer_learnable and self._decomposer_optimizer is None:
+            decomposer_params = list(self.decomposer.parameters())
+            if decomposer_params:
+                self._decomposer_optimizer = torch.optim.AdamW(
+                    decomposer_params,
+                    lr=self.cfg.turnrd_lr,
+                )
+                self._decomposer_params: list = decomposer_params
+            else:
+                # Edge case: a learnable decomposer with zero parameters
+                # (shouldn't happen in production). Skip the optimizer so
+                # AdamW doesn't error on an empty param group.
+                self._decomposer_params = []
 
     def _new_logprobs_for_turn(
         self, prompt_token_ids: list[int], action_token_ids: list[int]
@@ -433,10 +505,59 @@ class HGPOTrainer:
             kl_term = kl_coef * kl_per_tok.mean()
 
         cons = float(adv["consistency"])
-        # Consistency reg has zero gradient for Methods A/C — see comment below.
-        # Excluded from `total` (review C3). Will be re-added on TurnRD's params
-        # when Method B lands.
-        total = policy_loss + kl_term
+        # Consistency reg has zero gradient for Methods A/C (the pure-Python
+        # `consistency_loss` returns a Python float, not a torch leaf, so the
+        # original C3 fix removed it from `total`). For Method B (TurnRD),
+        # which IS learnable, we re-add the regulariser as a torch tensor
+        # built from the model's grad-tracking α weights — this gives it a
+        # real gradient path back to TurnRD parameters per the C3 follow-up
+        # note in `MEDIUM_FIXES.md::C3`.
+        cons_loss_t: "torch.Tensor | None" = None
+        if self._decomposer_learnable and self.cfg.lambda_consistency != 0.0:
+            grad_out = self.decomposer.decompose_with_grad(group)
+            alpha_t = grad_out["alpha"]  # [K_real, T_max], grad-tracking
+            attn_t = grad_out["attention_mask"]  # [K_real, T_max] long
+            final_R_t = grad_out["final_R"]  # [K_real]
+            if alpha_t.numel() > 0:
+                # Per-turn rewards = α * R. Then group-normalize per
+                # turn position (matches `compute_turn_advantages`) AND
+                # group-normalize final_R per group (matches
+                # `compute_traj_advantages`). Both norms operate on the
+                # K_real subset (empty trajectories are dropped from the
+                # tensor stack), which mirrors the pure-Python path's
+                # behavior — empty trajectories contribute nothing to
+                # either advantage's mean/std.
+                per_turn_rewards = alpha_t * final_R_t.unsqueeze(-1)  # [K_real, T_max]
+                # Per-position turn advantage normalization, mask-aware.
+                # mask_f: [K_real, T_max] of {0.0, 1.0}.
+                mask_f = attn_t.to(dtype=per_turn_rewards.dtype)
+                # Per-position counts: [T_max].
+                col_count = mask_f.sum(dim=0).clamp_min(1.0)
+                col_mean = (per_turn_rewards * mask_f).sum(dim=0) / col_count
+                col_var = ((per_turn_rewards - col_mean.unsqueeze(0)) ** 2 * mask_f).sum(dim=0) / col_count
+                col_std = (col_var + 1e-16).sqrt()
+                turn_adv_t = ((per_turn_rewards - col_mean.unsqueeze(0)) / col_std.unsqueeze(0)) * mask_f
+                # Per-group trajectory advantage normalization.
+                K_real = final_R_t.shape[0]
+                if K_real > 1:
+                    R_mean = final_R_t.mean()
+                    R_var = ((final_R_t - R_mean) ** 2).mean()
+                    R_std = (R_var + 1e-16).sqrt()
+                    traj_adv_t = (final_R_t - R_mean) / R_std
+                else:
+                    # K=1 → group-normalised advantage is trivially 0.
+                    traj_adv_t = torch.zeros_like(final_R_t)
+                cons_loss_t = consistency_loss_tensor(
+                    self.cfg.lambda_consistency, traj_adv_t, turn_adv_t, attn_t
+                )
+        if cons_loss_t is not None:
+            # Guard against the (production-impossible but test-possible) case
+            # where the decomposer lives on a different device than the policy.
+            # On A100 production both end up on cuda:0; on CPU tests everything
+            # is already on CPU. The .to() is a no-op when devices match.
+            total = policy_loss + kl_term + cons_loss_t.to(device=device)
+        else:
+            total = policy_loss + kl_term
 
         traj_adv = adv["traj_adv"]
         flat_turn_adv: list[float] = [v for row in adv["turn_adv"] for v in row]
@@ -464,6 +585,19 @@ class HGPOTrainer:
         """
         import torch  # type: ignore[import-not-found]
 
+        # Day 13: refresh the TurnRD checkpoint at the configured cadence
+        # BEFORE building any optimizer (the refresh may swap the
+        # decomposer's underlying model; the optimizer must see the new
+        # parameters). Skipped at step 0 so we don't refresh the brand-new
+        # decomposer that was just constructed.
+        if (
+            self._refresh_fn is not None
+            and self.cfg.refresh_every_episodes > 0
+            and self._step > 0
+            and (self._step % int(self.cfg.refresh_every_episodes) == 0)
+        ):
+            self._refresh_fn()
+
         self._ensure_optimizer()
         self.policy.model.train()
 
@@ -489,6 +623,13 @@ class HGPOTrainer:
             stats.grad_norm = float(grad_norm)
             self._optimizer.step()
             self._optimizer.zero_grad(set_to_none=True)
+            # Day 13: also step the TurnRD optimizer when present.
+            if self._decomposer_optimizer is not None and self._decomposer_params:
+                torch.nn.utils.clip_grad_norm_(
+                    self._decomposer_params, self.cfg.max_grad_norm
+                )
+                self._decomposer_optimizer.step()
+                self._decomposer_optimizer.zero_grad(set_to_none=True)
         else:
             stats.grad_norm = 0.0  # not yet a step boundary
 
