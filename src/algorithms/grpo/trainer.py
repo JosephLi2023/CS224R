@@ -42,6 +42,12 @@ class HGPOTrainerConfig:
     # When True, recompute new-policy logprobs in this trainer; when False the
     # caller passes them in (useful for unit tests with mocked policies).
     recompute_logprobs: bool = True
+    # Cap on total tokens (sum of len(prompt) + len(action) across rows) per
+    # padded forward in `_batched_logprobs`. Keeps activation memory within
+    # GPU bounds when K×T padded sequences would otherwise OOM A100-80GB.
+    # Default 8192 fits Qwen2.5-1.5B comfortably with bf16; raise for
+    # higher-throughput cards or smaller models.
+    max_tokens_per_microbatch: int = 8192
 
 
 @dataclass
@@ -195,54 +201,80 @@ class HGPOTrainer:
         *,
         use_ref: bool,
     ) -> list["torch.Tensor"]:
-        """Single padded forward → per-turn action logprobs (review M6).
+        """Padded forward → per-turn action logprobs (review M6).
 
-        Replaces the K×T per-turn forward loop with one batched call. For
-        each (prompt_ids, action_ids) pair, returns a 1-D tensor of length
-        len(action_ids) with per-token logprobs under the current policy
-        (use_ref=False) or the frozen base (use_ref=True, LoRA disabled).
+        Splits the K×T (prompt, action) pairs into micro-batches whose total
+        token count stays under `cfg.max_tokens_per_microbatch`. Each
+        micro-batch is one padded forward; activations are released between
+        micro-batches so we don't OOM at K×T scale (M6 follow-up).
         """
         import torch  # type: ignore[import-not-found]
         from torch.nn import functional as F  # type: ignore[import-not-found]
 
         device = next(self.policy.model.parameters()).device
         pad_id = int(getattr(self.policy.tokenizer, "pad_token_id", 0) or 0)
-
-        # Filter out empty pairs and remember original order.
-        non_empty: list[tuple[int, list[int], list[int]]] = []
-        for idx, (prompt_ids, action_ids) in enumerate(prompt_action_pairs):
-            if prompt_ids and action_ids:
-                non_empty.append((idx, prompt_ids, action_ids))
+        budget = max(1, int(self.cfg.max_tokens_per_microbatch))
 
         N = len(prompt_action_pairs)
         out: list[torch.Tensor] = [torch.zeros(0, device=device) for _ in range(N)]
-        if not non_empty:
+
+        # Filter empty + remember original positions, sorted by length to
+        # reduce padding waste within micro-batches.
+        keep: list[tuple[int, list[int], list[int], int]] = []
+        for idx, (prompt_ids, action_ids) in enumerate(prompt_action_pairs):
+            if prompt_ids and action_ids:
+                seq_len = len(prompt_ids) + len(action_ids)
+                keep.append((idx, prompt_ids, action_ids, seq_len))
+        if not keep:
             return out
+        keep.sort(key=lambda x: x[3])
 
-        full_seqs = [p + a for _, p, a in non_empty]
-        max_len = max(len(s) for s in full_seqs)
+        # Greedy pack into micro-batches: keep adding rows while
+        # (rows_in_batch + 1) * max_seq_len_in_batch <= budget.
+        microbatches: list[list[tuple[int, list[int], list[int], int]]] = []
+        current: list[tuple[int, list[int], list[int], int]] = []
+        current_max = 0
+        for item in keep:
+            new_max = max(current_max, item[3])
+            if current and (len(current) + 1) * new_max > budget:
+                microbatches.append(current)
+                current = [item]
+                current_max = item[3]
+            else:
+                current.append(item)
+                current_max = new_max
+        if current:
+            microbatches.append(current)
 
-        input_ids = torch.full((len(full_seqs), max_len), pad_id, dtype=torch.long, device=device)
-        attention_mask = torch.zeros((len(full_seqs), max_len), dtype=torch.long, device=device)
-        for i, s in enumerate(full_seqs):
-            input_ids[i, : len(s)] = torch.tensor(s, dtype=torch.long, device=device)
-            attention_mask[i, : len(s)] = 1
+        for mb in microbatches:
+            full_seqs = [p + a for _, p, a, _ in mb]
+            max_len = max(len(s) for s in full_seqs)
 
-        if use_ref:
-            with torch.no_grad(), self.policy.model.disable_adapter():
-                logits = self.policy.model(input_ids, attention_mask=attention_mask).logits
-        else:
-            with torch.set_grad_enabled(True):
-                logits = self.policy.model(input_ids, attention_mask=attention_mask).logits
+            input_ids = torch.full((len(full_seqs), max_len), pad_id, dtype=torch.long, device=device)
+            attention_mask = torch.zeros((len(full_seqs), max_len), dtype=torch.long, device=device)
+            for i, s in enumerate(full_seqs):
+                input_ids[i, : len(s)] = torch.tensor(s, dtype=torch.long, device=device)
+                attention_mask[i, : len(s)] = 1
 
-        for row, (orig_idx, prompt_ids, action_ids) in enumerate(non_empty):
-            start = len(prompt_ids) - 1
-            end = start + len(action_ids)
-            slice_logits = logits[row, start:end, :].to(torch.float32)
-            log_probs = F.log_softmax(slice_logits, dim=-1)
-            target = torch.tensor(action_ids, dtype=torch.long, device=device)
-            lp = log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1)
-            out[orig_idx] = lp.detach() if use_ref else lp
+            if use_ref:
+                with torch.no_grad(), self.policy.model.disable_adapter():
+                    logits = self.policy.model(input_ids, attention_mask=attention_mask).logits
+            else:
+                with torch.set_grad_enabled(True):
+                    logits = self.policy.model(input_ids, attention_mask=attention_mask).logits
+
+            for row, (orig_idx, prompt_ids, action_ids, _) in enumerate(mb):
+                start = len(prompt_ids) - 1
+                end = start + len(action_ids)
+                slice_logits = logits[row, start:end, :].to(torch.float32)
+                log_probs = F.log_softmax(slice_logits, dim=-1)
+                target = torch.tensor(action_ids, dtype=torch.long, device=device)
+                lp = log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1)
+                out[orig_idx] = lp.detach() if use_ref else lp
+
+            # Drop big tensors before the next micro-batch.
+            del input_ids, attention_mask, logits
+
         return out
 
     def compute_loss(self, group: TrajectoryGroup) -> tuple["torch.Tensor", TrainStepStats]:
