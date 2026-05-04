@@ -46,7 +46,7 @@ app = modal.App("cs224r-hgpo-train-step-turnrd")
     image=image, gpu="A100-80GB", volumes={VOLUME_MOUNT: volume}, timeout=20 * 60
 )
 def train_step_turnrd_smoke(
-    k: int = 2,
+    k: int = 4,
     max_turns: int = 3,
     lambda_consistency: float = 0.1,
     turnrd_lr: float = 1e-4,
@@ -173,6 +173,31 @@ def train_step_turnrd_smoke(
                 "prompt_token_ids missing — Day 5.5 wiring regressed"
             )
 
+    # FakeWebShopEnv is fully deterministic (`src/envs/fake_webshop.py`).
+    # On a tiny smoke (K=4, 3 turns), all trajectories often converge to
+    # the same final reward → `compute_traj_advantages` returns all
+    # zeros → the PPO surrogate `min(ratio·0, clip·0)` is exactly 0
+    # → backward populates zero gradient on the LoRA AND on TurnRD.
+    # The CODE PATHS would still execute, but we'd see no movement and
+    # the smoke would fail to verify gradient flow.
+    #
+    # Inject synthetic reward variance so the gradient verification is
+    # meaningful. We use a deterministic spread `[0.0, 0.25, 0.5, 0.75, ...]`
+    # so K=4 yields rewards `[0.0, 0.25, 0.5, 0.75]`. This keeps the
+    # smoke's pass/fail behavior independent of vLLM sampling chance.
+    import dataclasses
+    from src.algorithms.grpo.rollout import TrajectoryGroup
+
+    synthetic_rewards = [round(0.25 * i, 4) for i in range(len(group.trajectories))]
+    print(f">>> Injecting synthetic per-traj rewards: {synthetic_rewards}")
+    patched_trajs = [
+        dataclasses.replace(traj, final_reward=r)
+        for traj, r in zip(group.trajectories, synthetic_rewards)
+    ]
+    group = TrajectoryGroup(
+        task_id=group.task_id, env_name=group.env_name, trajectories=patched_trajs
+    )
+
     # -----------------------------------------------------------------
     # 4. Build the Method-B trainer (the interesting bit: TurnRD object
     #    as decomposer + lambda_consistency > 0 → C3 reattach fires).
@@ -212,31 +237,71 @@ def train_step_turnrd_smoke(
     step_elapsed = round(time.time() - t1, 2)
 
     after_norms = [float(p.detach().norm().item()) for p in trainable[:4]]
-    param_deltas = [round(abs(a - b), 6) for a, b in zip(after_norms, before_norms)]
+    raw_param_deltas = [abs(a - b) for a, b in zip(after_norms, before_norms)]
+    param_deltas = [round(d, 9) for d in raw_param_deltas]
 
-    # The Day-13 C3 reattach end-to-end check: cls_query MUST have moved.
+    # The Day-13 C3 reattach end-to-end check: cls_query MUST have moved
+    # IF the rollout group produced any reward variance (no variance →
+    # all advantages collapse to 0 → zero gradient on policy AND
+    # turnrd, even though the code paths are correct).
     cls_query_after = turnrd_model.cls_query.detach().clone().cpu()
     cls_query_delta = float((cls_query_after - cls_query_before).abs().sum().item())
+
+    rewards = [t.final_reward for t in group.trajectories]
+    reward_variance = max(rewards) - min(rewards)
+
+    print(f">>> param_deltas (raw)   = {raw_param_deltas}")
+    print(f">>> grad_norm (policy)   = {stats.grad_norm}")
+    print(f">>> cls_query_delta      = {cls_query_delta}")
+    print(f">>> n_action_tokens      = {stats.n_action_tokens}")
+    print(f">>> policy_loss          = {stats.policy_loss}")
+    print(f">>> mean_traj_adv        = {stats.mean_traj_adv}")
+    print(f">>> mean_turn_adv        = {stats.mean_turn_adv}")
+    print(f">>> rewards (per-traj)   = {rewards}  (variance: {reward_variance:.3f})")
 
     # -----------------------------------------------------------------
     # 6. Assertions
     # -----------------------------------------------------------------
 
     assert not torch.isnan(torch.tensor(stats.total_loss)), "NaN total_loss"
-    assert stats.grad_norm >= 0.0
-    assert any(d > 0 for d in param_deltas), (
-        "No LoRA parameter moved — optimizer step did not run"
-    )
-    # The C3 reattach must have flowed gradient through TurnRD AND the
-    # second optimizer must have stepped. cls_query is the natural
-    # gradient sink for the [CLS] cross-attention pool.
-    assert cls_query_delta > 0.0, (
-        f"cls_query did not move (delta={cls_query_delta}); "
-        "C3 reattach is not flowing gradient back to TurnRD params, OR "
-        "the second AdamW didn't step. Check "
-        "compute_loss → decompose_with_grad → consistency_loss_tensor "
-        "and the train_step() step-boundary block."
-    )
+
+    if reward_variance == 0.0:
+        # All trajectories tied — happens occasionally on FakeWebShopEnv
+        # when vLLM samples converge. With zero variance,
+        # `compute_traj_advantages` returns all zeros, the PPO surrogate
+        # collapses to zero, and grad is exactly zero on BOTH policy and
+        # TurnRD. This is NOT a code bug — it's a smoke-config edge case.
+        # Rerun the smoke (vLLM with `seed=42` + `temperature=1.0` will
+        # often produce different actions on a fresh boot).
+        print(
+            f"\n!!! All {len(rewards)} trajectories tied at reward={rewards[0]}. "
+            "PPO surrogate is exactly 0 → no LoRA gradient flow. "
+            "This is the deterministic-FakeWebShopEnv edge case, NOT a "
+            "Method-B bug. Re-run the smoke or bump --k to get reward "
+            "variance.\n"
+        )
+        # Still verify that the COMPUTE PATHS executed, even if the
+        # gradient was zero by construction.
+        assert stats.n_action_tokens > 0, (
+            f"n_action_tokens=0 even with K={k} trajectories — rollout "
+            "collector failed to populate token_ids."
+        )
+    else:
+        # Non-zero reward variance → backward MUST have populated grads.
+        assert stats.grad_norm > 0.0, (
+            f"reward variance is {reward_variance:.3f} (non-zero) but "
+            f"stats.grad_norm == 0 — backward did not populate any LoRA "
+            "gradient. Check compute_loss + _batched_logprobs(use_ref=False)."
+        )
+        assert any(d > 1e-9 for d in raw_param_deltas), (
+            f"All first-4 LoRA param norms unchanged ({raw_param_deltas}); "
+            "AdamW step may not have fired."
+        )
+        assert cls_query_delta > 0.0, (
+            f"cls_query did not move (delta={cls_query_delta}); "
+            "C3 reattach is not flowing gradient back to TurnRD params, OR "
+            "the second AdamW didn't step."
+        )
 
     # Replay JSONL round-trip (only if we emitted).
     replay_rows = 0
@@ -276,6 +341,7 @@ def train_step_turnrd_smoke(
         "param_norm_deltas_first4": param_deltas,
         # Day-13/14 extras:
         "cls_query_delta": round(cls_query_delta, 6),
+        "reward_variance": round(reward_variance, 4),
         "input_dim_from_policy": input_dim,
         "replay_path": (replay_path if emit_replay else None),
         "replay_rows": replay_rows,
@@ -286,7 +352,7 @@ def train_step_turnrd_smoke(
 
 @app.local_entrypoint()
 def main(
-    k: int = 2,
+    k: int = 4,
     max_turns: int = 3,
     lambda_consistency: float = 0.1,
     turnrd_lr: float = 1e-4,
