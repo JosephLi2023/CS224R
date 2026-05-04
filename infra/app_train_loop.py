@@ -34,6 +34,8 @@ def train_loop_smoke(
     sync_every: int = 1,
     run_name: str = "flat_grpo_webshop_smoke",
     sft_adapter: str = "",
+    use_sft_as_ref: bool = True,
+    kl_warmup_episodes: int = 0,
 ) -> dict:
     import json
     import os
@@ -120,8 +122,13 @@ def train_loop_smoke(
             clip_eps=0.2,
             learning_rate=1e-6,
             max_grad_norm=1.0,
+            kl_warmup_episodes=kl_warmup_episodes,
         ),
     )
+
+    if sft_loaded and use_sft_as_ref:
+        n = trainer.snapshot_current_lora_as_ref()
+        print(f">>> Snapshotted {n} LoRA modules as KL reference (RL-from-SFT)")
 
     log: list[dict] = []
     overall_start = time.time()
@@ -231,6 +238,8 @@ def main(
     sync_every: int = 1,
     run_name: str = "flat_grpo_webshop_smoke",
     sft_adapter: str = "",
+    use_sft_as_ref: bool = True,
+    kl_warmup_episodes: int = 0,
 ) -> None:
     import json as _json
     print(_json.dumps(
@@ -239,6 +248,8 @@ def main(
             task_id_offset=task_id_offset, num_products=num_products,
             sync_every=sync_every, run_name=run_name,
             sft_adapter=sft_adapter,
+            use_sft_as_ref=use_sft_as_ref,
+            kl_warmup_episodes=kl_warmup_episodes,
         ),
         indent=2, default=str,
     ))

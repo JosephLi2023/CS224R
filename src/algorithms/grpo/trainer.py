@@ -39,6 +39,12 @@ class HGPOTrainerConfig:
     max_grad_norm: float = 1.0
     # KL-to-reference
     kl_cfg: AdaptiveKLConfig = field(default_factory=AdaptiveKLConfig)
+    # Skip the KL penalty (zero it out, but still observe & log) for the
+    # first N train_step calls. Useful right after SFT warm-start, when
+    # the policy is intentionally far from the C2 frozen-base reference
+    # and the k3 estimator can blow up to ~1e6 magnitudes. Default 0 =
+    # no warmup (preserves prior behavior for tests).
+    kl_warmup_episodes: int = 0
     # When True, recompute new-policy logprobs in this trainer; when False the
     # caller passes them in (useful for unit tests with mocked policies).
     recompute_logprobs: bool = True
@@ -96,6 +102,34 @@ class HGPOTrainer:
         self.kl_controller = AdaptiveKLController(self.cfg.kl_cfg)
         self._optimizer: Any = None  # lazy-init in train_step
         self._step: int = 0
+        # Optional snapshot of LoRA weights to use as KL reference. When set,
+        # `_ref_logprobs_for_turn` / batched ref forwards swap these tensors
+        # in for the duration of the forward (no_grad) and restore the live
+        # weights afterwards. None ⇒ ref is the C2 frozen-base path
+        # (LoRA disabled). Populate via `snapshot_current_lora_as_ref()`.
+        self._ref_lora_snapshot: dict[str, dict[str, Any]] | None = None
+
+    def snapshot_current_lora_as_ref(self) -> int:
+        """Capture the current LoRA tensors as the frozen KL reference.
+
+        Returns the number of LoRA modules snapshotted. Call this AFTER
+        loading an SFT-warm adapter and BEFORE the first train_step so the
+        KL term penalises drift from the SFT-trained policy (not the raw
+        base Qwen — which would otherwise blow up the k3 estimator).
+        """
+        import torch  # type: ignore[import-not-found]
+        adapter_name = "default"
+        snapshot: dict[str, dict[str, Any]] = {}
+        with torch.no_grad():
+            for name, module in self.policy.model.named_modules():
+                if hasattr(module, "lora_A") and hasattr(module, "lora_B") and hasattr(module, "scaling"):
+                    snapshot[name] = {
+                        "lora_A": module.lora_A[adapter_name].weight.detach().clone(),
+                        "lora_B": module.lora_B[adapter_name].weight.detach().clone(),
+                        "scaling": float(module.scaling[adapter_name]),
+                    }
+        self._ref_lora_snapshot = snapshot
+        return len(snapshot)
 
     # -----------------------------------------------------------------
     # Pure-Python advantage stage (works without torch; used by tests)
@@ -258,8 +292,36 @@ class HGPOTrainer:
                 attention_mask[i, : len(s)] = 1
 
             if use_ref:
-                with torch.no_grad(), self.policy.model.disable_adapter():
-                    logits = self.policy.model(input_ids, attention_mask=attention_mask).logits
+                # If a SFT snapshot was registered as KL ref, swap its LoRA tensors
+                # in for this no_grad forward, then restore. Otherwise fall back to
+                # the C2 default of disabling LoRA entirely.
+                if self._ref_lora_snapshot is not None:
+                    with torch.no_grad():
+                        saved: dict[str, dict[str, "torch.Tensor"]] = {}
+                        for mod_name, snap in self._ref_lora_snapshot.items():
+                            try:
+                                mod = self.policy.model.get_submodule(mod_name)
+                            except AttributeError:
+                                continue
+                            saved[mod_name] = {
+                                "lora_A": mod.lora_A["default"].weight.data.clone(),
+                                "lora_B": mod.lora_B["default"].weight.data.clone(),
+                            }
+                            mod.lora_A["default"].weight.data.copy_(snap["lora_A"])
+                            mod.lora_B["default"].weight.data.copy_(snap["lora_B"])
+                        try:
+                            logits = self.policy.model(input_ids, attention_mask=attention_mask).logits
+                        finally:
+                            for mod_name, live in saved.items():
+                                try:
+                                    mod = self.policy.model.get_submodule(mod_name)
+                                except AttributeError:
+                                    continue
+                                mod.lora_A["default"].weight.data.copy_(live["lora_A"])
+                                mod.lora_B["default"].weight.data.copy_(live["lora_B"])
+                else:
+                    with torch.no_grad(), self.policy.model.disable_adapter():
+                        logits = self.policy.model(input_ids, attention_mask=attention_mask).logits
             else:
                 with torch.set_grad_enabled(True):
                     logits = self.policy.model(input_ids, attention_mask=attention_mask).logits
@@ -352,7 +414,12 @@ class HGPOTrainer:
         kl_per_tok = (ref_ratio - 1.0) - ref_log_ratio
         observed_kl = float(kl_per_tok.mean().detach().item())
         kl_coef = self.kl_controller.coef
-        kl_term = kl_coef * kl_per_tok.mean()
+        # KL warmup: zero out the term during the first N steps but still
+        # observe + log it so the controller has data when warmup ends.
+        if self._step < int(self.cfg.kl_warmup_episodes):
+            kl_term = 0.0 * kl_per_tok.mean()
+        else:
+            kl_term = kl_coef * kl_per_tok.mean()
 
         cons = float(adv["consistency"])
         # Consistency reg has zero gradient for Methods A/C — see comment below.

@@ -125,3 +125,35 @@ def test_trainable_params_snapshot_is_list():
     # The snapshot is materialised on first _ensure_optimizer; here we just
     # verify the attribute is initialised empty (lazy init).
     assert trainer._optimizer is None
+
+
+# ----- KL warmup + snapshot-as-ref config tests --------------
+
+
+def test_kl_warmup_default_zero():
+    cfg = HGPOTrainerConfig()
+    assert cfg.kl_warmup_episodes == 0
+
+
+def test_kl_warmup_configurable():
+    cfg = HGPOTrainerConfig(kl_warmup_episodes=5)
+    assert cfg.kl_warmup_episodes == 5
+
+
+def test_snapshot_lora_attribute_present():
+    """Trainer must have the _ref_lora_snapshot attribute (initially None)
+    and the snapshot_current_lora_as_ref method (callable signature)."""
+    trainer = HGPOTrainer(_StubPolicy(), progress_decomposer, HGPOTrainerConfig())
+    assert hasattr(trainer, "_ref_lora_snapshot")
+    assert trainer._ref_lora_snapshot is None
+    assert callable(getattr(trainer, "snapshot_current_lora_as_ref", None))
+
+
+def test_snapshot_returns_count_for_stub_policy():
+    """Stub policy has no LoRA modules → snapshot returns 0 but doesn't crash.
+    Skipped when torch isn't installed locally (the method requires it)."""
+    pytest.importorskip("torch")
+    trainer = HGPOTrainer(_StubPolicy(), progress_decomposer, HGPOTrainerConfig())
+    n = trainer.snapshot_current_lora_as_ref()
+    assert n == 0
+    assert trainer._ref_lora_snapshot == {}
