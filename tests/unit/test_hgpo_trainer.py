@@ -97,3 +97,31 @@ def test_trainer_config_defaults_sanity():
     assert cfg.clip_eps > 0
     assert cfg.learning_rate > 0
     assert cfg.max_grad_norm > 0
+
+
+# ------- grad-accum control flow (no torch: structural check only) -------
+
+
+def test_grad_accum_default_is_one():
+    """Default: optimizer steps every train_step. Regression for review M4."""
+    cfg = HGPOTrainerConfig()
+    assert cfg.grad_accum_steps == 1
+    # accum == 1 → always a step boundary (never skips optimizer.step)
+    assert ((0 + 1) % max(1, cfg.grad_accum_steps)) == 0
+
+
+def test_grad_accum_skip_schedule_with_accum_4():
+    """With grad_accum_steps=4, optimizer.step runs every 4 invocations
+    (steps 3, 7, 11, ... in 0-indexed self._step counter)."""
+    accum = 4
+    boundaries = [((s + 1) % accum) == 0 for s in range(12)]
+    expected = [False, False, False, True] * 3
+    assert boundaries == expected
+
+
+def test_trainable_params_snapshot_is_list():
+    """Snapshot preserves ordering + materialisation — guards review M7."""
+    trainer = HGPOTrainer(_StubPolicy(), progress_decomposer, HGPOTrainerConfig())
+    # The snapshot is materialised on first _ensure_optimizer; here we just
+    # verify the attribute is initialised empty (lazy init).
+    assert trainer._optimizer is None

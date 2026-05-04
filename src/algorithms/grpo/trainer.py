@@ -121,8 +121,13 @@ class HGPOTrainer:
         if self._optimizer is not None:
             return
         import torch  # type: ignore[import-not-found]
+        # Snapshot trainable params at init time so optimizer / grad-clip /
+        # AdamW state cannot drift if `trainable_parameters()` ever returns
+        # a different ordering or set on a later call (e.g. after
+        # `merge_and_unload()` for a vLLM weight sync). Review item M7.
+        self._trainable_params: list = list(self.policy.trainable_parameters())
         self._optimizer = torch.optim.AdamW(
-            self.policy.trainable_parameters(),
+            self._trainable_params,
             lr=self.cfg.learning_rate,
         )
 
@@ -140,13 +145,17 @@ class HGPOTrainer:
 
         device = next(self.policy.model.parameters()).device
         input_ids = torch.tensor([full], dtype=torch.long, device=device)
+        attention_mask = torch.ones_like(input_ids)
         with torch.set_grad_enabled(True):
-            logits = self.policy.model(input_ids).logits  # [1, L, V]
+            logits = self.policy.model(input_ids, attention_mask=attention_mask).logits  # [1, L, V]
         # Predict action tokens from positions [len(prompt) - 1 ... L - 2]
         start = len(prompt_token_ids) - 1
         end = start + len(action_token_ids)
-        slice_logits = logits[0, start:end, :]                  # [Tk, V]
-        log_probs = F.log_softmax(slice_logits, dim=-1)         # [Tk, V]
+        # Cast to fp32 BEFORE log_softmax — bf16 has ~3 mantissa decimals and
+        # the resulting logprob noise is amplified by exp() when computing
+        # the importance ratio (review M3).
+        slice_logits = logits[0, start:end, :].to(torch.float32)
+        log_probs = F.log_softmax(slice_logits, dim=-1)
         target = torch.tensor(action_token_ids, dtype=torch.long, device=device)
         return log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1)  # [Tk]
 
@@ -169,11 +178,13 @@ class HGPOTrainer:
 
         device = next(self.policy.model.parameters()).device
         input_ids = torch.tensor([full], dtype=torch.long, device=device)
+        attention_mask = torch.ones_like(input_ids)
         with torch.no_grad(), self.policy.model.disable_adapter():
-            logits = self.policy.model(input_ids).logits  # [1, L, V]
+            logits = self.policy.model(input_ids, attention_mask=attention_mask).logits  # [1, L, V]
         start = len(prompt_token_ids) - 1
         end = start + len(action_token_ids)
-        slice_logits = logits[0, start:end, :]
+        # fp32 cast (review M3) — see _new_logprobs_for_turn for rationale.
+        slice_logits = logits[0, start:end, :].to(torch.float32)
         log_probs = F.log_softmax(slice_logits, dim=-1)
         target = torch.tensor(action_token_ids, dtype=torch.long, device=device)
         return log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1).detach()
@@ -262,22 +273,42 @@ class HGPOTrainer:
         return total, stats
 
     def train_step(self, group: TrajectoryGroup) -> TrainStepStats:
-        """One AdamW step on a single TrajectoryGroup."""
+        """One AdamW step on a single TrajectoryGroup.
+
+        Honors `cfg.grad_accum_steps` (review M4): the loss is divided by
+        `grad_accum_steps` and `optimizer.step()` is only called every Nth
+        invocation. `n_action_tokens == 0` short-circuits to a no-op
+        (review nit) so we don't crash on a leaf-tensor backward.
+        """
         import torch  # type: ignore[import-not-found]
 
         self._ensure_optimizer()
         self.policy.model.train()
 
         loss, stats = self.compute_loss(group)
-        loss.backward()
+        if stats.n_action_tokens == 0:
+            # No live action tokens this group; nothing to learn from.
+            new_coef = self.kl_controller.update(stats.observed_kl)
+            stats.kl_coef = new_coef
+            self._step += 1
+            return stats
 
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            self.policy.trainable_parameters(), self.cfg.max_grad_norm
-        )
-        stats.grad_norm = float(grad_norm)
+        accum = max(1, int(self.cfg.grad_accum_steps))
+        scaled_loss = loss / accum
+        scaled_loss.backward()
 
-        self._optimizer.step()
-        self._optimizer.zero_grad(set_to_none=True)
+        # Only step the optimizer every `accum` train_step calls; otherwise
+        # accumulate grads silently.
+        is_step_boundary = ((self._step + 1) % accum) == 0
+        if is_step_boundary:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self._trainable_params, self.cfg.max_grad_norm
+            )
+            stats.grad_norm = float(grad_norm)
+            self._optimizer.step()
+            self._optimizer.zero_grad(set_to_none=True)
+        else:
+            stats.grad_norm = 0.0  # not yet a step boundary
 
         new_coef = self.kl_controller.update(stats.observed_kl)
         stats.kl_coef = new_coef
