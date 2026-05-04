@@ -36,6 +36,7 @@ def train_loop_smoke(
     sft_adapter: str = "",
     use_sft_as_ref: bool = True,
     kl_warmup_episodes: int = 0,
+    gpu_mem_util: float = 0.30,
 ) -> dict:
     import json
     import os
@@ -73,7 +74,7 @@ def train_loop_smoke(
     print(">>> Booting VLLMRunner")
     runner = VLLMRunner(
         VLLMRunnerConfig(
-            gpu_memory_utilization=0.40,
+            gpu_memory_utilization=gpu_mem_util,
             max_model_len=2048,
             download_dir="/vol/hf_cache",
             enforce_eager=True,
@@ -240,6 +241,7 @@ def main(
     sft_adapter: str = "",
     use_sft_as_ref: bool = True,
     kl_warmup_episodes: int = 0,
+    gpu_mem_util: float = 0.30,
 ) -> None:
     import json as _json
     print(_json.dumps(
@@ -250,6 +252,7 @@ def main(
             sft_adapter=sft_adapter,
             use_sft_as_ref=use_sft_as_ref,
             kl_warmup_episodes=kl_warmup_episodes,
+            gpu_mem_util=gpu_mem_util,
         ),
         indent=2, default=str,
     ))
