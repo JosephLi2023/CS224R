@@ -255,6 +255,10 @@ def main(action: str = "verify", small: bool = True) -> None:
         result = show_human_trajs_schema.remote()
     elif action == "show_one_traj":
         result = show_one_trajectory_full.remote()
+    elif action == "summarize_sft":
+        result = summarize_sft_dataset_action.remote(min_reward=0.0)
+    elif action == "summarize_sft_succeeded":
+        result = summarize_sft_dataset_action.remote(min_reward=0.5)
     else:
         raise ValueError(f"Unknown action: {action!r} (expected 'download'/'verify'/'show_setup'/'show_layout')")
 
@@ -405,3 +409,26 @@ def show_one_trajectory_full() -> dict:
         "n_rows_in_file": len(rows),
         "row_summaries": row_summaries,
     }
+
+
+@app.function(image=data_image, volumes={VOLUME_MOUNT: volume}, timeout=10 * 60)
+def summarize_sft_dataset_action(min_reward: float = 0.0) -> dict:
+    """Run src.datasets.sft_webshop loader on /vol/data/webshop/human_trajs
+    and report headline stats. Use min_reward=0.5 to filter for succeeded
+    trajectories before SFT."""
+    import sys
+    sys.path.insert(0, "/workspace")
+    from src.datasets.sft_webshop import (
+        load_sft_examples_from_directory,
+        summarize_sft_dataset,
+    )
+
+    base = "/vol/data/webshop/human_trajs"
+    examples = load_sft_examples_from_directory(base, min_reward=min_reward)
+    summary = summarize_sft_dataset(examples)
+    summary["min_reward_filter"] = min_reward
+    if examples:
+        summary["sample_prompt_first"] = examples[0].prompt[:400]
+        summary["sample_action_first"] = examples[0].action
+        summary["sample_instruction_first"] = examples[0].instruction
+    return summary
