@@ -101,37 +101,89 @@ class LoRAPolicy:
         return sum(p.numel() for p in self.model.parameters())
 
     def merged_state_dict(self) -> dict[str, "torch.Tensor"]:
-        """Non-destructive merge of LoRA into base, returns a state-dict view.
+        """Materialize all merged-LoRA weights as a single dict.
 
-        The merge happens on a *clone* so the live model is unaffected (we
-        still need the LoRA params for the next optimizer step). Keys are
-        canonicalized via `src.policy.weight_sync.canonicalize_lora_target_name`
-        so the result is shaped exactly like a plain Qwen base-model state-dict
-        and can be passed to `vllm_engine.model.load_weights(...)`.
+        Backward-compat wrapper around `iter_merged_weights()`. Prefer the
+        iterator form for vLLM weight sync — it streams one tensor at a
+        time and avoids holding the full base+LoRA state-dict in memory
+        simultaneously.
         """
-        from copy import deepcopy
+        return dict(self.iter_merged_weights())
 
-        from src.policy.weight_sync import (
-            canonicalize_lora_target_name,
-            is_lora_param_name,
-        )
+    def iter_merged_weights(self):
+        """Lazy generator yielding `(canonical_name, merged_tensor)` pairs.
 
-        # `merge_and_unload` IS destructive, so do it on a deep copy.
-        # NOTE: this duplicates the model in GPU memory briefly; for
-        # Qwen2.5-1.5B (~3 GB bf16) this is comfortably under the A100-80GB
-        # ceiling. If we move to larger models later, we'd switch to a
-        # memory-efficient merge path.
-        clone = deepcopy(self.model)
-        merged = clone.merge_and_unload()
-        raw = merged.state_dict()
+        For each PEFT-LoRA-wrapped Linear, computes the merged weight on
+        the fly as `base + (lora_B @ lora_A) * scaling` WITHOUT modifying
+        the live model and WITHOUT a full deepcopy. Each merged tensor
+        exists only briefly during `yield`; vLLM's `model.load_weights`
+        copies the data into its own buffer, then the tensor is freed
+        before the next iteration.
 
-        out: dict[str, Any] = {}
-        for k, v in raw.items():
-            if is_lora_param_name(k):
-                # Should not happen after merge_and_unload, but guard.
-                continue
-            out[canonicalize_lora_target_name(k)] = v
-        return out
+        Memory profile: peak transient ≈ 3× one LoRA target's weight
+        (~18 MB for a Qwen-1.5B q_proj at hidden=1536), instead of the
+        ~3 GB transient of the deepcopy path.
+        """
+        import torch  # type: ignore[import-not-found]
+
+        from src.policy.weight_sync import canonicalize_lora_target_name
+
+        # Map module-name → PEFT LoRA layer (if any). PEFT wraps a Linear
+        # with a LoraLayer that holds .base_layer (the original weight) and
+        # .lora_A.<adapter>, .lora_B.<adapter>, plus .scaling[adapter].
+        adapter_name = "default"
+
+        # First pass: build a set of module names that ARE LoRA-wrapped, so
+        # we can skip their .base_layer.weight in the second pass and yield
+        # the merged version instead.
+        lora_module_names: set[str] = set()
+        for name, module in self.model.named_modules():
+            if hasattr(module, "lora_A") and hasattr(module, "lora_B") and hasattr(module, "base_layer"):
+                lora_module_names.add(name)
+
+        # Second pass: walk every parameter and decide what to yield.
+        # PEFT puts everything under "base_model.model." prefix; we strip
+        # that via canonicalize_lora_target_name.
+        with torch.no_grad():
+            for raw_name, param in self.model.named_parameters():
+                # Skip pure-LoRA params (lora_A/lora_B); they are merged
+                # into the base layer in the LoRA pass below.
+                if ".lora_A." in raw_name or ".lora_B." in raw_name:
+                    continue
+
+                # Skip ANY .base_layer.weight whose parent module is LoRA-wrapped;
+                # we yield the merged version below instead.
+                # raw_name like 'base_model.model.<...>.q_proj.base_layer.weight'
+                # → its parent module name is everything up to '.base_layer.<...>'
+                if ".base_layer." in raw_name:
+                    parent = raw_name.split(".base_layer.")[0]
+                    parent_short = parent[len("base_model.model.") :] if parent.startswith("base_model.model.") else parent
+                    parent_full = "base_model.model." + parent_short
+                    if parent_full in {"base_model.model." + n for n in lora_module_names} or parent in lora_module_names:
+                        continue
+
+                # Untouched param (norms, embed, lm_head, mlp not in target_modules):
+                # canonicalize the name and yield the param data directly (no copy).
+                yield canonicalize_lora_target_name(raw_name), param.data
+
+            # LoRA pass: for each wrapped module, compute the merged weight
+            # and yield it. This is the only place where a transient tensor
+            # is materialized.
+            for mod_name in lora_module_names:
+                module = self.model.get_submodule(mod_name)
+                base_layer = module.base_layer
+                base_weight = base_layer.weight  # [out, in]
+                lora_A = module.lora_A[adapter_name].weight  # [r, in]
+                lora_B = module.lora_B[adapter_name].weight  # [out, r]
+                scaling = float(module.scaling[adapter_name])
+                # delta = (B @ A) * scaling — one tensor of base_weight shape
+                delta = (lora_B @ lora_A) * scaling
+                merged = base_weight + delta
+                # Canonical name is the parent module's `.weight`
+                full_name = f"base_model.model.{mod_name}.weight"
+                yield canonicalize_lora_target_name(full_name), merged
+                # `merged` and `delta` go out of scope here → freed before
+                # next iteration.
 
     def save_adapter(self, path: str) -> None:
         self.model.save_pretrained(path)

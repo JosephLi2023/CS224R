@@ -150,9 +150,15 @@ def train_loop_smoke(
             )
 
             if sync_every > 0 and (ep + 1) % sync_every == 0:
-                state = policy.merged_state_dict()
-                runner.sync_weights(state)
-                del state
+                # Stream merged LoRA weights one tensor at a time — avoids
+                # the deepcopy(self.model) memory spike. Then explicitly
+                # release any leftover buffers before next episode.
+                runner.sync_weights(policy.iter_merged_weights())
+                import gc
+                import torch as _torch
+                gc.collect()
+                if _torch.cuda.is_available():
+                    _torch.cuda.empty_cache()
 
             # Persist log every episode so a crash or local timeout still leaves
             # a useful artifact on the Volume.

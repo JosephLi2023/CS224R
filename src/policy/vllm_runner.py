@@ -9,10 +9,9 @@ the running engine so subsequent rollouts reflect the policy update.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Iterable
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    import torch
     from vllm import LLM  # type: ignore[import-not-found]
 
 
@@ -149,20 +148,33 @@ class VLLMRunner:
     # Weight sync (the core Day-3 deliverable)
     # ------------------------------------------------------------------
 
-    def sync_weights(self, state_dict: dict[str, "torch.Tensor"]) -> dict[str, int]:
-        """Push a merged-LoRA state-dict into the running vLLM model.
+    def sync_weights(self, state_dict) -> dict[str, int]:
+        """Push merged-LoRA weights into the running vLLM model.
 
-        `state_dict` keys must match what the underlying base model expects
-        (i.e. they should already have been canonicalized via
-        `src.policy.weight_sync.canonicalize_lora_target_name`).
+        `state_dict` can be either a dict OR an iterable of (name, tensor)
+        pairs. The iterable form streams one tensor at a time so LoRA
+        policies can use `iter_merged_weights()` without materializing the
+        full merged state-dict in memory (fixes sync_weights OOM at scale).
         """
         worker = self._get_driver_worker()
         model_runner = worker.model_runner  # type: ignore[attr-defined]
         model = model_runner.model
-        # vLLM's load_weights expects an iterable of (name, tensor).
-        items: Iterable[tuple[str, "torch.Tensor"]] = list(state_dict.items())
-        model.load_weights(items)
-        return {"loaded": len(state_dict)}
+        # Accept both dict and iterable-of-pairs.
+        if hasattr(state_dict, "items") and not hasattr(state_dict, "__next__"):
+            items_iter = iter(state_dict.items())
+        else:
+            items_iter = iter(state_dict)
+        # vLLM's `load_weights` itself streams — we count as we go.
+        count = 0
+
+        def counted():
+            nonlocal count
+            for name, t in items_iter:
+                count += 1
+                yield name, t
+
+        model.load_weights(counted())
+        return {"loaded": count}
 
     def _get_driver_worker(self) -> Any:
         """Reach into the engine for the worker holding the model.
