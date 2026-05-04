@@ -6,6 +6,7 @@ from src.datasets.sft_webshop import (
     load_jsonl_trajectory,
     load_sft_examples_from_directory,
     summarize_sft_dataset,
+    synthesize_sft_target,
     trajectory_to_sft_examples,
 )
 
@@ -15,5 +16,6 @@ __all__ = [
     "load_jsonl_trajectory",
     "load_sft_examples_from_directory",
     "summarize_sft_dataset",
+    "synthesize_sft_target",
     "trajectory_to_sft_examples",
 ]

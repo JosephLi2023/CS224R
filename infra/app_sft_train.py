@@ -44,6 +44,7 @@ def sft_train(
     from src.datasets.sft_webshop import (
         load_sft_examples_from_directory,
         summarize_sft_dataset,
+        synthesize_sft_target,
     )
     from src.policy.lora_policy import LoRAPolicy, LoRAPolicyConfig
 
@@ -68,9 +69,11 @@ def sft_train(
     rows: list[dict] = []
     for ex in examples:
         prompt_ids = tokenizer(ex.prompt, add_special_tokens=False).input_ids
-        action_ids = tokenizer(
-            " " + ex.action + tokenizer.eos_token, add_special_tokens=False
-        ).input_ids
+        # Target is the full ReAct emission ` <thought>\nAction: <body>` so
+        # the SFT model learns to produce Thought + Action together — the
+        # exact format the runtime ReAct loop expects.
+        target_str = synthesize_sft_target(ex.action) + tokenizer.eos_token
+        action_ids = tokenizer(target_str, add_special_tokens=False).input_ids
         if len(prompt_ids) + len(action_ids) > max_seq_len:
             keep = max(0, max_seq_len - len(action_ids))
             prompt_ids = prompt_ids[-keep:]

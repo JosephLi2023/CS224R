@@ -184,30 +184,84 @@ def _diff_options(prev_encoded: str, next_encoded: str) -> str | None:
 # --------- Default ReAct prompt renderer ---------------------------------
 
 
+def _action_to_thought(action: str) -> str:
+    """Heuristic: synthesize a one-sentence ReAct 'Thought' from an action.
+
+    Used by `default_render_prompt` so the SFT target is a full
+    `Thought: <reason>\\nAction: <body>` block — matching the runtime ReAct
+    template exactly. The original WebShop human-trajectory JSONL does not
+    record human thoughts, so we synthesize one consistent with each action
+    type.
+    """
+    if action.startswith("search["):
+        query = action[len("search["):-1] if action.endswith("]") else action[len("search["):]
+        return f"I'll search for {query}."
+    if action == "click[Buy Now]":
+        return "This product matches the requirements; I'll buy it now."
+    if action == "click[Back to Search]":
+        return "Let me go back to the search results."
+    if action == "click[Next >]":
+        return "Let me look at the next page of results."
+    if action == "click[< Prev]":
+        return "Let me go back to the previous page of results."
+    if action.startswith("click[") and action.endswith("]"):
+        body = action[len("click["):-1]
+        if body in {"Description", "Features", "Reviews", "Attributes"}:
+            return f"Let me read the {body.lower()} for this item."
+        if body.startswith("B0") and len(body) == 10:
+            return "Let me look at this product more closely."
+        # Otherwise treat as an option/value selection.
+        return f"I'll select the option {body}."
+    return "Let me proceed."
+
+
 def default_render_prompt(
     instruction: str,
     history: list[tuple[str, str]],   # list of (observation, action) for past turns
     current_observation: str,
 ) -> str:
-    """Minimal ReAct-style prompt. The collector's renderer is more elaborate
-    but for SFT we only need the contract: prompt ends right where the model
-    should emit the next action. Override via the `render_prompt` arg of
-    `trajectory_to_sft_examples`.
+    """SFT prompt template that MATCHES the runtime ReAct template
+    (`src.envs.prompts.react_webshop.render_webshop_turn_prompt`) so the
+    model trained at SFT time is conditioned on the SAME prefix it will see
+    during GRPO rollouts. Diverging templates here was the root cause of
+    SFT-warm GRPO returning R=0 on the v3 run.
+
+    Prompt ends with `Thought:` so the SFT target is the full ReAct block
+    `<synthesized thought>\\nAction: <body>` (see `synthesize_sft_target`).
     """
-    parts: list[str] = []
-    parts.append(
-        "You are an online shopping agent. Given the user instruction and "
-        "the current page observation, output a single action."
-    )
-    parts.append("")
-    parts.append(f"User instruction: {instruction}")
-    parts.append("")
+    parts: list[str] = [
+        "You are an online shopping agent. Your goal is to find and buy a "
+        "product matching the user's instruction. On every turn you must "
+        "respond in the ReAct format with exactly one of:",
+        "  Thought: <one short reasoning sentence>",
+        "  Action: search[<query>]",
+        "  Action: click[<item or button>]",
+        "Pick a single Action per turn; do not output more than one Action.",
+        "",
+        f"User instruction: {instruction}",
+        "",
+    ]
     for obs, act in history:
         parts.append(f"Observation: {obs.strip()}")
+        # During SFT we replay both the synthesized thought and the action
+        # so the in-context history matches what the model itself will emit
+        # at runtime.
+        parts.append(f"Thought: {_action_to_thought(act)}")
         parts.append(f"Action: {act}")
     parts.append(f"Observation: {current_observation.strip()}")
-    parts.append("Action:")
+    parts.append("Thought:")
     return "\n".join(parts)
+
+
+def synthesize_sft_target(action: str) -> str:
+    """Build the multi-line SFT label matching the prompt's `Thought:` ending.
+
+    Returns the string the model should emit AFTER the prompt ends — i.e.
+    ` <synthesized thought>\\nAction: <action body>`. The leading space is
+    deliberate so it concatenates cleanly with the prompt's trailing
+    `Thought:` (which has no trailing whitespace).
+    """
+    return f" {_action_to_thought(action)}\nAction: {action}"
 
 
 # --------- Trajectory parsing --------------------------------------------

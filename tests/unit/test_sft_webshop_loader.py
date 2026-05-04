@@ -8,6 +8,7 @@ from src.datasets.sft_webshop import (
     _action_from_url_transition,
     _decode_query_list,
     _path_segments,
+    default_render_prompt,
     load_sft_examples_from_directory,
     summarize_sft_dataset,
     trajectory_to_sft_examples,
@@ -113,13 +114,24 @@ def test_synthetic_trajectory_preserves_instruction_and_reward():
 def test_prompt_accumulates_history_across_steps():
     rows = _make_synthetic_trajectory()
     ex = trajectory_to_sft_examples(rows, trajectory_id="T01")
-    # step 0 (index) has NO prior history
-    assert "Action: search" not in ex[0].prompt
-    # step 1 (after search) has ONE prior action in history
+    # The system-prompt format-hint contains the literal `Action: search[<query>]`
+    # so we count actual prior-action lines instead by counting Thought: lines
+    # (system prompt has 1 Thought:, each prior history turn adds 1, current
+    # observation adds 1 more = 2 + n_history).
+    n_thought_step0 = ex[0].prompt.count("Thought:")
+    n_thought_step1 = ex[1].prompt.count("Thought:")
+    n_thought_step2 = ex[2].prompt.count("Thought:")
+    assert n_thought_step0 == 2  # system hint + final
+    assert n_thought_step1 == 3  # + 1 history turn
+    assert n_thought_step2 == 4  # + 2 history turns
+    # History entries replay both the synthesized thought and the action.
     assert "Action: search[red dress]" in ex[1].prompt
-    # step 2 (after click on item) has TWO prior actions
-    assert "Action: search[red dress]" in ex[2].prompt
+    assert "Thought: I'll search for red dress." in ex[1].prompt
     assert "Action: click[B07AAAAAA]" in ex[2].prompt
+    # All step prompts end with "Thought:" (matches runtime ReAct prefix).
+    assert ex[0].prompt.rstrip().endswith("Thought:")
+    assert ex[1].prompt.rstrip().endswith("Thought:")
+    assert ex[2].prompt.rstrip().endswith("Thought:")
 
 
 def test_min_reward_filter_drops_failed_trajectory():
@@ -228,3 +240,40 @@ def test_unknown_transition_aborts_trajectory():
          "goal": {"instruction_text": "buy X"}, "content": {"observation": "done"}, "reward": 1.0},
     ]
     assert trajectory_to_sft_examples(rows, trajectory_id="T1") == []
+
+
+# ---- Prompt-template alignment with runtime ReAct ------------------
+
+
+def test_default_prompt_matches_runtime_template_structure():
+    """The SFT loader's prompt template must end with 'Thought:' so the
+    SFT model is conditioned on the SAME prefix the runtime collector uses.
+    Diverging templates here was the root cause of the v3 R=0 result."""
+    p = default_render_prompt(
+        instruction="buy a red dress under $30",
+        history=[],
+        current_observation="Welcome to Amazon Shopping.",
+    )
+    assert p.rstrip().endswith("Thought:")
+    # System prompt must mention the ReAct format the runtime expects.
+    assert "ReAct" in p
+    assert "Action: search[" in p
+    assert "Action: click[" in p
+
+
+def test_synthesize_sft_target_emits_react_block():
+    from src.datasets.sft_webshop import synthesize_sft_target
+    out = synthesize_sft_target("search[red dress]")
+    assert out.startswith(" ")  # leading space concatenates with prompt's "Thought:"
+    assert "I'll search for red dress." in out
+    assert "Action: search[red dress]" in out
+
+
+def test_synthesize_sft_target_special_actions():
+    from src.datasets.sft_webshop import synthesize_sft_target
+    assert "Action: click[Buy Now]" in synthesize_sft_target("click[Buy Now]")
+    assert "buy" in synthesize_sft_target("click[Buy Now]").lower()
+    assert "next page" in synthesize_sft_target("click[Next >]").lower()
+    assert "Action: click[B0123ABCDE]" in synthesize_sft_target("click[B0123ABCDE]")
+    assert "Action: click[Description]" in synthesize_sft_target("click[Description]")
+    assert "description" in synthesize_sft_target("click[Description]").lower()
