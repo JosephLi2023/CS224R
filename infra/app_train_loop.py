@@ -33,6 +33,7 @@ def train_loop_smoke(
     num_products: int = 1000,
     sync_every: int = 1,
     run_name: str = "flat_grpo_webshop_smoke",
+    sft_adapter: str = "",
 ) -> dict:
     import json
     import os
@@ -61,6 +62,12 @@ def train_loop_smoke(
     print(">>> Loading LoRAPolicy")
     policy = LoRAPolicy(LoRAPolicyConfig(cache_dir="/vol/hf_cache"))
 
+    sft_loaded = False
+    if sft_adapter:
+        print(">>> Loading SFT-warm-started LoRA adapter from", sft_adapter)
+        policy.load_adapter(sft_adapter)
+        sft_loaded = True
+
     print(">>> Booting VLLMRunner")
     runner = VLLMRunner(
         VLLMRunnerConfig(
@@ -71,6 +78,19 @@ def train_loop_smoke(
             seed=0,
         )
     )
+
+    if sft_loaded:
+        # vLLM was just initialised with the BASE Qwen weights — push the
+        # SFT-merged LoRA into it so the very first episode samples from the
+        # warm-started policy. Without this, episode 0 would still be
+        # base-Qwen.
+        print(">>> Syncing SFT-merged weights to vLLM before first episode")
+        runner.sync_weights(policy.iter_merged_weights())
+        import gc as _gc
+        import torch as _torch
+        _gc.collect()
+        if _torch.cuda.is_available():
+            _torch.cuda.empty_cache()
 
     def env_factory():
         return WebShopAdapter(
@@ -167,6 +187,7 @@ def train_loop_smoke(
                     "n_episodes": n_episodes, "K": k, "max_turns": max_turns,
                     "task_id_offset": task_id_offset, "num_products": num_products,
                     "sync_every": sync_every, "run_name": run_name,
+                    "sft_adapter": sft_adapter,
                 }}, f, indent=2)
             volume.commit()
         except Exception as exc:
@@ -209,6 +230,7 @@ def main(
     num_products: int = 1000,
     sync_every: int = 1,
     run_name: str = "flat_grpo_webshop_smoke",
+    sft_adapter: str = "",
 ) -> None:
     import json as _json
     print(_json.dumps(
@@ -216,6 +238,7 @@ def main(
             n_episodes=n_episodes, k=k, max_turns=max_turns,
             task_id_offset=task_id_offset, num_products=num_products,
             sync_every=sync_every, run_name=run_name,
+            sft_adapter=sft_adapter,
         ),
         indent=2, default=str,
     ))
