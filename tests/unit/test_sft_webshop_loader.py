@@ -49,7 +49,7 @@ def test_action_click_asin_from_search_to_item_page():
 def test_action_buy_when_transitioning_to_done():
     prev = "http://host/item_page/task1/B0/q/1/opts"
     nxt = "http://host/done/task1/B0/%7B%7D"
-    assert _action_from_url_transition(prev, nxt) == "click[buy]"
+    assert _action_from_url_transition(prev, nxt) == "click[Buy Now]"
 
 
 def test_action_none_for_unknown_transition():
@@ -99,7 +99,7 @@ def test_synthetic_trajectory_produces_3_examples():
     assert len(ex) == 3
     assert ex[0].action == "search[red dress]"
     assert ex[1].action == "click[B07AAAAAA]"
-    assert ex[2].action == "click[buy]"
+    assert ex[2].action == "click[Buy Now]"
 
 
 def test_synthetic_trajectory_preserves_instruction_and_reward():
@@ -161,3 +161,70 @@ def test_load_from_directory_reads_jsonl_files(tmp_path):
     assert summary["n_examples"] == 3
     assert summary["n_trajectories"] == 1
     assert summary["by_action_kind"] == {"search": 1, "click": 2}
+
+
+# ---- A8: extended URL-action coverage ------------------------------
+
+
+def test_action_pagination_next():
+    prev = "http://h/search_results/T1/%5B%27red%27%5D/1"
+    nxt  = "http://h/search_results/T1/%5B%27red%27%5D/2"
+    assert _action_from_url_transition(prev, nxt) == "click[Next >]"
+
+
+def test_action_pagination_prev():
+    prev = "http://h/search_results/T1/%5B%27red%27%5D/3"
+    nxt  = "http://h/search_results/T1/%5B%27red%27%5D/2"
+    assert _action_from_url_transition(prev, nxt) == "click[< Prev]"
+
+
+def test_action_re_search_different_query():
+    prev = "http://h/search_results/T1/%5B%27red%27%5D/1"
+    nxt  = "http://h/search_results/T1/%5B%27blue%27%2C%20%27dress%27%5D/1"
+    assert _action_from_url_transition(prev, nxt) == "search[blue dress]"
+
+
+def test_action_back_to_search():
+    prev = "http://h/item_page/T1/B0X/q/1/%7B%7D"
+    nxt  = "http://h/search_results/T1/%5B%27red%27%5D/1"
+    assert _action_from_url_transition(prev, nxt) == "click[Back to Search]"
+
+
+def test_action_tab_click_on_item_page():
+    prev = "http://h/item_page/T1/B0X/q/1/%7B%7D"
+    nxt  = "http://h/item_page/T1/B0X/q/1/%7B%7D/Description"
+    assert _action_from_url_transition(prev, nxt) == "click[Description]"
+
+
+def test_action_option_click_on_item_page():
+    # prev: empty options dict ; next: {"size":"large"}
+    prev = "http://h/item_page/T1/B0X/q/1/%7B%7D"
+    nxt  = "http://h/item_page/T1/B0X/q/1/%7B%22size%22%3A%20%22large%22%7D"
+    assert _action_from_url_transition(prev, nxt) == "click[large]"
+
+
+def test_unknown_transition_returns_none():
+    """e.g. same item_page same options → no meaningful action."""
+    prev = "http://h/item_page/T1/B0X/q/1/%7B%7D"
+    nxt  = "http://h/item_page/T1/B0X/q/1/%7B%7D"
+    assert _action_from_url_transition(prev, nxt) is None
+
+
+# ---- A7: abort trajectory on unrecognised transition ---------------
+
+
+def test_unknown_transition_aborts_trajectory():
+    """If any mid-trajectory transition can't be inferred, the WHOLE
+    trajectory is dropped to prevent prompt-history desync."""
+    rows = [
+        {"page": "index", "url": "http://h/T1", "goal": {"instruction_text": "buy X"},
+         "content": {"observation": "home"}},
+        {"page": "search_results", "url": "http://h/search_results/T1/%5B%27x%27%5D/1",
+         "goal": {"instruction_text": "buy X"}, "content": {"observation": "results"}},
+        # Same page, same options → returns None → abort
+        {"page": "search_results", "url": "http://h/search_results/T1/%5B%27x%27%5D/1",
+         "goal": {"instruction_text": "buy X"}, "content": {"observation": "results"}},
+        {"page": "done", "url": "http://h/done/T1/B0X/%7B%7D",
+         "goal": {"instruction_text": "buy X"}, "content": {"observation": "done"}, "reward": 1.0},
+    ]
+    assert trajectory_to_sft_examples(rows, trajectory_id="T1") == []

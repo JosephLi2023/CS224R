@@ -64,30 +64,121 @@ def _decode_query_list(encoded: str) -> list[str]:
     return [encoded]
 
 
-def _action_from_url_transition(prev_url: str, next_url: str) -> str | None:  # noqa: ARG001 -- prev_url reserved for future heuristics
+def _action_from_url_transition(prev_url: str, next_url: str) -> str | None:
     """Infer the WebShop ReAct action from `prev_url` → `next_url`.
 
-    `prev_url` is currently unused: WebShop's URL fully encodes the agent's
-    state at each step, so the next URL alone determines the action that
-    produced it. Kept in the signature in case future variants of the env
-    require diffing successive URLs to disambiguate (e.g. browser back).
+    Diffs the two URLs to disambiguate transitions that look superficially
+    identical but represent different agent actions (review item A8):
+
+      * index → search_results              → search[<query>]
+      * search_results page=N → page=N+1, same query → click[Next >]
+      * search_results page=N → page=N-1, same query → click[< Prev]
+      * search_results → search_results, different query → search[<new>]
+      * search_results → item_page          → click[<asin>]
+      * item_page → item_page, same asin, mutated options dict
+                                            → click[<new option value>]
+      * item_page → item_page, same asin, page suffix (Description/Features/
+                    Reviews/Attributes)     → click[<tab name>]
+      * item_page → search_results          → click[Back to Search]
+      * item_page → done                    → click[Buy Now]
+
+    Returns None for any transition that doesn't match a known pattern.
+    Callers (trajectory_to_sft_examples) ABORT the whole trajectory in that
+    case so the rendered prompt history can't desync (review item A7).
     """
-    del prev_url
     next_segs = _path_segments(next_url)
+    prev_segs = _path_segments(prev_url)
     if not next_segs:
         return None
     page = next_segs[0]
-    if page == "search_results" and len(next_segs) >= 4:
-        # /search_results/<task>/<query>/<page>
-        query_words = _decode_query_list(next_segs[2])
-        return f"search[{' '.join(query_words)}]"
-    if page == "item_page" and len(next_segs) >= 3:
-        # /item_page/<task>/<asin>/...
-        asin = next_segs[2]
-        return f"click[{asin}]"
+
+    # done / buy
     if page == "done":
-        return "click[buy]"
+        return "click[Buy Now]"
+
+    # search_results — could be initial search, pagination, or a re-search
+    if page == "search_results" and len(next_segs) >= 4:
+        next_query = _decode_query_list(next_segs[2])
+        next_page_idx_raw = next_segs[3]
+        try:
+            next_page_idx = int(next_page_idx_raw)
+        except ValueError:
+            next_page_idx = 1
+        if prev_segs and prev_segs[0] == "search_results" and len(prev_segs) >= 4:
+            prev_query = _decode_query_list(prev_segs[2])
+            try:
+                prev_page_idx = int(prev_segs[3])
+            except ValueError:
+                prev_page_idx = 1
+            if prev_query == next_query:
+                if next_page_idx == prev_page_idx + 1:
+                    return "click[Next >]"
+                if next_page_idx == prev_page_idx - 1:
+                    return "click[< Prev]"
+                return None
+            # Different query → fresh search.
+            return f"search[{' '.join(next_query) if next_query else ''}]"
+        if prev_segs and prev_segs[0] == "item_page":
+            # On item page, navigated back to search results.
+            return "click[Back to Search]"
+        # From index (or unknown).
+        return f"search[{' '.join(next_query) if next_query else ''}]"
+
+    # item_page — could be ASIN click, option click, or tab click
+    if page == "item_page" and len(next_segs) >= 3:
+        next_asin = next_segs[2]
+        # URL layout: /item_page/<task>/<asin>/<query>/<page>/<options>/<tab?>
+        # → segs[3]=query, segs[4]=page, segs[5]=options, segs[6]=tab(optional)
+        next_tab: str | None = None
+        if len(next_segs) >= 7 and next_segs[6] in {
+            "Description", "Features", "Reviews", "Attributes",
+        }:
+            next_tab = next_segs[6]
+        next_options = next_segs[5] if len(next_segs) >= 6 else "%7B%7D"
+
+        if prev_segs and prev_segs[0] == "item_page" and len(prev_segs) >= 3 and prev_segs[2] == next_asin:
+            prev_tab: str | None = None
+            if len(prev_segs) >= 7 and prev_segs[6] in {
+                "Description", "Features", "Reviews", "Attributes",
+            }:
+                prev_tab = prev_segs[6]
+            prev_options = prev_segs[5] if len(prev_segs) >= 6 else "%7B%7D"
+            # Tab change → click[<tab>]
+            if next_tab is not None and next_tab != prev_tab:
+                return f"click[{next_tab}]"
+            # Options changed → click[<new option value>]
+            if next_options != prev_options:
+                opt = _diff_options(prev_options, next_options)
+                if opt is None:
+                    return None
+                return f"click[{opt}]"
+            # Same asin, same options, same tab → not a meaningful action.
+            return None
+        # Coming from search_results or index → click on the listing.
+        return f"click[{next_asin}]"
+
     return None
+
+
+def _diff_options(prev_encoded: str, next_encoded: str) -> str | None:
+    """Return the value of the option that newly appeared (or changed) when
+    comparing two URL-encoded option dicts. Returns None on parse failure or
+    when no single new value can be identified."""
+    try:
+        prev_d = ast.literal_eval(unquote(prev_encoded))
+        next_d = ast.literal_eval(unquote(next_encoded))
+    except Exception:
+        return None
+    if not isinstance(prev_d, dict) or not isinstance(next_d, dict):
+        return None
+    # New key, OR same key with a different value.
+    new_pairs = [
+        (k, v) for k, v in next_d.items()
+        if k not in prev_d or prev_d.get(k) != v
+    ]
+    if len(new_pairs) != 1:
+        return None
+    return str(new_pairs[0][1])
 
 
 # --------- Default ReAct prompt renderer ---------------------------------
@@ -180,7 +271,13 @@ def trajectory_to_sft_examples(
         nxt = rows[i + 1]
         action = _action_from_url_transition(cur.get("url", ""), nxt.get("url", ""))
         if action is None:
-            continue
+            # Trajectory contains an un-recognised URL transition (e.g. an
+            # action type the loader doesn't understand yet). Aborting the
+            # WHOLE trajectory rather than skipping this single step keeps
+            # the prompt history aligned with the action labels — skipping
+            # would silently desync subsequent (obs, action) pairs and teach
+            # mis-grounded supervision. (Review item A7.)
+            return []
         obs_text = _row_observation_text(cur)
         prompt = render_prompt(instruction, list(history), obs_text)
         examples.append(

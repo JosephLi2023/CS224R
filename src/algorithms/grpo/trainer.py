@@ -298,18 +298,23 @@ class HGPOTrainer:
                 if self._ref_lora_snapshot is not None:
                     with torch.no_grad():
                         saved: dict[str, dict[str, "torch.Tensor"]] = {}
-                        for mod_name, snap in self._ref_lora_snapshot.items():
-                            try:
-                                mod = self.policy.model.get_submodule(mod_name)
-                            except AttributeError:
-                                continue
-                            saved[mod_name] = {
-                                "lora_A": mod.lora_A["default"].weight.data.clone(),
-                                "lora_B": mod.lora_B["default"].weight.data.clone(),
-                            }
-                            mod.lora_A["default"].weight.data.copy_(snap["lora_A"])
-                            mod.lora_B["default"].weight.data.copy_(snap["lora_B"])
+                        # Open try BEFORE the swap-in so a partial swap (e.g. shape
+                        # mismatch / OOM mid-loop) still triggers restoration of
+                        # the modules already overwritten. saved[mod_name] is
+                        # populated *before* each copy_, so restoration is well-
+                        # defined at any point. (Review item A2.)
                         try:
+                            for mod_name, snap in self._ref_lora_snapshot.items():
+                                try:
+                                    mod = self.policy.model.get_submodule(mod_name)
+                                except AttributeError:
+                                    continue
+                                saved[mod_name] = {
+                                    "lora_A": mod.lora_A["default"].weight.data.clone(),
+                                    "lora_B": mod.lora_B["default"].weight.data.clone(),
+                                }
+                                mod.lora_A["default"].weight.data.copy_(snap["lora_A"])
+                                mod.lora_B["default"].weight.data.copy_(snap["lora_B"])
                             logits = self.policy.model(input_ids, attention_mask=attention_mask).logits
                         finally:
                             for mod_name, live in saved.items():
@@ -406,18 +411,24 @@ class HGPOTrainer:
         unclipped = ratio * adv_t
         policy_loss = -torch.minimum(unclipped, clipped).mean()
 
-        # KL penalty uses (new vs ref=frozen base) — anchors policy to SFT prior
-        # per proposal §3.1 (review item C2). k3 estimator: kl = (rho - 1) - log(rho),
-        # non-negative per-token AND unbiased estimator of KL(ref||new).
-        ref_log_ratio = new_lp_t - ref_lp_t
+        # KL penalty uses (ref vs new) with samples from the current policy π.
+        # For unbiased Schulman-k3 of KL(π||π_ref), the ratio must be r = π_ref/π
+        # (i.e. log_ratio = ref_lp − new_lp), NOT r = π/π_ref. Then
+        # E_π[(r − 1) − log r] = KL(π||π_ref) by Jensen, and the per-token term
+        # is non-negative. (Review item A1: prior version used new − ref which
+        # was a non-negative biased surrogate of neither KL direction.)
+        ref_log_ratio = ref_lp_t - new_lp_t
         ref_ratio = torch.exp(ref_log_ratio)
         kl_per_tok = (ref_ratio - 1.0) - ref_log_ratio
         observed_kl = float(kl_per_tok.mean().detach().item())
         kl_coef = self.kl_controller.coef
-        # KL warmup: zero out the term during the first N steps but still
-        # observe + log it so the controller has data when warmup ends.
+        # KL warmup: zero out the term during the first N steps with a FRESH
+        # tensor (not 0.0 * kl_per_tok.mean(), which would propagate NaN/inf
+        # if ref_ratio overflowed — exactly the scenario warmup exists to
+        # handle). observed_kl is still computed + logged so we can see what
+        # the un-penalised KL is doing during warmup. (Review items A3 + A4.)
         if self._step < int(self.cfg.kl_warmup_episodes):
-            kl_term = 0.0 * kl_per_tok.mean()
+            kl_term = torch.zeros((), device=device, dtype=torch.float32)
         else:
             kl_term = kl_coef * kl_per_tok.mean()
 
@@ -481,7 +492,13 @@ class HGPOTrainer:
         else:
             stats.grad_norm = 0.0  # not yet a step boundary
 
-        new_coef = self.kl_controller.update(stats.observed_kl)
-        stats.kl_coef = new_coef
+        # KL controller is also frozen during warmup (review item A3): if
+        # observed_kl spikes to ~1e6 right after SFT, feeding the controller
+        # would saturate kl_coef to floor/ceiling before warmup ends, snapping
+        # the penalty on at an absurd coefficient. Resume updates AFTER warmup.
+        if self._step >= int(self.cfg.kl_warmup_episodes):
+            new_coef = self.kl_controller.update(stats.observed_kl)
+            stats.kl_coef = new_coef
+        # else: kl_coef stays at controller.coef (init value), already in stats
         self._step += 1
         return stats
