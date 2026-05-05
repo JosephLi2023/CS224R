@@ -28,6 +28,25 @@ Usage:
   scripts/run_turnrd_modal.py --dry-run    # print commands only
   scripts/run_turnrd_modal.py --rounds 1 --episodes-per-round 2 --turnrd-epochs 1   # tiny smoke
 
+Wall-clock budget (real protocol, real WebShop, K=4 trajectories):
+  Per round: ~12-15 min train_loop + ~30 s standalone fit ≈ 13-16 min.
+  5-round protocol: ~65-80 min total (assume 90 min for safety).
+
+  → If running from a devmate session, set the execute_command timeout
+    to >= 7200000 ms (2 hours). The previous 60-min cap killed the
+    LOCAL polling subprocess at the boundary between Round 3 and
+    Round 4 — note that this only kills the local poller; the cloud
+    jobs themselves are detached so they continue, but the
+    orchestrator stops submitting subsequent rounds.
+  → For long unattended runs, prefer running this script under
+    `nohup` in a separate terminal so its lifetime is bounded only
+    by the actual orchestration, not by any IDE/agent session
+    timeout. Example:
+      nohup scripts/run_turnrd_modal.py --rounds 5 \
+        --episodes-per-round 40 --turnrd-epochs 3 --seed 11 \
+        --sft-adapter /vol/checkpoints/sft_v3_<ts> \
+        > /tmp/protocol_seed11.log 2>&1 &
+
 Requires `modal` on PATH. The two Modal app entrypoints invoked are:
   - infra/app_train_loop.py::train_loop_smoke  (parent H-GRPO + producer)
   - infra/app_train_turnrd.py::train_turnrd_run  (standalone TurnRD fit)
@@ -466,6 +485,13 @@ def _train_loop_cmd(cfg: OrchestrationConfig, round_idx: int) -> list[str]:
         ),
         "--run-name", f"{cfg.effective_run_name_prefix}_round{round_idx:02d}",
     ]
+    # `gpu_mem_util` from the JSON's train block, when present. This
+    # caps vLLM's KV cache so the trainer has enough activation room
+    # for grad-tracking forward passes — the OOM mitigation from the
+    # prior protocol post-mortem (see execution plan).
+    gpu_mem_util_cfg = (cfg_json.get("train", {}) or {}).get("gpu_mem_util")
+    if gpu_mem_util_cfg is not None:
+        cmd.extend(["--gpu-mem-util", str(float(gpu_mem_util_cfg))])
     if cfg.sft_adapter:
         cmd.extend(["--sft-adapter", cfg.sft_adapter])
     cmd.extend(cfg.extra_train_loop_args)

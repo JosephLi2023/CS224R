@@ -307,6 +307,12 @@ def build_trainer_from_config(
         max_grad_norm=float(
             train_cfg.get("max_grad_norm", HGPOTrainerConfig().max_grad_norm)
         ),
+        max_tokens_per_microbatch=int(
+            train_cfg.get(
+                "max_tokens_per_microbatch",
+                HGPOTrainerConfig().max_tokens_per_microbatch,
+            )
+        ),
         kl_cfg=_build_kl_cfg(cfg),
         kl_warmup_episodes=int(
             train_cfg.get("kl_warmup_episodes", HGPOTrainerConfig().kl_warmup_episodes)

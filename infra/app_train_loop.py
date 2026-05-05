@@ -75,16 +75,16 @@ def train_loop_smoke(
         with open(config) as fh:
             cfg_dict = json.load(fh)
         # Per-config overrides for the loop knobs that the JSON owns.
-        # NOTE: We do NOT override n_episodes or K from cfg["train"] —
-        # those describe protocol-wide semantics, not per-Modal-call
-        # semantics. The orchestrator (`scripts/run_turnrd_modal.py`)
-        # passes per-round values via --n-episodes / --k explicitly.
-        # If the JSON's total_episodes overrode the CLI, a single
-        # `modal run` would balloon from a 2-ep dry-run into the full
-        # 200-ep protocol — see the post-mortem in the execution plan.
-        run_block = cfg_dict.get("run", {}) if cfg_dict else {}
-        if "name" in run_block:
-            run_name = str(run_block["name"])
+        # NOTE: We do NOT override n_episodes, k, or run_name from the
+        # JSON — those describe protocol-wide / orchestrator-supplied
+        # semantics, not per-Modal-call semantics. The orchestrator
+        # (`scripts/run_turnrd_modal.py`) passes per-round values via
+        # --n-episodes / --k / --run-name explicitly. If the JSON
+        # overrode these, the orchestrator's per-round naming
+        # (`<prefix>_round00`, `_round01`, …) would collapse onto a
+        # single `cfg.run.name` and the per-round log aggregator
+        # (`scripts/merge_turnrd_round_logs.py`) couldn't auto-detect
+        # rounds — see the post-mortem in the execution plan.
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     run_dir = f"/vol/manifests/{run_name}_{timestamp}"
