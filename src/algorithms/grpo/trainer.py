@@ -71,14 +71,21 @@ class HGPOTrainerConfig:
 class TrainStepStats:
     policy_loss: float = 0.0
     kl_term: float = 0.0
-    consistency: float = 0.0
+    consistency: float = 0.0  # python-side advantage residual (always 0 by construction; kept for back-compat)
+    consistency_t: float = 0.0  # tensor-side gradient-bearing C3 loss (the one that actually drives the trainer)
     total_loss: float = 0.0
     observed_kl: float = 0.0
     kl_coef: float = 0.0
-    grad_norm: float = 0.0
+    grad_norm: float = 0.0           # policy LoRA grad norm (pre-clip)
+    turnrd_grad_norm: float = 0.0    # TurnRD parameter grad norm (pre-clip; 0 when not learnable)
     n_action_tokens: int = 0
     mean_traj_adv: float = 0.0
     mean_turn_adv: float = 0.0
+    # TurnRD diagnostics (populated only when decomposer is learnable):
+    cls_query_norm: float = 0.0      # ‖cls_query‖₂ — non-trivial change ⇒ TurnRD is moving
+    alpha_mean: float = 0.0          # mean of α over (k, t) entries
+    alpha_var: float = 0.0           # variance of α; ≈ uniform-flat when small
+    alpha_max: float = 0.0           # max α weight in the group
 
 
 PerTurnDecomposer = Callable[[TrajectoryGroup], list[list[float]]]
@@ -513,12 +520,30 @@ class HGPOTrainer:
         # real gradient path back to TurnRD parameters per the C3 follow-up
         # note in `MEDIUM_FIXES.md::C3`.
         cons_loss_t: "torch.Tensor | None" = None
+        # TurnRD diagnostics (populated alongside cons_loss_t when learnable).
+        _alpha_mean: float = 0.0
+        _alpha_var: float = 0.0
+        _alpha_max: float = 0.0
         if self._decomposer_learnable and self.cfg.lambda_consistency != 0.0:
             grad_out = self.decomposer.decompose_with_grad(group)
             alpha_t = grad_out["alpha"]  # [K_real, T_max], grad-tracking
             attn_t = grad_out["attention_mask"]  # [K_real, T_max] long
             final_R_t = grad_out["final_R"]  # [K_real]
             if alpha_t.numel() > 0:
+                # Snapshot α distribution stats (mask-weighted) for
+                # post-hoc diagnostics: a uniform decomposition has
+                # alpha_var ≈ 0 and alpha_max ≈ 1/T; learned decompositions
+                # concentrate on a few turns and grow alpha_max + alpha_var.
+                _mask_for_stats = attn_t.to(dtype=alpha_t.dtype)
+                _denom = _mask_for_stats.sum().clamp_min(1.0)
+                _alpha_mean = float(((alpha_t * _mask_for_stats).sum() / _denom).detach().item())
+                _alpha_var = float(
+                    (((alpha_t - _alpha_mean) ** 2 * _mask_for_stats).sum() / _denom).detach().item()
+                )
+                # Mask out padding positions before max so an all-zero
+                # padded position doesn't artificially shrink the max.
+                _masked = alpha_t.masked_fill(attn_t == 0, float("-inf"))
+                _alpha_max = float(_masked.max().detach().item()) if alpha_t.numel() > 0 else 0.0
                 # Per-turn rewards = α * R. Then group-normalize per
                 # turn position (matches `compute_turn_advantages`) AND
                 # group-normalize final_R per group (matches
@@ -550,6 +575,21 @@ class HGPOTrainer:
                 cons_loss_t = consistency_loss_tensor(
                     self.cfg.lambda_consistency, traj_adv_t, turn_adv_t, attn_t
                 )
+        # Snapshot the cons_loss_t scalar BEFORE the optimizer step. This
+        # is the gradient-bearing C3 loss — distinct from `cons` (the
+        # pure-Python residual which is always 0 by construction).
+        _cons_t_scalar: float = (
+            float(cons_loss_t.detach().item()) if cons_loss_t is not None else 0.0
+        )
+        # Snapshot cls_query norm — proves whether TurnRD is moving.
+        _cls_query_norm: float = 0.0
+        if self._decomposer_learnable:
+            try:
+                _cls_query_norm = float(
+                    self.decomposer.model.cls_query.detach().norm().item()
+                )
+            except AttributeError:  # pragma: no cover (decomposer without cls_query)
+                _cls_query_norm = 0.0
         if cons_loss_t is not None:
             # Guard against the (production-impossible but test-possible) case
             # where the decomposer lives on a different device than the policy.
@@ -565,6 +605,7 @@ class HGPOTrainer:
             policy_loss=float(policy_loss.detach().item()),
             kl_term=float(kl_term.detach().item()),
             consistency=cons,
+            consistency_t=_cons_t_scalar,
             total_loss=float(total.detach().item()),
             observed_kl=observed_kl,
             kl_coef=kl_coef,
@@ -572,6 +613,10 @@ class HGPOTrainer:
             n_action_tokens=int(new_lp_t.numel()),
             mean_traj_adv=(sum(traj_adv) / max(1, len(traj_adv))),
             mean_turn_adv=(sum(flat_turn_adv) / max(1, len(flat_turn_adv))),
+            cls_query_norm=_cls_query_norm,
+            alpha_mean=_alpha_mean,
+            alpha_var=_alpha_var,
+            alpha_max=_alpha_max,
         )
         return total, stats
 
@@ -625,9 +670,10 @@ class HGPOTrainer:
             self._optimizer.zero_grad(set_to_none=True)
             # Day 13: also step the TurnRD optimizer when present.
             if self._decomposer_optimizer is not None and self._decomposer_params:
-                torch.nn.utils.clip_grad_norm_(
+                turnrd_grad_norm = torch.nn.utils.clip_grad_norm_(
                     self._decomposer_params, self.cfg.max_grad_norm
                 )
+                stats.turnrd_grad_norm = float(turnrd_grad_norm)
                 self._decomposer_optimizer.step()
                 self._decomposer_optimizer.zero_grad(set_to_none=True)
         else:

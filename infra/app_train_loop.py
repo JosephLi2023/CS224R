@@ -216,12 +216,19 @@ def train_loop_smoke(
                 "n_action_tokens": stats.n_action_tokens,
                 "policy_loss": round(stats.policy_loss, 6),
                 "kl_term": round(stats.kl_term, 6),
-                "consistency": round(stats.consistency, 6),
+                "consistency": round(stats.consistency, 6),  # python residual (always 0)
+                "consistency_t": round(stats.consistency_t, 6),  # actual gradient-bearing C3 loss
                 "total_loss": round(stats.total_loss, 6),
                 "observed_kl": round(stats.observed_kl, 6),
                 "kl_coef": round(stats.kl_coef, 6),
                 "grad_norm": round(stats.grad_norm, 6),
+                "turnrd_grad_norm": round(stats.turnrd_grad_norm, 6),
                 "mean_traj_adv": round(stats.mean_traj_adv, 6),
+                "mean_turn_adv": round(stats.mean_turn_adv, 6),
+                "cls_query_norm": round(stats.cls_query_norm, 6),
+                "alpha_mean": round(stats.alpha_mean, 6),
+                "alpha_var": round(stats.alpha_var, 6),
+                "alpha_max": round(stats.alpha_max, 6),
                 "elapsed_s": round(time.time() - ep_t0, 2),
             }
             log.append(row)
