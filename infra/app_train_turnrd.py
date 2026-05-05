@@ -38,16 +38,23 @@ def train_turnrd_run(
     mode: int = 1,
     n_epochs: int = 5,
     batch_size: int = 16,
-    lr: float = 1e-4,
+    lr: float = 5e-4,
     ckpt_out: str = "",
     max_records: int = 0,
     # TurnRD model knobs (defaults match TurnRDConfig + the existing
-    # configs/method_hgpo_turnrd.json).
-    layers: int = 4,
-    hidden_size: int = 256,
+    # configs/method_hgpo_turnrd.json post-improvement values).
+    layers: int = 6,
+    hidden_size: int = 384,
     n_heads: int = 4,
     max_turns: int = 64,
     dropout: float = 0.1,
+    causal: bool = True,
+    value_head: bool = True,
+    # Aux-loss knobs (Mode 1 only). lambda_value/gamma drive the
+    # per-turn V-head loss; lambda_entropy is the negative-entropy reg.
+    lambda_value: float = 0.5,
+    gamma: float = 0.95,
+    lambda_entropy: float = 0.01,
     # The producer pre-embeds turns; the standalone trainer doesn't need
     # the LoRA policy. We DO need the embedding width D, which the
     # producer wrote into the replay (we read it off the first record).
@@ -93,6 +100,8 @@ def train_turnrd_run(
             n_heads=n_heads,
             max_turns=max_turns,
             dropout=dropout,
+            causal=causal,
+            value_head=value_head,
         ),
         input_dim=input_dim,
     )
@@ -110,6 +119,9 @@ def train_turnrd_run(
         log_every=50,
         ckpt_path=(ckpt_out or None),
         max_records=(max_records or None),
+        lambda_value=lambda_value,
+        gamma=gamma,
+        lambda_entropy=lambda_entropy,
     )
     elapsed = round(time.time() - t0, 2)
     summary["elapsed_s"] = elapsed
@@ -125,14 +137,19 @@ def main(
     mode: int = 1,
     n_epochs: int = 5,
     batch_size: int = 16,
-    lr: float = 1e-4,
+    lr: float = 5e-4,
     ckpt_out: str = "",
     max_records: int = 0,
-    layers: int = 4,
-    hidden_size: int = 256,
+    layers: int = 6,
+    hidden_size: int = 384,
     n_heads: int = 4,
     max_turns: int = 64,
     dropout: float = 0.1,
+    causal: bool = True,
+    value_head: bool = True,
+    lambda_value: float = 0.5,
+    gamma: float = 0.95,
+    lambda_entropy: float = 0.01,
 ) -> None:
     import json as _json
 
@@ -150,6 +167,11 @@ def main(
             n_heads=n_heads,
             max_turns=max_turns,
             dropout=dropout,
+            causal=causal,
+            value_head=value_head,
+            lambda_value=lambda_value,
+            gamma=gamma,
+            lambda_entropy=lambda_entropy,
         ),
         indent=2,
         default=str,

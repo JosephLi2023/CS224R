@@ -25,7 +25,13 @@ from typing import Any, Iterator
 import torch
 
 from src.turnrd.dataset import TurnRDRecord, TurnRDReplayDataset, pad_collate
-from src.turnrd.model import TurnRD, loss_mode_1, loss_mode_2
+from src.turnrd.model import (
+    TurnRD,
+    alpha_entropy,
+    loss_mode_1,
+    loss_mode_2,
+    loss_value_head,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +62,11 @@ def train_turnrd(
     log_every: int = 50,
     ckpt_path: str | os.PathLike[str] | None = None,
     max_records: int | None = None,
+    # Post-WebShop-attempt aux losses (Mode 1 only — Mode 2 has direct
+    # judge-label supervision so doesn't need either).
+    lambda_value: float = 0.5,
+    gamma: float = 0.95,
+    lambda_entropy: float = 0.01,
 ) -> dict[str, Any]:
     """Train TurnRD on a replay JSONL.
 
@@ -73,10 +84,22 @@ def train_turnrd(
         ckpt_path: if provided, write `model.state_dict()` here after the
             last epoch.
         max_records: optional cap forwarded to `TurnRDReplayDataset`.
+        lambda_value: weight on the per-turn V-head MSE loss
+            `(V(h_t) - γ^(T-t-1)·R)²`. Only effective in Mode 1 AND
+            when the model was built with `cfg.value_head=True`. Set
+            to 0 to disable. Default 0.5.
+        gamma: discount factor for the per-turn return target. Default
+            0.95. With sparse final R, smaller γ skews credit toward
+            later turns.
+        lambda_entropy: NEGATIVE entropy regularization strength on α
+            (subtracts β·H from the Mode-1 loss). Encourages α to
+            commit to a small set of high-credit turns rather than
+            collapse to uniform. Set to 0 to disable. Default 0.01.
 
     Returns:
         Dict with `final_loss`, `initial_loss`, `n_steps`, `ckpt_path`,
-        `skipped_records` (sum of empties + missing-judge for Mode 2).
+        `skipped_records`, plus `final_loss_breakdown` showing the
+        last batch's component losses (cls / value / entropy).
     """
     if mode not in (1, 2):
         raise ValueError(f"train_turnrd: mode must be 1 or 2; got {mode}.")
@@ -118,12 +141,35 @@ def train_turnrd(
 
             optimizer.zero_grad(set_to_none=True)
             out = model(turn_embeds, attention_mask)
+            # Track component losses for the last batch's breakdown
+            # (returned in the train_turnrd summary for diagnostics).
+            cls_loss_v = 0.0
+            value_loss_v = 0.0
+            entropy_v = 0.0
             if mode == 1:
-                loss = loss_mode_1(out, final_reward)
+                cls_loss = loss_mode_1(out, final_reward)
+                # Aux per-turn value loss: trains V(h_t) to predict
+                # γ^(T-t-1)·R per real turn. Gives the encoder a
+                # credit-relevant signal under sparse R alone.
+                value_loss = loss_value_head(
+                    out, final_reward, attention_mask, gamma=float(gamma)
+                )
+                # Negative-entropy reg: subtract β·H(α) so the loss
+                # PENALIZES uniform decompositions. Without this the
+                # standalone R-prediction objective (which is satisfied
+                # by ANY α since Σα=1 → CLS gets the same R) leaves α
+                # at uniform-init.
+                H = alpha_entropy(out, attention_mask)
+                loss = (
+                    cls_loss
+                    + float(lambda_value) * value_loss
+                    - float(lambda_entropy) * H
+                )
+                cls_loss_v = float(cls_loss.detach().item())
+                value_loss_v = float(value_loss.detach().item())
+                entropy_v = float(H.detach().item())
             else:  # mode == 2
                 if "judge_labels" not in collated:
-                    # Should not happen post-dataset filtering, but be loud
-                    # if a future producer change writes a partial batch.
                     raise RuntimeError(
                         "train_turnrd(mode=2): pad_collate did not produce "
                         "judge_labels — at least one record in the batch had "
@@ -132,6 +178,7 @@ def train_turnrd(
                     )
                 judge_labels = collated["judge_labels"].to(target_device)
                 loss = loss_mode_2(out, judge_labels, final_reward, attention_mask)
+                cls_loss_v = float(loss.detach().item())
 
             loss.backward()
             optimizer.step()
@@ -168,4 +215,12 @@ def train_turnrd(
         "n_steps": int(n_steps),
         "ckpt_path": saved_ckpt,
         "skipped_records": int(dataset.skipped_empty + dataset.skipped_missing_judge),
+        "final_loss_breakdown": {
+            "cls_loss": cls_loss_v,
+            "value_loss": value_loss_v,
+            "alpha_entropy": entropy_v,
+            "lambda_value": float(lambda_value),
+            "lambda_entropy": float(lambda_entropy),
+            "gamma": float(gamma),
+        },
     }

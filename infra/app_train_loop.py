@@ -238,6 +238,7 @@ def train_loop_smoke(
                 "alpha_mean": round(stats.alpha_mean, 6),
                 "alpha_var": round(stats.alpha_var, 6),
                 "alpha_max": round(stats.alpha_max, 6),
+                "alpha_entropy": round(stats.alpha_entropy, 6),
                 "elapsed_s": round(time.time() - ep_t0, 2),
             }
             log.append(row)

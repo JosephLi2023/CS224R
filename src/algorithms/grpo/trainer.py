@@ -86,6 +86,7 @@ class TrainStepStats:
     alpha_mean: float = 0.0          # mean of α over (k, t) entries
     alpha_var: float = 0.0           # variance of α; ≈ uniform-flat when small
     alpha_max: float = 0.0           # max α weight in the group
+    alpha_entropy: float = 0.0       # mean H(α); uniform on T turns ⇒ log(T); peaked ⇒ small
 
 
 PerTurnDecomposer = Callable[[TrajectoryGroup], list[list[float]]]
@@ -647,6 +648,7 @@ class HGPOTrainer:
         _alpha_mean: float = 0.0
         _alpha_var: float = 0.0
         _alpha_max: float = 0.0
+        _alpha_entropy: float = 0.0
         if self._decomposer_learnable and self.cfg.lambda_consistency != 0.0:
             grad_out = self.decomposer.decompose_with_grad(group)
             alpha_t = grad_out["alpha"]  # [K_real, T_max], grad-tracking
@@ -667,6 +669,14 @@ class HGPOTrainer:
                 # padded position doesn't artificially shrink the max.
                 _masked = alpha_t.masked_fill(attn_t == 0, float("-inf"))
                 _alpha_max = float(_masked.max().detach().item()) if alpha_t.numel() > 0 else 0.0
+                # Per-row entropy of α over the unmasked positions, then
+                # averaged across K_real rows. Uniform on T_real ⇒ log(T_real).
+                # Smaller = α concentrating credit on fewer turns. We compute
+                # it inline (rather than calling model.alpha_entropy) so the
+                # trainer doesn't need to import from src.turnrd.
+                _log_alpha = torch.log(alpha_t.clamp_min(1e-12))
+                _row_H = -(alpha_t * _log_alpha * _mask_for_stats).sum(dim=-1)  # [K_real]
+                _alpha_entropy = float(_row_H.mean().detach().item())
                 # Per-turn rewards = α * R. Then group-normalize per
                 # turn position (matches `compute_turn_advantages`) AND
                 # group-normalize final_R per group (matches
@@ -740,6 +750,7 @@ class HGPOTrainer:
             alpha_mean=_alpha_mean,
             alpha_var=_alpha_var,
             alpha_max=_alpha_max,
+            alpha_entropy=_alpha_entropy,
         )
         return total, stats
 

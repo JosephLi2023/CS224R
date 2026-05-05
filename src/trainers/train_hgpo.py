@@ -162,6 +162,8 @@ def _build_turnrd_branch(
             n_heads=int(turnrd_cfg.get("n_heads", TurnRDConfig().n_heads)),
             max_turns=int(turnrd_cfg.get("max_turns", TurnRDConfig().max_turns)),
             dropout=float(turnrd_cfg.get("dropout", TurnRDConfig().dropout)),
+            causal=bool(turnrd_cfg.get("causal", TurnRDConfig().causal)),
+            value_head=bool(turnrd_cfg.get("value_head", TurnRDConfig().value_head)),
         ),
         input_dim=input_dim,
     )

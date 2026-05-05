@@ -539,17 +539,57 @@ def _train_turnrd_cmd(cfg: OrchestrationConfig) -> list[str]:
     loads the freshest fit.
 
     Detached for the same reason as `_train_loop_cmd`.
+
+    Forwards aux-loss knobs (`lambda_value`, `gamma`, `lambda_entropy`)
+    + architecture knobs (`causal`, `value_head`, larger `layers`/
+    `hidden_size`) from the JSON config so the standalone trainer
+    matches what the parent's TurnRD model was built with. Without
+    these, the standalone trainer would fall back to its own defaults
+    and produce an architecturally-mismatched ckpt.
     """
-    return [
+    # Read TurnRD knobs from the JSON; fall back to standalone-trainer defaults.
+    try:
+        with open(cfg.config_path) as fh:
+            cfg_json = json.load(fh)
+    except Exception:
+        cfg_json = {}
+    turnrd_block = (cfg_json.get("turnrd", {}) or {})
+
+    # Resolve turnrd_lr: prefer JSON's value, fall back to CLI cfg default.
+    effective_turnrd_lr = float(turnrd_block.get("turnrd_lr", cfg.turnrd_lr))
+
+    cmd = [
         "modal", "run", "--detach", "infra/app_train_turnrd.py",
         "--replay", cfg.replay_path,
         "--mode", str(cfg.turnrd_mode),
         "--n-epochs", str(cfg.turnrd_epochs),
         "--batch-size", str(cfg.turnrd_batch_size),
-        "--lr", str(cfg.turnrd_lr),
+        "--lr", str(effective_turnrd_lr),
         "--ckpt-out", cfg.ckpt_path,
-        *cfg.extra_turnrd_args,
     ]
+    # Architecture: must match what the parent train_loop's
+    # build_trainer_from_config built, otherwise refresh-fn ckpt load
+    # will silently break (state_dict keys mismatch).
+    for cli, jkey, default in [
+        ("--layers", "layers", None),
+        ("--hidden-size", "hidden_size", None),
+        ("--n-heads", "n_heads", None),
+        ("--max-turns", "max_turns", None),
+        ("--dropout", "dropout", None),
+        ("--lambda-value", "lambda_value", None),
+        ("--gamma", "gamma", None),
+        ("--lambda-entropy", "lambda_entropy", None),
+    ]:
+        if jkey in turnrd_block:
+            cmd.extend([cli, str(turnrd_block[jkey])])
+    # Boolean flags need value-form because Modal CLI doesn't accept
+    # bare --flag for bool params (it expects --flag VALUE).
+    if "causal" in turnrd_block:
+        cmd.extend(["--causal", str(bool(turnrd_block["causal"])).lower()])
+    if "value_head" in turnrd_block:
+        cmd.extend(["--value-head", str(bool(turnrd_block["value_head"])).lower()])
+    cmd.extend(cfg.extra_turnrd_args)
+    return cmd
 
 
 # ---------------------------------------------------------------------------

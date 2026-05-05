@@ -43,6 +43,17 @@ class TurnRDConfig:
     Defaults match `MEDIUM_FIXES.md::M1`. They size a small Transformer
     (~1–2 M params at hidden_size=256) that can train comfortably on a
     single A100 alongside the LoRA policy.
+
+    Improvements (post-WebShop-attempt):
+    - `causal=True`: self-attn is causal so turn-t's α can only depend on
+      h_0..h_t. Bidirectional attention encourages "focus on the
+      high-info turn regardless of position" rather than "this turn
+      caused that downstream success" — a credit-assignment red flag.
+    - `value_head=True`: adds an auxiliary `V(h_t) → scalar` head trained
+      against the discounted future return γ^(T-t-1)·R per turn. Gives
+      each turn's representation direct credit-relevant supervision
+      from sparse R alone (no env signal, no judge required) — the
+      only Mode-1 way to push α off uniform.
     """
 
     n_layers: int = 4
@@ -50,6 +61,8 @@ class TurnRDConfig:
     n_heads: int = 4
     max_turns: int = 64
     dropout: float = 0.1
+    causal: bool = True
+    value_head: bool = True
 
 
 @dataclass(frozen=True)
@@ -59,6 +72,13 @@ class TurnRDOutput:
     `predicted_R: [B]`         — scalar `R` predicted from the pooled [CLS] vec.
     `cls_attn_weights: [B, T]` — softmax probabilities, sum to 1 along T per
                                  row (within fp32 tol), padded positions == 0.
+    `predicted_per_turn_R`     — `[B, T]` per-turn value predictions from
+                                 the auxiliary V-head; `None` when
+                                 `cfg.value_head=False`. Trained against
+                                 `γ^(T-t-1) · R` per turn so the encoder
+                                 learns features that predict per-turn
+                                 discounted future return — gives α
+                                 a credit-relevant signal to attend to.
     `per_turn_rewards`         — None at construction; populated by callers via
                                  `decompose(R)`. Kept in the dataclass so the
                                  spec API surface is self-documenting.
@@ -66,6 +86,7 @@ class TurnRDOutput:
 
     predicted_R: torch.Tensor
     cls_attn_weights: torch.Tensor
+    predicted_per_turn_R: Optional[torch.Tensor] = None
     per_turn_rewards: Optional[torch.Tensor] = None
 
     def decompose(self, final_reward: torch.Tensor) -> torch.Tensor:
@@ -148,6 +169,14 @@ class TurnRD(nn.Module):
 
         self.r_head = nn.Linear(cfg.hidden_size, 1)
 
+        # Auxiliary per-turn value head (post-WebShop-attempt improvement).
+        # Trained against γ^(T-t-1)·R per turn — gives the encoder a
+        # credit-relevant signal under sparse R alone.
+        if cfg.value_head:
+            self.value_head = nn.Linear(cfg.hidden_size, 1)
+        else:
+            self.value_head = None  # type: ignore[assignment]
+
     def forward(
         self,
         turn_embeds: torch.Tensor,
@@ -201,10 +230,25 @@ class TurnRD(nn.Module):
 
         # 3. PyTorch convention: True == "mask out" (padded). attention_mask is
         #    1 for real turns, so invert.
-        key_padding_mask = ~attention_mask.bool()  # [B, T]
+        # 3a. Optional causal mask (post-WebShop-attempt improvement).
+        # PyTorch deprecated mismatched-dtype combinations of `mask` +
+        # `src_key_padding_mask`; build BOTH as boolean (True = block)
+        # so they unify cleanly.
+        key_padding_mask = ~attention_mask.bool()  # [B, T] bool
+        causal_attn_mask: torch.Tensor | None = None
+        if self.cfg.causal:
+            # [T, T] bool: True above diagonal = block future positions.
+            causal_attn_mask = torch.triu(
+                torch.ones(T, T, dtype=torch.bool, device=h.device),
+                diagonal=1,
+            )
 
         # 4. Self-attention over turns. Padded positions are masked out.
-        h = self.encoder(h, src_key_padding_mask=key_padding_mask)  # [B, T, H]
+        h = self.encoder(
+            h,
+            mask=causal_attn_mask,
+            src_key_padding_mask=key_padding_mask,
+        )  # [B, T, H]
 
         # 5. Build the [CLS] query: replicate the learned scalar query per row.
         cls_q = self.cls_query.expand(B, -1, -1)  # [B, 1, H]
@@ -242,9 +286,19 @@ class TurnRD(nn.Module):
         # 8. Predicted final reward from the pooled [CLS] vector.
         predicted_R = self.r_head(pooled.squeeze(1)).squeeze(-1)  # [B]
 
+        # 9. Optional per-turn V(h_t) predictions (for the discounted-future-
+        #    return aux loss). Padded positions kept as 0 — the loss helper
+        #    masks them anyway, but keep the tensor mask-clean for callers
+        #    that want to compute correlations / per-position diagnostics.
+        predicted_per_turn_R: Optional[torch.Tensor] = None
+        if self.value_head is not None:
+            v = self.value_head(h).squeeze(-1)  # [B, T]
+            predicted_per_turn_R = v * float_mask
+
         return TurnRDOutput(
             predicted_R=predicted_R,
             cls_attn_weights=cls_attn_weights,
+            predicted_per_turn_R=predicted_per_turn_R,
             per_turn_rewards=None,
         )
 
@@ -280,3 +334,69 @@ def loss_mode_2(
     sq = sq * float_mask
     n = float_mask.sum().clamp_min(1.0)
     return sq.sum() / n
+
+
+def loss_value_head(
+    out: TurnRDOutput,
+    R: torch.Tensor,
+    attention_mask: torch.Tensor,
+    *,
+    gamma: float = 0.95,
+) -> torch.Tensor:
+    """Auxiliary per-turn value loss (post-WebShop-attempt improvement).
+
+    For sparse final R, the discounted future return at turn t in a
+    trajectory of length T is `γ^(T-t-1) · R`. We train V(h_t) to
+    predict that quantity per real (unmasked) turn.
+
+    Args:
+        out: TurnRDOutput from `model.forward`. Must have
+            `predicted_per_turn_R` populated (`cfg.value_head=True`).
+        R: `[B]` final scalar reward per trajectory.
+        attention_mask: `[B, T]` 1 for real turns, 0 for padding.
+        gamma: discount factor. Default 0.95.
+
+    Returns:
+        Scalar tensor — MSE averaged over real (unmasked) turn positions.
+        `0` (no_grad) when the model was built without `value_head`.
+    """
+    if out.predicted_per_turn_R is None:
+        # Compatibility: when `cfg.value_head=False`, return a zero
+        # constant so callers can multiply by a coefficient without
+        # branching. Use the same dtype/device as `R` for safety.
+        return torch.zeros((), dtype=R.dtype, device=R.device)
+    pred_v = out.predicted_per_turn_R  # [B, T]
+    float_mask = attention_mask.to(dtype=pred_v.dtype)  # [B, T]
+    B, T = pred_v.shape
+    # Per-position discount: t in 0..T-1 → γ^(T-t-1). Final turn (t=T-1)
+    # gets γ^0 = 1.0; first turn (t=0) gets γ^(T-1).
+    t_idx = torch.arange(T, device=pred_v.device, dtype=pred_v.dtype)
+    discount = gamma ** (float(T - 1) - t_idx)  # [T]
+    # Per-row R might use a different effective T per traj (some rows are
+    # shorter due to padding). For padded positions the loss is masked
+    # out, so the discount value at those positions is irrelevant; using
+    # the global T as the exponent base is fine because the loss only
+    # gradient-ed unmasked entries.
+    target = R.to(dtype=pred_v.dtype).unsqueeze(-1) * discount.unsqueeze(0)  # [B, T]
+    sq = (pred_v - target) ** 2 * float_mask
+    n = float_mask.sum().clamp_min(1.0)
+    return sq.sum() / n
+
+
+def alpha_entropy(out: TurnRDOutput, attention_mask: torch.Tensor) -> torch.Tensor:
+    """Compute the average entropy of α across the batch.
+
+    Returns a scalar tensor `H̄ = mean_b (-Σ_t α_{b,t} · log α_{b,t})`,
+    summed over real (unmasked) positions only. Uniform α over T_b real
+    turns gives H = log(T_b). Lower entropy = α concentrating credit on
+    fewer turns. Used both as a diagnostic AND as the negative-entropy
+    regularization target (subtract β·entropy from the standalone
+    trainer's loss to encourage non-uniform decompositions).
+    """
+    alpha = out.cls_attn_weights  # [B, T]
+    float_mask = attention_mask.to(dtype=alpha.dtype)
+    # Add tiny epsilon before log to avoid -inf on exact-zero (padded)
+    # entries, then mask them out with `float_mask`.
+    log_alpha = torch.log(alpha.clamp_min(1e-12))
+    H = -(alpha * log_alpha * float_mask).sum(dim=-1)  # [B]
+    return H.mean()
