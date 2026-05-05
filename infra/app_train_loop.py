@@ -41,8 +41,17 @@ def train_loop_smoke(
     # Post-training eval pass on a held-out task range with greedy
     # sampling. Disabled when --eval-episodes 0. Default 50 eps on
     # task IDs [eval_task_id_base, eval_task_id_base + eval_episodes).
+    # NOTE: WebShop's `web_agent_site/envs/web_agent_text_env.py`
+    # holds a finite `goals` list (~6910 entries with default
+    # `num_products=1000`); requesting `task_id >= len(goals)` raises
+    # `IndexError` from `goal = self.goals[idx]`. Default 6500 is
+    # WITHIN that range AND disjoint from the training task ranges
+    # used by `scripts/run_turnrd_modal.py --seed N`
+    # (`seed * rounds * episodes_per_round`, e.g. seed 11 → [2200, 2400),
+    # seed 23 → [4600, 4800)). If you change `num_products` or the
+    # protocol seeds, recheck disjointness + range.
     eval_episodes: int = 50,
-    eval_task_id_base: int = 10000,
+    eval_task_id_base: int = 6500,
 ) -> dict:
     import json
     import os
@@ -419,7 +428,7 @@ def main(
     gpu_mem_util: float = 0.30,
     config: str = "",
     eval_episodes: int = 50,
-    eval_task_id_base: int = 10000,
+    eval_task_id_base: int = 6500,
 ) -> None:
     import json as _json
     print(_json.dumps(

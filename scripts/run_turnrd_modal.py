@@ -103,11 +103,14 @@ class OrchestrationConfig:
     sft_adapter: str = ""
     # Held-out eval pass appended to each train_loop call. Uses
     # greedy sampling on a disjoint task range so the eval is stable
-    # AND comparable across rounds + methods + seeds. The default
-    # range [10000, 10050) is reserved for protocol eval; never used
-    # for training. Set --eval-episodes 0 to disable.
+    # AND comparable across rounds + methods + seeds. Default
+    # `[6500, 6550)` is INSIDE WebShop's ~6910-goal range AND disjoint
+    # from training task ranges (seed 11 → [2200, 2400),
+    # seed 23 → [4600, 4800)). Higher offsets like 10000 raise
+    # `IndexError` in WebShop's `web_agent_text_env.py:512`. Set
+    # --eval-episodes 0 to disable.
     eval_episodes: int = 50
-    eval_task_id_base: int = 10000
+    eval_task_id_base: int = 6500
     # Multi-seed protocol support. None ⇒ no seed-specific offset
     # applied (legacy single-run behavior). When set, each seed gets a
     # disjoint task_id range so different seeds never train on the same
@@ -164,10 +167,12 @@ def _parse_args(argv: Sequence[str]) -> OrchestrationConfig:
     parser.add_argument(
         "--eval-task-id-base",
         type=int,
-        default=10000,
+        default=6500,
         help="Starting task ID for the held-out eval range. The range "
-             "[base, base+eval_episodes) MUST be disjoint from any "
-             "training task IDs (see --seed's base_task_id_offset).",
+             "[base, base+eval_episodes) MUST be (a) WITHIN WebShop's "
+             "~6910-goal limit (default num_products=1000) and (b) "
+             "disjoint from training task IDs (see --seed's "
+             "base_task_id_offset). Default 6500.",
     )
     parser.add_argument(
         "--sft-adapter",
