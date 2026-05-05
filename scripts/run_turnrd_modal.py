@@ -74,6 +74,14 @@ class OrchestrationConfig:
     replay_path: str = "/vol/cache/turnrd_replay.jsonl"
     ckpt_path: str = "/vol/cache/turnrd_ckpt.pt"
     run_name_prefix: str = "method_b_orchestrated"
+    # Optional SFT-warm-started LoRA adapter on the Modal volume. When
+    # set, the parent train_loop loads it via PEFT.load_adapter() and
+    # syncs the merged weights into vLLM before the first episode.
+    # Without this, cold-start RL on real WebShop typically produces
+    # R≈0 for hundreds of episodes — the protocol's TurnRD signal
+    # depends on having non-trivially-trained policy producing
+    # reward variance from episode 0.
+    sft_adapter: str = ""
     # Multi-seed protocol support. None ⇒ no seed-specific offset
     # applied (legacy single-run behavior). When set, each seed gets a
     # disjoint task_id range so different seeds never train on the same
@@ -118,6 +126,16 @@ def _parse_args(argv: Sequence[str]) -> OrchestrationConfig:
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--sft-adapter",
+        default="",
+        help="Optional SFT-warm-started LoRA adapter path on the Modal "
+             "volume (e.g. /vol/checkpoints/sft_v3_<ts>). Forwarded to "
+             "the parent train_loop as --sft-adapter so the policy "
+             "starts from a non-trivially-trained checkpoint. Without "
+             "this, cold-start RL on real WebShop typically produces "
+             "R≈0 for hundreds of episodes.",
     )
     parser.add_argument(
         "--config",
@@ -218,6 +236,7 @@ def _parse_args(argv: Sequence[str]) -> OrchestrationConfig:
         replay_path=args.replay_path,
         ckpt_path=args.ckpt_path,
         run_name_prefix=args.run_name_prefix,
+        sft_adapter=args.sft_adapter,
         seed=args.seed,
         dry_run=args.dry_run,
         skip_warmup_fit=args.skip_warmup_fit,
@@ -437,7 +456,7 @@ def _train_loop_cmd(cfg: OrchestrationConfig, round_idx: int) -> list[str]:
         (cfg_json.get("train", {}) or {}).get("K_trajectories_per_task", 4)
     )
 
-    return [
+    cmd = [
         "modal", "run", "--detach", "infra/app_train_loop.py",
         "--config", _to_container_path(cfg.config_path),
         "--n-episodes", str(cfg.episodes_per_round),
@@ -446,8 +465,11 @@ def _train_loop_cmd(cfg: OrchestrationConfig, round_idx: int) -> list[str]:
             cfg.base_task_id_offset + round_idx * cfg.episodes_per_round
         ),
         "--run-name", f"{cfg.effective_run_name_prefix}_round{round_idx:02d}",
-        *cfg.extra_train_loop_args,
     ]
+    if cfg.sft_adapter:
+        cmd.extend(["--sft-adapter", cfg.sft_adapter])
+    cmd.extend(cfg.extra_train_loop_args)
+    return cmd
 
 
 def _train_turnrd_cmd(cfg: OrchestrationConfig) -> list[str]:
@@ -490,6 +512,15 @@ def _run(cmd: list[str], *, dry_run: bool, label: str) -> int:
     only requires the local CLI to be alive *for polling* (not for
     the actual compute). If the orchestrator dies mid-poll, the cloud
     job continues; `modal app logs <app_id>` can be used to recover.
+
+    Robustness: a non-zero CLI exit DOES NOT mean the cloud function
+    failed. The Modal CLI can exit non-zero on transient
+    upload/download glitches (e.g. DNS hiccup at the very end of a
+    long run) even though the cloud function completed successfully.
+    Whenever we can parse an app ID from the CLI output, we trust the
+    CLOUD STATE (via `_wait_for_app_finish`) rather than the LOCAL
+    CLI exit code. Only a missing app ID is treated as a hard
+    submission failure.
     """
     print(f"\n┌── {label}")
     print(f"│  $ {' '.join(cmd)}")
@@ -504,19 +535,24 @@ def _run(cmd: list[str], *, dry_run: bool, label: str) -> int:
     print(submit.stdout)
     if submit.stderr:
         print(submit.stderr, file=sys.stderr)
-    if submit.returncode != 0:
-        print(f"({label} submit exited {submit.returncode})")
-        return submit.returncode
+    # Try to parse the app ID from EITHER stream regardless of exit code.
     app_id = _parse_app_id(submit.stdout) or _parse_app_id(submit.stderr)
     if app_id is None:
+        # No app ID at all → the submit truly failed before reaching Modal.
         print(
             f"⚠ Could not parse app ID from `modal run --detach` output. "
-            f"Falling back to immediate-return semantics — the cloud job may "
-            f"still be running. Inspect with `modal app list`."
+            f"The submit likely failed before the cloud function started "
+            f"(CLI exit={submit.returncode}). Aborting this round."
         )
-        elapsed = round(time.time() - t0, 2)
-        print(f"({label} submitted (no app-id) in {elapsed}s)")
-        return 0
+        return submit.returncode if submit.returncode != 0 else 1
+    if submit.returncode != 0:
+        # CLI exited non-zero but we DO have an app ID. Trust the cloud
+        # state instead — Modal CLI's exit code is unreliable on
+        # transient network glitches.
+        print(
+            f"⚠ Modal CLI exited {submit.returncode} but app {app_id} was "
+            f"submitted. Trusting cloud state via polling."
+        )
     # Phase 2: poll for completion.
     rc = _wait_for_app_finish(app_id, label=label)
     elapsed = round(time.time() - t0, 2)
