@@ -514,6 +514,7 @@ def _train_loop_cmd(cfg: OrchestrationConfig, round_idx: int) -> list[str]:
             cfg.base_task_id_offset + round_idx * cfg.episodes_per_round
         ),
         "--run-name", f"{cfg.effective_run_name_prefix}_round{round_idx:02d}",
+        "--round-idx", str(round_idx),
     ]
     # `gpu_mem_util` from the JSON's train block, when present. This
     # caps vLLM's KV cache so the trainer has enough activation room
@@ -579,6 +580,8 @@ def _train_turnrd_cmd(cfg: OrchestrationConfig) -> list[str]:
         ("--lambda-value", "lambda_value", None),
         ("--gamma", "gamma", None),
         ("--lambda-entropy", "lambda_entropy", None),
+        ("--lambda-contrastive", "lambda_contrastive", None),
+        ("--contrastive-temperature", "contrastive_temperature", None),
     ]:
         if jkey in turnrd_block:
             cmd.extend([cli, str(turnrd_block[jkey])])

@@ -65,6 +65,16 @@ class HGPOTrainerConfig:
     # small standalone Transformer that benefits from a higher rate (~1e-4
     # is the standalone trainer default).
     turnrd_lr: float = 1e-4
+    # v6 BUG 2 fix: V-baseline annealing across rounds. In Round 0 the
+    # standalone TurnRD trainer hasn't run yet, so V_θ predictions are
+    # at random init (noise). Using V as a per-turn PPO baseline that
+    # early would inject noise into the policy gradient. Linear ramp:
+    # β = clamp(round_idx / warmup_rounds, 0, 1). Round 0 = β=0 (use
+    # OLD per-position-normalized turn_adv exclusively, == v5 behavior);
+    # Round 1 = β=0.5 (50/50 blend); Rounds 2+ = β=1.0 (full V baseline).
+    # The orchestrator sets `v_baseline_round_idx` per Modal call.
+    v_baseline_round_idx: int = 0
+    v_baseline_warmup_rounds: int = 2
 
 
 @dataclass
@@ -724,27 +734,79 @@ class HGPOTrainer:
                 # mask=1 are overridden; padded turns stay at 0.
                 value_per_turn = grad_out.get("value_per_turn")
                 if value_per_turn is not None and value_per_turn.shape == per_turn_rewards.shape:
+                    # v6 BUG 1 fix: per-position normalize the V-baseline
+                    # tensor BEFORE inserting into combined. Without this,
+                    # `(α·R - V)` is in raw R-units (~0.03) while
+                    # `traj_adv` is in normalized units (~1.0). The
+                    # combined formula then gets dominated by traj_adv
+                    # and the V-baseline contribution is ~3% — i.e.
+                    # we wired V into PPO but it's effectively ignored.
+                    # After normalization both signals have magnitude ~1
+                    # and the actor-critic baseline actually drives
+                    # gradient updates.
+                    v6_unnorm = (per_turn_rewards - value_per_turn) * mask_f
+                    # Per-position group statistics, mask-aware (matches
+                    # the existing turn_adv normalization path).
+                    v6_col_mean = (v6_unnorm * mask_f).sum(dim=0) / col_count
+                    v6_col_var = (
+                        ((v6_unnorm - v6_col_mean.unsqueeze(0)) ** 2 * mask_f).sum(dim=0)
+                        / col_count
+                    )
+                    v6_col_std = (v6_col_var + 1e-16).sqrt()
                     v6_turn_adv = (
-                        per_turn_rewards - value_per_turn
-                    ) * mask_f  # [K_real, T_max], grad-tracking
-                    v6_detached = v6_turn_adv.detach().cpu().tolist()
-                    nonempty_idx = grad_out["nonempty_indices"]
-                    # Override combined[i][t] for the unmasked entries.
-                    # combined came from build_advantages (Python list); we
-                    # rebuild only the entries we have V predictions for.
-                    # combined[i][t] = α·traj_adv[i] + (1-α)·turn_adv[i][t]
-                    alpha_w = float(self.cfg.alpha)
-                    for row, orig_i in enumerate(nonempty_idx):
-                        traj_obj = group.trajectories[orig_i]
-                        T_i = len(traj_obj.turns)
-                        for t in range(min(T_i, len(v6_detached[row]))):
-                            if attn_t[row, t].item() == 0:
-                                continue
-                            new_turn_adv = v6_detached[row][t]
-                            combined[orig_i][t] = (
-                                alpha_w * traj_adv[orig_i] +
-                                (1.0 - alpha_w) * new_turn_adv
+                        (v6_unnorm - v6_col_mean.unsqueeze(0))
+                        / v6_col_std.unsqueeze(0)
+                    ) * mask_f  # [K_real, T_max], normalized
+                    # v6 BUG 2 fix: anneal V-baseline contribution by
+                    # round. Round 0 → β=0 (V is fresh-init noise; use
+                    # ONLY old turn_adv = v5 behavior). Round
+                    # `v_baseline_warmup_rounds`+ → β=1 (full V baseline).
+                    # Linear ramp in between. Skips the chicken-and-egg
+                    # trap where Round 0's noisy V-gradient corrupts the
+                    # policy → corrupts the replay → V never converges.
+                    warmup = max(1, int(self.cfg.v_baseline_warmup_rounds))
+                    beta_v = min(
+                        1.0,
+                        max(0.0, float(self.cfg.v_baseline_round_idx) / warmup),
+                    )
+                    # M1 review fix: only run the override loop if β > 0.
+                    # When β=0 (Round 0) the protocol's intent is "no V
+                    # contribution at all → identical to v5". Falling
+                    # through to use `turn_adv_t` would silently swap the
+                    # eval-mode advantages computed in `decompose()` (via
+                    # build_advantages's call) for the dropout-perturbed
+                    # train-mode advantages computed inside
+                    # `decompose_with_grad` (which doesn't force eval()).
+                    # Wrap the override block in `if beta_v > 0.0:` so
+                    # combined[i][t] keeps its original eval-mode values
+                    # when annealing weight is zero.
+                    if beta_v > 0.0:
+                        if beta_v >= 1.0:
+                            v6_blended = v6_turn_adv  # full V baseline
+                        else:
+                            v6_blended = (
+                                beta_v * v6_turn_adv
+                                + (1.0 - beta_v) * turn_adv_t
                             )
+                        v6_detached = v6_blended.detach().cpu().tolist()
+                        nonempty_idx = grad_out["nonempty_indices"]
+                        # Override combined[i][t] for the unmasked
+                        # entries. combined came from build_advantages
+                        # (Python list); we rebuild only the entries we
+                        # have V predictions for.
+                        # combined[i][t] = α·traj_adv[i] + (1-α)·turn_adv[i][t]
+                        alpha_w = float(self.cfg.alpha)
+                        for row, orig_i in enumerate(nonempty_idx):
+                            traj_obj = group.trajectories[orig_i]
+                            T_i = len(traj_obj.turns)
+                            for t in range(min(T_i, len(v6_detached[row]))):
+                                if attn_t[row, t].item() == 0:
+                                    continue
+                                new_turn_adv = v6_detached[row][t]
+                                combined[orig_i][t] = (
+                                    alpha_w * traj_adv[orig_i] +
+                                    (1.0 - alpha_w) * new_turn_adv
+                                )
                 # v6 diagnostic: correlation between learned α and the
                 # env's normalized progress signal (Method C's signal).
                 # High correlation ⇒ TurnRD is rediscovering Method C.
@@ -781,12 +843,20 @@ class HGPOTrainer:
             float(cons_loss_t.detach().item()) if cons_loss_t is not None else 0.0
         )
         # Snapshot cls_query norm — proves whether TurnRD is moving.
+        # v6 BUG 3 fix: divide by sqrt(hidden_size) so the metric is
+        # directly comparable across architectures with different
+        # hidden_size. Initial ||cls_query|| ≈ sqrt(H)·0.02 (N(0, 0.02)
+        # init), so dividing by sqrt(H) gives a consistent ~0.02
+        # baseline regardless of H. Movement above this baseline is
+        # the signal.
         _cls_query_norm: float = 0.0
         if self._decomposer_learnable:
             try:
-                _cls_query_norm = float(
+                _raw = float(
                     self.decomposer.model.cls_query.detach().norm().item()
                 )
+                _hidden = int(self.decomposer.model.cfg.hidden_size)
+                _cls_query_norm = _raw / max(1.0, _hidden ** 0.5)
             except AttributeError:  # pragma: no cover (decomposer without cls_query)
                 _cls_query_norm = 0.0
         if cons_loss_t is not None:

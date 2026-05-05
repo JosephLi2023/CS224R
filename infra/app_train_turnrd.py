@@ -55,6 +55,9 @@ def train_turnrd_run(
     lambda_value: float = 0.5,
     gamma: float = 0.95,
     lambda_entropy: float = 0.01,
+    # v8 Tier 1: contrastive aux loss knobs.
+    lambda_contrastive: float = 0.1,
+    contrastive_temperature: float = 0.1,
     # The producer pre-embeds turns; the standalone trainer doesn't need
     # the LoRA policy. We DO need the embedding width D, which the
     # producer wrote into the replay (we read it off the first record).
@@ -122,6 +125,8 @@ def train_turnrd_run(
         lambda_value=lambda_value,
         gamma=gamma,
         lambda_entropy=lambda_entropy,
+        lambda_contrastive=lambda_contrastive,
+        contrastive_temperature=contrastive_temperature,
     )
     elapsed = round(time.time() - t0, 2)
     summary["elapsed_s"] = elapsed
@@ -150,6 +155,8 @@ def main(
     lambda_value: float = 0.5,
     gamma: float = 0.95,
     lambda_entropy: float = 0.01,
+    lambda_contrastive: float = 0.1,
+    contrastive_temperature: float = 0.1,
 ) -> None:
     import json as _json
 
@@ -172,6 +179,8 @@ def main(
             lambda_value=lambda_value,
             gamma=gamma,
             lambda_entropy=lambda_entropy,
+            lambda_contrastive=lambda_contrastive,
+            contrastive_temperature=contrastive_temperature,
         ),
         indent=2,
         default=str,

@@ -79,6 +79,13 @@ class TurnRDOutput:
                                  learns features that predict per-turn
                                  discounted future return — gives α
                                  a credit-relevant signal to attend to.
+    `encoder_hidden`           — `[B, T, H]` per-turn encoder outputs
+                                 (post-self-attn, pre-CLS-pool). Exposed
+                                 for the contrastive auxiliary loss
+                                 (`loss_contrastive`); required for
+                                 InfoNCE-style discriminative training
+                                 between success/failure trajectories.
+                                 Always populated.
     `per_turn_rewards`         — None at construction; populated by callers via
                                  `decompose(R)`. Kept in the dataclass so the
                                  spec API surface is self-documenting.
@@ -87,6 +94,7 @@ class TurnRDOutput:
     predicted_R: torch.Tensor
     cls_attn_weights: torch.Tensor
     predicted_per_turn_R: Optional[torch.Tensor] = None
+    encoder_hidden: Optional[torch.Tensor] = None
     per_turn_rewards: Optional[torch.Tensor] = None
 
     def decompose(self, final_reward: torch.Tensor) -> torch.Tensor:
@@ -299,6 +307,7 @@ class TurnRD(nn.Module):
             predicted_R=predicted_R,
             cls_attn_weights=cls_attn_weights,
             predicted_per_turn_R=predicted_per_turn_R,
+            encoder_hidden=h,  # [B, T, H] — for contrastive aux loss
             per_turn_rewards=None,
         )
 
@@ -368,16 +377,23 @@ def loss_value_head(
     pred_v = out.predicted_per_turn_R  # [B, T]
     float_mask = attention_mask.to(dtype=pred_v.dtype)  # [B, T]
     B, T = pred_v.shape
-    # Per-position discount: t in 0..T-1 → γ^(T-t-1). Final turn (t=T-1)
-    # gets γ^0 = 1.0; first turn (t=0) gets γ^(T-1).
-    t_idx = torch.arange(T, device=pred_v.device, dtype=pred_v.dtype)
-    discount = gamma ** (float(T - 1) - t_idx)  # [T]
-    # Per-row R might use a different effective T per traj (some rows are
-    # shorter due to padding). For padded positions the loss is masked
-    # out, so the discount value at those positions is irrelevant; using
-    # the global T as the exponent base is fine because the loss only
-    # gradient-ed unmasked entries.
-    target = R.to(dtype=pred_v.dtype).unsqueeze(-1) * discount.unsqueeze(0)  # [B, T]
+    # M2 review fix: discount uses PER-ROW trajectory length T_i, not
+    # the batch-global T_max. With γ=0.95 and a length-3 trajectory in
+    # a length-5 batch, the OLD code computed target for real final
+    # turn (t=2) as γ^(5-1-2)·R = 0.9025·R instead of γ^0·R = R, so
+    # V was trained on systematically-biased targets for any
+    # trajectory shorter than the batch max. Now compute T_i per row
+    # from the mask and exponent (T_i - 1 - t_idx). Padded positions
+    # would give a meaningless negative exponent; mask them out
+    # explicitly via `float_mask` after target construction.
+    t_idx = torch.arange(T, device=pred_v.device, dtype=pred_v.dtype)  # [T]
+    T_i = float_mask.sum(dim=-1, keepdim=True)  # [B, 1] real turn count per row
+    # exponent[b, t] = max(0, T_i[b] - 1 - t)
+    # The clamp_min(0) is just for numerical safety on padded positions
+    # (which are masked out anyway).
+    exponent = (T_i - 1.0 - t_idx.unsqueeze(0)).clamp_min(0.0)  # [B, T]
+    discount = gamma ** exponent  # [B, T]
+    target = R.to(dtype=pred_v.dtype).unsqueeze(-1) * discount  # [B, T]
     sq = (pred_v - target) ** 2 * float_mask
     n = float_mask.sum().clamp_min(1.0)
     return sq.sum() / n
@@ -400,3 +416,104 @@ def alpha_entropy(out: TurnRDOutput, attention_mask: torch.Tensor) -> torch.Tens
     log_alpha = torch.log(alpha.clamp_min(1e-12))
     H = -(alpha * log_alpha * float_mask).sum(dim=-1)  # [B]
     return H.mean()
+
+
+def loss_contrastive(
+    out: TurnRDOutput,
+    R: torch.Tensor,
+    attention_mask: torch.Tensor,
+    *,
+    temperature: float = 0.1,
+    success_threshold: float = 0.0,
+) -> torch.Tensor:
+    """InfoNCE-style contrastive loss on per-turn encoder hidden states.
+
+    Pulls together turn embeddings from successful trajectories
+    (final R > `success_threshold`); pushes them apart from turn
+    embeddings in unsuccessful trajectories. Self-supervised — only
+    needs the binary success/failure signal we already have. Forces
+    the encoder to extract features that DISCRIMINATE by outcome,
+    which is exactly the signal α needs to identify causal turns.
+
+    Standard contrastive RL trick (CURL, ATC, DRIML).
+
+    Args:
+        out: TurnRDOutput with `encoder_hidden` populated `[B, T, H]`.
+        R: `[B]` final scalar reward per trajectory.
+        attention_mask: `[B, T]` 1 for real turns, 0 for padding.
+        temperature: softmax temperature for the InfoNCE log-likelihood.
+            Default 0.1. Lower = more peaked (harder positives + negatives).
+        success_threshold: trajectories with R > this are "success",
+            others are "failure". Default 0.0 (any positive reward).
+
+    Returns:
+        Scalar tensor — InfoNCE loss averaged over success-anchor turns.
+        Returns 0 (no_grad) when there's no valid pair (e.g., all-success
+        or all-failure batch with no contrast available).
+    """
+    if out.encoder_hidden is None:
+        return torch.zeros((), dtype=R.dtype, device=R.device)
+    H_state = out.encoder_hidden  # [B, T, H]
+    float_mask = attention_mask.to(dtype=H_state.dtype)  # [B, T]
+    B, T, _ = H_state.shape
+
+    # Trajectory-level success label.
+    is_success = (R > success_threshold)  # [B] bool
+
+    # Need at least 1 success AND 1 failure to have positive + negative pairs.
+    if int(is_success.sum().item()) < 1 or int((~is_success).sum().item()) < 1:
+        return torch.zeros((), dtype=R.dtype, device=R.device)
+
+    # Flatten (B, T) → (B*T) and filter unmasked turns only.
+    H_flat = H_state.reshape(B * T, -1)  # [B*T, H]
+    mask_flat = float_mask.reshape(B * T)  # [B*T]
+    # Per-turn success label (broadcast trajectory R to all its turns).
+    succ_flat = (
+        is_success.unsqueeze(-1).expand(-1, T).reshape(B * T)
+    )  # [B*T] bool
+
+    # Keep only unmasked entries.
+    keep = mask_flat > 0
+    if int(keep.sum().item()) < 2:
+        return torch.zeros((), dtype=R.dtype, device=R.device)
+
+    H_keep = H_flat[keep]  # [N, H]
+    succ_keep = succ_flat[keep]  # [N] bool
+
+    n_succ = int(succ_keep.sum().item())
+    n_fail = int((~succ_keep).sum().item())
+    if n_succ < 2 or n_fail < 1:
+        # Need ≥2 successful turns (anchor + at least one positive)
+        # and ≥1 failure turn (negative pool).
+        return torch.zeros((), dtype=R.dtype, device=R.device)
+
+    # L2-normalize for cosine similarity.
+    H_norm = torch.nn.functional.normalize(H_keep, dim=-1)  # [N, H]
+
+    # Pairwise similarity matrix [N, N], temperature-scaled.
+    sim = H_norm @ H_norm.T / float(temperature)  # [N, N]
+    # Mask out self-similarities (diagonal) so an anchor can't be its own positive.
+    eye = torch.eye(sim.shape[0], dtype=torch.bool, device=sim.device)
+    sim = sim.masked_fill(eye, float("-inf"))
+
+    # For each success-anchor i:
+    #   numerator   = sum over success j != i of exp(sim[i, j])
+    #   denominator = sum over ALL j != i of exp(sim[i, j])
+    #   L_i = -log(numerator / denominator)
+    # Use logsumexp for numerical stability.
+    succ_idx = succ_keep.nonzero(as_tuple=True)[0]  # indices of successes
+    sim_anchors = sim[succ_idx]  # [n_succ, N]
+
+    # Numerator mask: only success-success pairs (exclude self via the eye mask above).
+    succ_row_mask = succ_keep.unsqueeze(0).expand(n_succ, -1)  # [n_succ, N]
+    # Set non-positive entries to -inf for the numerator's logsumexp.
+    sim_pos = sim_anchors.masked_fill(~succ_row_mask, float("-inf"))
+
+    log_num = torch.logsumexp(sim_pos, dim=-1)  # [n_succ]
+    log_den = torch.logsumexp(sim_anchors, dim=-1)  # [n_succ]
+    loss_per_anchor = -(log_num - log_den)
+    # Filter out anchors whose log_num was -inf (no positives left after self-mask).
+    valid = ~torch.isinf(log_num)
+    if int(valid.sum().item()) == 0:
+        return torch.zeros((), dtype=R.dtype, device=R.device)
+    return loss_per_anchor[valid].mean()

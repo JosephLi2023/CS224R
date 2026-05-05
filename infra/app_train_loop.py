@@ -52,6 +52,11 @@ def train_loop_smoke(
     # protocol seeds, recheck disjointness + range.
     eval_episodes: int = 50,
     eval_task_id_base: int = 6500,
+    # v6 BUG 2 fix: round index for V-baseline annealing. The orchestrator
+    # passes the current round (0-indexed) so the trainer can ramp V from
+    # 0% (Round 0, V is fresh-init noise) → 100% (Round
+    # `v_baseline_warmup_rounds`+, V has converged via standalone trainer).
+    round_idx: int = 0,
 ) -> dict:
     import json
     import os
@@ -156,6 +161,9 @@ def train_loop_smoke(
             turnrd_embedder,
             judge_decomposer,
         ) = build_trainer_from_config(cfg_dict, policy=policy)
+        # v6 BUG 2 fix plumbing: tell the trainer which round we're in
+        # so the V-baseline annealing schedule can compute β.
+        trainer.cfg.v_baseline_round_idx = int(round_idx)
         collector = RolloutCollector(
             runner=runner,
             env_factory=env_factory,
@@ -431,6 +439,7 @@ def main(
     config: str = "",
     eval_episodes: int = 50,
     eval_task_id_base: int = 6500,
+    round_idx: int = 0,
 ) -> None:
     import json as _json
     print(_json.dumps(
@@ -445,6 +454,7 @@ def main(
             config=config,
             eval_episodes=eval_episodes,
             eval_task_id_base=eval_task_id_base,
+            round_idx=round_idx,
         ),
         indent=2, default=str,
     ))

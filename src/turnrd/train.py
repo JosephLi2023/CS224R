@@ -28,6 +28,7 @@ from src.turnrd.dataset import TurnRDRecord, TurnRDReplayDataset, pad_collate
 from src.turnrd.model import (
     TurnRD,
     alpha_entropy,
+    loss_contrastive,
     loss_mode_1,
     loss_mode_2,
     loss_value_head,
@@ -67,6 +68,14 @@ def train_turnrd(
     lambda_value: float = 0.5,
     gamma: float = 0.95,
     lambda_entropy: float = 0.01,
+    # v8 Tier 1: contrastive aux loss on per-turn encoder hidden states.
+    # Pulls success-trajectory turn embeddings together; pushes them
+    # apart from failure-trajectory turn embeddings. Self-supervised
+    # — uses only the binary R>0 vs R==0 signal we already have.
+    # Forces the encoder to learn discriminative features that α can
+    # use to identify causal turns.
+    lambda_contrastive: float = 0.1,
+    contrastive_temperature: float = 0.1,
 ) -> dict[str, Any]:
     """Train TurnRD on a replay JSONL.
 
@@ -146,6 +155,7 @@ def train_turnrd(
             cls_loss_v = 0.0
             value_loss_v = 0.0
             entropy_v = 0.0
+            contrast_loss_v = 0.0
             if mode == 1:
                 cls_loss = loss_mode_1(out, final_reward)
                 # Aux per-turn value loss: trains V(h_t) to predict
@@ -160,14 +170,25 @@ def train_turnrd(
                 # by ANY α since Σα=1 → CLS gets the same R) leaves α
                 # at uniform-init.
                 H = alpha_entropy(out, attention_mask)
+                # v8 Tier 1: contrastive on per-turn encoder hidden states.
+                # Discriminate success vs failure trajectories at the
+                # encoder level → α has discriminative features to attend over.
+                contrast_loss = loss_contrastive(
+                    out,
+                    final_reward,
+                    attention_mask,
+                    temperature=float(contrastive_temperature),
+                )
                 loss = (
                     cls_loss
                     + float(lambda_value) * value_loss
                     - float(lambda_entropy) * H
+                    + float(lambda_contrastive) * contrast_loss
                 )
                 cls_loss_v = float(cls_loss.detach().item())
                 value_loss_v = float(value_loss.detach().item())
                 entropy_v = float(H.detach().item())
+                contrast_loss_v = float(contrast_loss.detach().item())
             else:  # mode == 2
                 if "judge_labels" not in collated:
                     raise RuntimeError(
@@ -219,8 +240,11 @@ def train_turnrd(
             "cls_loss": cls_loss_v,
             "value_loss": value_loss_v,
             "alpha_entropy": entropy_v,
+            "contrast_loss": contrast_loss_v,
             "lambda_value": float(lambda_value),
             "lambda_entropy": float(lambda_entropy),
+            "lambda_contrastive": float(lambda_contrastive),
+            "contrastive_temperature": float(contrastive_temperature),
             "gamma": float(gamma),
         },
     }
