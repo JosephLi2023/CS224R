@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -323,8 +324,86 @@ def _to_container_path(local_path: Path) -> str:
     return f"/workspace/{rel.as_posix()}"
 
 
+_APP_ID_RE = re.compile(r"ap-[A-Za-z0-9]+")
+
+
+def _parse_app_id(modal_run_stdout: str) -> str | None:
+    """Extract the ephemeral app ID from `modal run --detach` output.
+
+    Modal prints e.g. `View run at https://modal.com/apps/shoupei/main/ap-...`
+    on stdout. We grep for the first `ap-XXXXX` token.
+    """
+    m = _APP_ID_RE.search(modal_run_stdout)
+    return m.group(0) if m else None
+
+
+def _wait_for_app_finish(
+    app_id: str, *, label: str, poll_interval_s: float = 5.0,
+    timeout_s: float = 60 * 60,
+) -> int:
+    """Poll `modal app list` until `app_id` leaves the running state.
+
+    Returns 0 if the app finished cleanly, non-zero on timeout / unknown
+    state. Streams a heartbeat every `poll_interval_s` seconds so the
+    user sees progress.
+    """
+    print(f"   ↻ polling {app_id} ({label})…")
+    t0 = time.time()
+    while True:
+        elapsed = time.time() - t0
+        if elapsed > timeout_s:
+            print(f"   ⚠ timeout waiting for {app_id} after {elapsed:.0f}s.")
+            return 124
+        try:
+            res = subprocess.run(
+                ["modal", "app", "list"],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            print("   ⚠ `modal app list` timed out; retrying.")
+            time.sleep(poll_interval_s)
+            continue
+        if res.returncode != 0:
+            print(f"   ⚠ `modal app list` exited {res.returncode}; retrying.")
+            time.sleep(poll_interval_s)
+            continue
+        # Find our row.
+        state = None
+        for line in res.stdout.splitlines():
+            if app_id in line:
+                # Heuristic: strip ANSI/box-drawing chars and look for
+                # known states. State is one of: ephemeral, stopped,
+                # stopping..., (running labels we treat as not-done).
+                if "stopped" in line:
+                    state = "stopped"
+                elif "stopping" in line:
+                    state = "stopping"
+                elif "ephemeral" in line:
+                    state = "ephemeral"
+                else:
+                    state = "unknown"
+                break
+        if state == "stopped":
+            print(f"   ✓ {app_id} finished after {elapsed:.0f}s.")
+            return 0
+        if state is None:
+            # Newly-submitted apps may not appear in `app list` for a
+            # few seconds — keep waiting rather than fail.
+            print(
+                f"   ↻ {app_id} not yet visible in app list (elapsed: {elapsed:.0f}s)…"
+            )
+        else:
+            print(
+                f"   ↻ {app_id} still {state} (elapsed: {elapsed:.0f}s)…"
+            )
+        time.sleep(poll_interval_s)
+
+
 def _train_loop_cmd(cfg: OrchestrationConfig, round_idx: int) -> list[str]:
-    """`modal run infra/app_train_loop.py --config <cfg> --n-episodes M ...`
+    """`modal run --detach infra/app_train_loop.py --config <cfg> --n-episodes M ...`
 
     The `app_train_loop.py::main()` entrypoint accepts:
       --n-episodes / --k / --max-turns / --task-id-offset / --num-products /
@@ -341,6 +420,11 @@ def _train_loop_cmd(cfg: OrchestrationConfig, round_idx: int) -> list[str]:
 
     `--config` is translated to its in-container `/workspace/...` path
     so `open(...)` inside the Modal function actually finds the file.
+
+    `--detach` is passed to `modal run` so the cloud function keeps
+    running even if the local orchestrator process dies. The
+    orchestrator polls for completion via `modal app list` between
+    rounds (see `_wait_for_app_finish`).
     """
     # Read K from the JSON; default to the app's own default (4) if
     # the key is absent.
@@ -354,7 +438,7 @@ def _train_loop_cmd(cfg: OrchestrationConfig, round_idx: int) -> list[str]:
     )
 
     return [
-        "modal", "run", "infra/app_train_loop.py",
+        "modal", "run", "--detach", "infra/app_train_loop.py",
         "--config", _to_container_path(cfg.config_path),
         "--n-episodes", str(cfg.episodes_per_round),
         "--k", str(k_per_task),
@@ -367,15 +451,17 @@ def _train_loop_cmd(cfg: OrchestrationConfig, round_idx: int) -> list[str]:
 
 
 def _train_turnrd_cmd(cfg: OrchestrationConfig) -> list[str]:
-    """`modal run infra/app_train_turnrd.py --replay <p> --mode N ...`
+    """`modal run --detach infra/app_train_turnrd.py --replay <p> --mode N ...`
 
     Round-independent: every round reads and writes the same shared
     paths on the Modal Volume. The replay file accumulates across
     rounds; the ckpt is overwritten so the parent's refresh_fn always
     loads the freshest fit.
+
+    Detached for the same reason as `_train_loop_cmd`.
     """
     return [
-        "modal", "run", "infra/app_train_turnrd.py",
+        "modal", "run", "--detach", "infra/app_train_turnrd.py",
         "--replay", cfg.replay_path,
         "--mode", str(cfg.turnrd_mode),
         "--n-epochs", str(cfg.turnrd_epochs),
@@ -392,17 +478,50 @@ def _train_turnrd_cmd(cfg: OrchestrationConfig) -> list[str]:
 
 
 def _run(cmd: list[str], *, dry_run: bool, label: str) -> int:
-    """Run a `modal run ...` command, streaming its output. Returns exit code."""
+    """Submit a `modal run --detach …` command, parse its app ID, then
+    poll `modal app list` until that app finishes.
+
+    Returns 0 on success, non-zero on failure.
+
+    Two-phase shape: we want each cloud function to keep running even
+    if this orchestrator process dies, so each `modal run` is detached
+    (the local CLI returns immediately after submitting). We then
+    wait on the cloud-side state via `_wait_for_app_finish`, which
+    only requires the local CLI to be alive *for polling* (not for
+    the actual compute). If the orchestrator dies mid-poll, the cloud
+    job continues; `modal app logs <app_id>` can be used to recover.
+    """
     print(f"\n┌── {label}")
     print(f"│  $ {' '.join(cmd)}")
     print("└──")
     if dry_run:
         return 0
     t0 = time.time()
-    proc = subprocess.run(cmd, cwd=REPO_ROOT)
+    # Phase 1: submit detached. Capture stdout so we can parse the app ID.
+    submit = subprocess.run(
+        cmd, cwd=REPO_ROOT, capture_output=True, text=True
+    )
+    print(submit.stdout)
+    if submit.stderr:
+        print(submit.stderr, file=sys.stderr)
+    if submit.returncode != 0:
+        print(f"({label} submit exited {submit.returncode})")
+        return submit.returncode
+    app_id = _parse_app_id(submit.stdout) or _parse_app_id(submit.stderr)
+    if app_id is None:
+        print(
+            f"⚠ Could not parse app ID from `modal run --detach` output. "
+            f"Falling back to immediate-return semantics — the cloud job may "
+            f"still be running. Inspect with `modal app list`."
+        )
+        elapsed = round(time.time() - t0, 2)
+        print(f"({label} submitted (no app-id) in {elapsed}s)")
+        return 0
+    # Phase 2: poll for completion.
+    rc = _wait_for_app_finish(app_id, label=label)
     elapsed = round(time.time() - t0, 2)
-    print(f"({label} exited {proc.returncode} after {elapsed}s)")
-    return proc.returncode
+    print(f"({label} exited {rc} after {elapsed}s)")
+    return rc
 
 
 def _orchestrate(cfg: OrchestrationConfig) -> int:
