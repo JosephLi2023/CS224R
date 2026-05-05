@@ -187,7 +187,29 @@ class RolloutCollector:
             outs = self.runner.generate_rich(prompts, sampling)
 
             for j, i in enumerate(live_idx):
-                gen = outs[j][0]
+                # Defensive: vLLM can return an EMPTY completion list for a
+                # prompt when greedy sampling (T=0) immediately predicts
+                # EOS as the top-1 token — `outs[j] = []`, and the next
+                # line would raise IndexError. Treat as a no-op turn:
+                # empty action text + no tokens. The env will step on
+                # "" and likely return done=True with reward 0, which is
+                # the correct eval behavior (the policy failed to
+                # produce an action). Same defensive guard for the very
+                # rare case where len(outs) < len(live_idx).
+                gen_list = outs[j] if j < len(outs) else []
+                if not gen_list:
+                    class _EmptyGen:  # noqa: D401  (defensive empty stub)
+                        text = ""
+                        token_ids: tuple = ()
+                        token_logprobs: tuple = ()
+                        prompt_token_count = 0
+                        prompt_token_ids: tuple = ()
+                        finish_reason = "empty"
+
+                    gen = _EmptyGen
+                    stats.empty_outputs = getattr(stats, "empty_outputs", 0) + 1
+                else:
+                    gen = gen_list[0]
                 action_text = self.parse(getattr(gen, "text", "") or "")
 
                 next_state, reward, done, _info = envs[i].step(action_text)

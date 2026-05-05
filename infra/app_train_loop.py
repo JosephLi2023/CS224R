@@ -293,6 +293,18 @@ def train_loop_smoke(
             n=1, temperature=0.0, top_p=1.0, max_tokens=48,
             return_logprobs=False, seed=42,
         )
+        # Single eval collector reused across all eval episodes. Its env
+        # pool is built once on the first call and reused via env.reset()
+        # for subsequent episodes (saves the ~5-8 s per-ep WebShop env
+        # construction). Producer hook is disabled here so eval rollouts
+        # don't pollute the replay buffer.
+        eval_collector = RolloutCollector(
+            runner=runner,
+            env_factory=env_factory,
+            prompt_renderer=render_webshop_turn_prompt,
+            action_parser=parse_react_action,
+            cfg=RolloutCollectorConfig(max_turns=max_turns),
+        )
         eval_t0 = time.time()
         eval_returns: list[float] = []
         eval_turns: list[int] = []
@@ -302,17 +314,6 @@ def train_loop_smoke(
         for j in range(eval_episodes):
             task_id = eval_task_id_base + j
             try:
-                # K=1 greedy rollout per held-out task. Disable the
-                # producer hook for eval (set turnrd_emit_path=None on
-                # a fresh collector) so we don't pollute the replay
-                # buffer with held-out task data.
-                eval_collector = RolloutCollector(
-                    runner=runner,
-                    env_factory=env_factory,
-                    prompt_renderer=render_webshop_turn_prompt,
-                    action_parser=parse_react_action,
-                    cfg=RolloutCollectorConfig(max_turns=max_turns),
-                )
                 _, eval_cstats = eval_collector.collect_group(
                     task_id=task_id, env_name="webshop", K=1, sampling=eval_sampling
                 )
@@ -321,7 +322,15 @@ def train_loop_smoke(
                 eval_completed += eval_cstats.completed
                 eval_truncated += eval_cstats.truncated
             except Exception as exc:
-                print(f"eval ep={j} task={task_id} CRASHED: {exc!r}")
+                # Print the FULL traceback so future eval failures are
+                # diagnosable without re-running the protocol. Per-ep
+                # crashes don't abort the eval pass; we just lose one
+                # data point.
+                import traceback
+                print(
+                    f"eval ep={j} task={task_id} CRASHED: {exc!r}\n"
+                    f"  traceback:\n{traceback.format_exc()}"
+                )
                 eval_crashed += 1
                 continue
         eval_elapsed = round(time.time() - eval_t0, 2)

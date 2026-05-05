@@ -197,3 +197,68 @@ def test_reuse_envs_off_builds_fresh_each_call():
     coll.collect_group(task_id=0, env_name="webshop", K=2, sampling=_S())
     coll.collect_group(task_id=1, env_name="webshop", K=2, sampling=_S())
     assert len(built) == 4, "with reuse_envs=False each call rebuilds K envs"
+
+
+# ---------------------------------------------------------------------------
+# Defensive: empty-completion-list handling (post-mortem from the
+# `eval ep=32 task=10032 CRASHED: IndexError('list index out of range')`
+# Modal-side report). vLLM with greedy sampling can return [] for some
+# prompts; collect_group must NOT raise IndexError on this.
+# ---------------------------------------------------------------------------
+
+
+class _EmptyOutRunner:
+    """Returns an empty completion list for every prompt — simulates
+    vLLM greedy sampling immediately predicting EOS (T=0 + EOS top-1).
+
+    `out` shape from a healthy runner is `list[K_prompts] of list[n] of Gen`.
+    Here we deliberately return `[[], [], ...]` to exercise the defensive
+    guard that wraps `outs[j][0]`.
+    """
+
+    def generate_rich(self, prompts, sampling):
+        return [[] for _ in prompts]
+
+
+def test_collect_group_handles_empty_completion_list():
+    """K=1 greedy + empty vLLM output → no IndexError; turn recorded with
+    empty action_text + zero tokens; env still gets stepped."""
+    coll = _coll(_EmptyOutRunner(), max_turns=2)
+    g, s = coll.collect_group(task_id=99, env_name="webshop", K=1, sampling=_S())
+    assert isinstance(g, TrajectoryGroup)
+    assert g.K == 1
+    # The collector must have emitted at least one turn (with empty
+    # action) before the env declared done OR the max_turns budget.
+    traj = g.trajectories[0]
+    assert len(traj.turns) >= 1
+    for t in traj.turns:
+        assert t.action_text == ""  # parser fallback for empty text
+        assert t.action_token_ids == ()
+    # CollectStats should record the empty-output count for diagnostics.
+    assert getattr(s, "empty_outputs", 0) >= 1
+
+
+class _MixedOutRunner:
+    """Returns valid output for the first prompt, empty for the second.
+    Exercises the per-prompt defensive guard inside the live_idx loop."""
+
+    def generate_rich(self, prompts, sampling):
+        out = []
+        for idx, _ in enumerate(prompts):
+            if idx == 0:
+                out.append([_FakeGen("Action: search[bag]", (10, 11), (-0.1, -0.2), 100)])
+            else:
+                out.append([])
+        return out
+
+
+def test_collect_group_handles_partial_empty_in_batch():
+    """K=2: prompt 0 gets a valid completion, prompt 1 gets []. Both
+    trajectories should still progress; only #1's actions are empty."""
+    coll = _coll(_MixedOutRunner(), max_turns=1)
+    g, s = coll.collect_group(task_id=0, env_name="webshop", K=2, sampling=_S())
+    assert g.K == 2
+    assert len(g.trajectories[0].turns) >= 1
+    assert g.trajectories[0].turns[0].action_text != ""
+    assert len(g.trajectories[1].turns) >= 1
+    assert g.trajectories[1].turns[0].action_text == ""
