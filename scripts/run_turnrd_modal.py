@@ -582,12 +582,16 @@ def _train_turnrd_cmd(cfg: OrchestrationConfig) -> list[str]:
     ]:
         if jkey in turnrd_block:
             cmd.extend([cli, str(turnrd_block[jkey])])
-    # Boolean flags need value-form because Modal CLI doesn't accept
-    # bare --flag for bool params (it expects --flag VALUE).
+    # Boolean flags use Click/Modal convention: `--flag` (true) /
+    # `--no-flag` (false), NOT `--flag value`. Translate the JSON's
+    # bool to the right form.
+    def _bool_flag(name: str, value: bool) -> list[str]:
+        return [f"--{name}" if value else f"--no-{name}"]
+
     if "causal" in turnrd_block:
-        cmd.extend(["--causal", str(bool(turnrd_block["causal"])).lower()])
+        cmd.extend(_bool_flag("causal", bool(turnrd_block["causal"])))
     if "value_head" in turnrd_block:
-        cmd.extend(["--value-head", str(bool(turnrd_block["value_head"])).lower()])
+        cmd.extend(_bool_flag("value-head", bool(turnrd_block["value_head"])))
     cmd.extend(cfg.extra_turnrd_args)
     return cmd
 
