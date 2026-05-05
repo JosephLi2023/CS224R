@@ -75,11 +75,13 @@ def train_loop_smoke(
         with open(config) as fh:
             cfg_dict = json.load(fh)
         # Per-config overrides for the loop knobs that the JSON owns.
-        train_block = cfg_dict.get("train", {}) if cfg_dict else {}
-        if "total_episodes" in train_block:
-            n_episodes = int(train_block["total_episodes"])
-        if "K_trajectories_per_task" in train_block:
-            k = int(train_block["K_trajectories_per_task"])
+        # NOTE: We do NOT override n_episodes or K from cfg["train"] —
+        # those describe protocol-wide semantics, not per-Modal-call
+        # semantics. The orchestrator (`scripts/run_turnrd_modal.py`)
+        # passes per-round values via --n-episodes / --k explicitly.
+        # If the JSON's total_episodes overrode the CLI, a single
+        # `modal run` would balloon from a 2-ep dry-run into the full
+        # 200-ep protocol — see the post-mortem in the execution plan.
         run_block = cfg_dict.get("run", {}) if cfg_dict else {}
         if "name" in run_block:
             run_name = str(run_block["name"])

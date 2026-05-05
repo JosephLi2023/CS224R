@@ -332,16 +332,32 @@ def _train_loop_cmd(cfg: OrchestrationConfig, round_idx: int) -> list[str]:
       --kl-warmup-episodes / --gpu-mem-util / --config
 
     We rely on the JSON config to set most of these (per the Day-14
-    `--config` switch); only `--n-episodes`, `--task-id-offset`, and
-    `--run-name` are overridden round-by-round (and seed-by-seed).
+    `--config` switch); only `--n-episodes`, `--k`, `--task-id-offset`,
+    and `--run-name` are overridden round-by-round (and seed-by-seed).
+    `--k` is read from `cfg.config_path` JSON's
+    `train.K_trajectories_per_task` so the protocol K matches what the
+    user configured (the JSON-driven app no longer overrides this on
+    its own — see the post-mortem in the execution plan).
 
     `--config` is translated to its in-container `/workspace/...` path
     so `open(...)` inside the Modal function actually finds the file.
     """
+    # Read K from the JSON; default to the app's own default (4) if
+    # the key is absent.
+    try:
+        with open(cfg.config_path) as fh:
+            cfg_json = json.load(fh)
+    except Exception:
+        cfg_json = {}
+    k_per_task = int(
+        (cfg_json.get("train", {}) or {}).get("K_trajectories_per_task", 4)
+    )
+
     return [
         "modal", "run", "infra/app_train_loop.py",
         "--config", _to_container_path(cfg.config_path),
         "--n-episodes", str(cfg.episodes_per_round),
+        "--k", str(k_per_task),
         "--task-id-offset", str(
             cfg.base_task_id_offset + round_idx * cfg.episodes_per_round
         ),
