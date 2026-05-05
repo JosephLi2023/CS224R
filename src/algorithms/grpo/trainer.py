@@ -87,6 +87,7 @@ class TrainStepStats:
     alpha_var: float = 0.0           # variance of α; ≈ uniform-flat when small
     alpha_max: float = 0.0           # max α weight in the group
     alpha_entropy: float = 0.0       # mean H(α); uniform on T turns ⇒ log(T); peaked ⇒ small
+    alpha_progress_corr: float = 0.0 # mean Pearson corr(α, env raw_env_reward) over trajectories
 
 
 PerTurnDecomposer = Callable[[TrajectoryGroup], list[list[float]]]
@@ -649,6 +650,7 @@ class HGPOTrainer:
         _alpha_var: float = 0.0
         _alpha_max: float = 0.0
         _alpha_entropy: float = 0.0
+        _alpha_progress_corr: float = 0.0
         if self._decomposer_learnable and self.cfg.lambda_consistency != 0.0:
             grad_out = self.decomposer.decompose_with_grad(group)
             alpha_t = grad_out["alpha"]  # [K_real, T_max], grad-tracking
@@ -708,6 +710,70 @@ class HGPOTrainer:
                 cons_loss_t = consistency_loss_tensor(
                     self.cfg.lambda_consistency, traj_adv_t, turn_adv_t, attn_t
                 )
+                # v6: V-head as per-turn PPO baseline. When the
+                # TurnRD model has a learnable value head AND it
+                # exposed value_per_turn here, REPLACE the
+                # per-position-normalized turn_adv used in the PPO
+                # surrogate with a true actor-critic baseline:
+                #   A_t = (α_t · R[i]) − V_θ(h_t^i)
+                # The value tensor is grad-tracking, but we DETACH
+                # it before insertion into `combined` so the policy
+                # gradient doesn't push V (V is trained via
+                # standalone trainer's loss_value_head, not via
+                # policy backprop). Only the (i, t) entries with
+                # mask=1 are overridden; padded turns stay at 0.
+                value_per_turn = grad_out.get("value_per_turn")
+                if value_per_turn is not None and value_per_turn.shape == per_turn_rewards.shape:
+                    v6_turn_adv = (
+                        per_turn_rewards - value_per_turn
+                    ) * mask_f  # [K_real, T_max], grad-tracking
+                    v6_detached = v6_turn_adv.detach().cpu().tolist()
+                    nonempty_idx = grad_out["nonempty_indices"]
+                    # Override combined[i][t] for the unmasked entries.
+                    # combined came from build_advantages (Python list); we
+                    # rebuild only the entries we have V predictions for.
+                    # combined[i][t] = α·traj_adv[i] + (1-α)·turn_adv[i][t]
+                    alpha_w = float(self.cfg.alpha)
+                    for row, orig_i in enumerate(nonempty_idx):
+                        traj_obj = group.trajectories[orig_i]
+                        T_i = len(traj_obj.turns)
+                        for t in range(min(T_i, len(v6_detached[row]))):
+                            if attn_t[row, t].item() == 0:
+                                continue
+                            new_turn_adv = v6_detached[row][t]
+                            combined[orig_i][t] = (
+                                alpha_w * traj_adv[orig_i] +
+                                (1.0 - alpha_w) * new_turn_adv
+                            )
+                # v6 diagnostic: correlation between learned α and the
+                # env's normalized progress signal (Method C's signal).
+                # High correlation ⇒ TurnRD is rediscovering Method C.
+                # Low ⇒ TurnRD has found a different signal.
+                _alpha_corr_sum = 0.0
+                _alpha_corr_n = 0
+                for row, orig_i in enumerate(grad_out["nonempty_indices"]):
+                    traj_obj = group.trajectories[orig_i]
+                    progress = [float(turn.raw_env_reward) for turn in traj_obj.turns]
+                    if not progress or sum(abs(p) for p in progress) < 1e-12:
+                        continue
+                    a_row = alpha_t[row, :len(progress)].detach().cpu().tolist()
+                    if len(a_row) < 2:
+                        continue
+                    # Pearson correlation across turn positions.
+                    n_t = len(progress)
+                    mean_a = sum(a_row) / n_t
+                    mean_p = sum(progress) / n_t
+                    cov = sum((a_row[k] - mean_a) * (progress[k] - mean_p) for k in range(n_t))
+                    var_a = sum((a - mean_a) ** 2 for a in a_row)
+                    var_p = sum((p - mean_p) ** 2 for p in progress)
+                    denom = (var_a * var_p) ** 0.5
+                    if denom < 1e-12:
+                        continue
+                    _alpha_corr_sum += cov / denom
+                    _alpha_corr_n += 1
+                _alpha_progress_corr = (
+                    _alpha_corr_sum / _alpha_corr_n if _alpha_corr_n > 0 else 0.0
+                )
         # Snapshot the cons_loss_t scalar BEFORE the optimizer step. This
         # is the gradient-bearing C3 loss — distinct from `cons` (the
         # pure-Python residual which is always 0 by construction).
@@ -751,6 +817,7 @@ class HGPOTrainer:
             alpha_var=_alpha_var,
             alpha_max=_alpha_max,
             alpha_entropy=_alpha_entropy,
+            alpha_progress_corr=_alpha_progress_corr,
         )
         return total, stats
 

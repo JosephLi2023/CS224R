@@ -119,8 +119,29 @@ def policy_hidden_state_embedder(
                 model.train()
 
         # `outputs.hidden_states` is a tuple `(layer_0, ..., layer_N)` of
-        # tensors `[T, L, D]`. Take the last layer per the docstring.
-        hidden = outputs.hidden_states[-1]  # [T, L, D]
+        # tensors `[T, L, D]`. v6 improvement: average across multiple
+        # layers (last + 3 earlier) instead of just the last layer.
+        # Lower layers carry more positional/syntactic info that helps
+        # TurnRD's encoder discriminate "search" from "click[item-N]"
+        # — which the deepest layer's task-specialized features may have
+        # smoothed over. Averaging keeps the output dim at D (no
+        # downstream input_dim change required).
+        all_hidden = outputs.hidden_states  # tuple of [T, L, D] tensors
+        n_layers = len(all_hidden)
+        # Pick layers from depth-quartiles: last (-1), then 3 earlier
+        # at evenly-spaced positions. Skip the embedding layer (idx 0)
+        # which is just token embeddings without contextualization.
+        if n_layers >= 13:  # Qwen-1.5B has 28 layers + embedding = 29
+            layer_idxs = [-1, -7, -14, -21]
+        elif n_layers >= 5:
+            # Smaller models / unit-test stubs: just last 4 layers.
+            layer_idxs = [-1, -2, -3, -4]
+        else:
+            layer_idxs = [-1]
+        # Stack picked layers along a new dim and average.
+        hidden = torch.stack(
+            [all_hidden[i] for i in layer_idxs], dim=0
+        ).mean(dim=0)  # [T, L, D]
 
         # Mean-pool over L using the attention mask.
         # mask: [T, L] long → cast to hidden's dtype for the multiply.

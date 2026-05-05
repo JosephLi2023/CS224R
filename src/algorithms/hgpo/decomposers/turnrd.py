@@ -278,6 +278,7 @@ class TurnRDDecomposer:
                 "attention_mask": torch.zeros(0, 0, dtype=torch.long, device=self.device),
                 "nonempty_indices": [],
                 "final_R": torch.zeros(0, device=self.device, dtype=self._model_dtype),
+                "value_per_turn": None,
             }
 
         # 1. Embed each non-empty trajectory under no_grad (same rationale
@@ -308,6 +309,7 @@ class TurnRDDecomposer:
                 "attention_mask": torch.zeros(0, 0, dtype=torch.long, device=self.device),
                 "nonempty_indices": [],
                 "final_R": torch.zeros(0, device=self.device, dtype=self._model_dtype),
+                "value_per_turn": None,
             }
 
         D = non_empty[0].shape[1]
@@ -339,6 +341,11 @@ class TurnRDDecomposer:
         out = self.model(stacked, attn_mask)
         # alpha == cls_attn_weights (already mask-zeroed inside the model).
         alpha = out.cls_attn_weights  # [K_real, T_max], grad-tracking
+        # v6: V-head per-turn predictions for the actor-critic baseline
+        # in HGPOTrainer.compute_loss. None when the model was built
+        # with cfg.value_head=False (back-compat); the trainer falls
+        # back to the per-position-normalized turn_adv path then.
+        value_per_turn = out.predicted_per_turn_R  # [K_real, T_max] or None
 
         final_R = torch.tensor(
             [float(group.trajectories[i].final_reward) for i in nonempty_indices],
@@ -351,6 +358,7 @@ class TurnRDDecomposer:
             "attention_mask": attn_mask,
             "nonempty_indices": nonempty_indices,
             "final_R": final_R,
+            "value_per_turn": value_per_turn,
         }
 
 
