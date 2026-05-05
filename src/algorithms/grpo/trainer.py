@@ -105,6 +105,41 @@ class HGPOTrainer:
     """Group-relative policy optimization with hierarchical (trajectory + turn)
     advantages, PPO-clip surrogate, and an adaptive KL penalty against the
     frozen base.
+
+    Gradient-flow overview
+    ----------------------
+    For one `train_step(group)` call the trainer minimizes::
+
+        L = L_PPO(theta)  +  beta_t * KL_k3(pi_theta || pi_ref)
+                          +  lambda * L_consistency(theta, phi)
+
+    where:
+      * ``theta``  = LoRA-adapter weights on the trainable Qwen body
+        (the ONLY LLM weights that receive gradients; the base ``W_0`` is
+        frozen).
+      * ``phi``    = TurnRD decomposer parameters — present and trainable
+        only when ``decomposer.has_learnable_params is True``
+        (Method B). For Methods A/C this set is empty.
+      * ``pi_ref`` = either the LoRA-disabled base (``disable_adapter()``)
+        or a snapshot of an SFT-warmed LoRA captured by
+        ``snapshot_current_lora_as_ref()`` — always a *constant* w.r.t.
+        ``theta`` and ``phi``.
+
+    The two distinct gradient paths in a single backward pass are:
+
+    1. ``L_PPO`` and the KL term flow gradients into ``theta`` only,
+       through the grad-on forward in ``_batched_logprobs(use_ref=False)``
+       which produces ``new_logp(pi_theta)``. ``old_logp`` (rollout cache)
+       and ``ref_logp`` (no_grad forward) are constants.
+    2. ``L_PPO`` (via the broadcast advantage ``A_H``) AND ``L_consistency``
+       (tensor form) flow gradients into ``phi`` through the grad-tracking
+       ``alpha_t`` produced by ``decompose_with_grad`` →
+       ``r_hat_t = alpha_t * R`` → ``A_turn`` → ``A_H``.
+
+    The two parameter groups are stepped by **two separate AdamW
+    optimizers** (different learning rates: ``cfg.learning_rate`` for the
+    LoRA, ``cfg.turnrd_lr`` for TurnRD) so AdamW state is not shared.
+    Both share a single ``loss.backward()`` call.
     """
 
     def __init__(
@@ -255,7 +290,17 @@ class HGPOTrainer:
         self, prompt_token_ids: list[int], action_token_ids: list[int]
     ) -> "torch.Tensor":
         """Recompute per-token logprobs under the *current* policy for a single
-        (prompt, action) pair. Returns a 1-D tensor of length len(action_token_ids)."""
+        (prompt, action) pair. Returns a 1-D tensor of length len(action_token_ids).
+
+        Gradient flow
+        -------------
+        Runs under ``torch.set_grad_enabled(True)`` with the LoRA adapter
+        active, so the returned tensor carries autograd history back to
+        ``theta`` (the LoRA params). This is the path through which
+        ``L_PPO`` and ``KL_k3`` ultimately reach ``optimizer.step()``
+        for the LLM weights. The fp32 cast before ``log_softmax`` keeps
+        ``exp(new - old)`` numerically stable in the importance ratio.
+        """
         import torch  # type: ignore[import-not-found]
         from torch.nn import functional as F  # type: ignore[import-not-found]
 
@@ -288,6 +333,14 @@ class HGPOTrainer:
         `disable_adapter()` context manager temporarily bypasses the LoRA
         adapter so the forward sees only the original SFT base weights.
         Returned tensor is detached (no grad needed for the reference side).
+
+        Gradient flow
+        -------------
+        Runs under ``torch.no_grad()`` and returns ``.detach()``-ed
+        tensors. The reference logprobs are *constants* in the loss
+        graph — they only set the target distribution that ``KL_k3``
+        penalizes drift from. No gradient ever flows into ``pi_ref``
+        (it is, by construction, frozen).
         """
         import torch  # type: ignore[import-not-found]
         from torch.nn import functional as F  # type: ignore[import-not-found]
@@ -321,6 +374,31 @@ class HGPOTrainer:
         token count stays under `cfg.max_tokens_per_microbatch`. Each
         micro-batch is one padded forward; activations are released between
         micro-batches so we don't OOM at K×T scale (M6 follow-up).
+
+        Gradient flow
+        -------------
+        ``use_ref`` selects between the two distinct forward modes used
+        every train step:
+
+        * ``use_ref=False`` — runs under ``torch.set_grad_enabled(True)``
+          with the LoRA active. Returned tensors carry autograd history
+          back to ``theta`` (the LoRA params). These ``new_logp`` values
+          drive ``L_PPO`` (via the importance ratio ``rho = exp(new-old)``)
+          AND the KL term (via the k3 estimator, where ``new_logp`` is the
+          denominator inside ``r = pi_ref / pi_theta``).
+
+        * ``use_ref=True`` — runs under ``torch.no_grad()`` either with
+          ``disable_adapter()`` (default reference = frozen base) or with
+          the SFT LoRA snapshot temporarily swapped in (when
+          ``self._ref_lora_snapshot is not None``). Returned tensors are
+          ``.detach()``-ed and act as constants in the loss graph. Live
+          LoRA tensors are restored in a ``finally`` block so a partial
+          swap on OOM cannot leave the policy in a corrupted state.
+
+        Both modes return per-row 1-D tensors aligned with each
+        (prompt, action) pair's action-token positions; padding rows have
+        zero gradient contribution since they were filtered out before
+        the micro-batch was assembled.
         """
         import torch  # type: ignore[import-not-found]
         from torch.nn import functional as F  # type: ignore[import-not-found]
@@ -429,6 +507,51 @@ class HGPOTrainer:
 
         Reads `prompt_token_ids` and `action_token_ids` directly from each
         `TurnRecord` (the rollout collector populates both as of Day 5.5).
+
+        Gradient flow (``L = L_PPO + beta_t * KL_k3 + lambda * L_cons``)
+        ----------------------------------------------------------------
+        Per action token ``u`` of turn ``t`` in trajectory ``i``::
+
+            rho      = exp(new_logp - old_logp)         # autograd → theta
+            L_PPO    = -mean( min(rho * A_H, clip(rho, 1±eps) * A_H) )
+            r        = pi_ref / pi_theta = exp(ref_logp - new_logp)
+            KL_k3    = mean( (r - 1) - log r )           # autograd → theta
+            A_H      = alpha * A_traj + (1 - alpha) * A_turn
+
+        Gradient destinations:
+
+        * **theta (LoRA)** receives gradient from
+          ``L_PPO`` (via ``new_logp``) and from ``KL_k3`` (via
+          ``new_logp`` — note ``ref_logp`` is detached). ``old_logp`` is a
+          constant from the rollout cache.
+
+        * **phi (TurnRD)** — present only when
+          ``self._decomposer_learnable is True``. Gradient flows in via
+          ``decompose_with_grad`` → ``alpha_t`` (grad-tracking) →
+          ``per_turn_rewards = alpha * R`` → group-normalized ``A_turn``
+          → ``A_H`` → ``L_PPO``, AND additionally via the tensor-form
+          ``consistency_loss_tensor`` (``L_cons``). ``A_traj`` is a
+          constant w.r.t. ``phi`` because it depends only on the env
+          rewards ``R_i``.
+
+        * **pi_ref** is *never* updated — both reference paths
+          (``disable_adapter()`` and the SFT snapshot swap) run under
+          ``torch.no_grad()`` and the returned tensors are detached.
+
+        KL warmup: during the first ``cfg.kl_warmup_episodes`` calls,
+        ``kl_term`` is replaced by a fresh zero tensor (NOT ``0.0 *
+        kl_per_tok.mean()`` — that would propagate NaN/Inf from a blown-
+        up k3 estimator right after SFT). ``observed_kl`` is still
+        recorded for logging.
+
+        Returns
+        -------
+        total : ``torch.Tensor``
+            Scalar loss with autograd history into both ``theta`` and
+            ``phi`` (when learnable). Caller handles ``backward()``.
+        stats : ``TrainStepStats``
+            Detached scalars for logging — never participates in the
+            gradient computation.
         """
         import torch  # type: ignore[import-not-found]
 
@@ -627,6 +750,46 @@ class HGPOTrainer:
         `grad_accum_steps` and `optimizer.step()` is only called every Nth
         invocation. `n_action_tokens == 0` short-circuits to a no-op
         (review nit) so we don't crash on a leaf-tensor backward.
+
+        Gradient-flow ordering (one invocation)
+        ---------------------------------------
+        1. Optional TurnRD checkpoint refresh (in-place; preserves
+           tensor identities held by ``self._decomposer_optimizer``).
+        2. ``_ensure_optimizer()`` lazily builds AdamW(theta_LoRA) and,
+           when the decomposer is learnable, AdamW(phi_TurnRD).
+        3. ``compute_loss(group)`` builds the autograd graph:
+
+               L = L_PPO + beta * KL + lambda * L_cons
+
+           * grad path 1: ``new_logp(pi_theta)`` → L_PPO + KL → theta
+           * grad path 2: ``alpha_t(phi)`` → A_turn → A_H → L_PPO,
+             plus ``alpha_t(phi)`` → L_cons → phi
+
+        4. ``(loss / grad_accum_steps).backward()`` accumulates grads
+           into ``.grad`` on both parameter groups. Scaling is applied
+           BEFORE backward so AdamW state stays unscaled.
+        5. **Step boundary** (every ``grad_accum_steps`` calls):
+
+              - ``clip_grad_norm_(theta_LoRA, max_grad_norm)``
+                then ``AdamW(theta_LoRA).step()`` + ``zero_grad()``
+              - if learnable decomposer:
+                ``clip_grad_norm_(phi_TurnRD, max_grad_norm)``
+                then ``AdamW(phi_TurnRD).step()`` + ``zero_grad()``
+
+           Otherwise grads keep accumulating silently and
+           ``stats.grad_norm`` is set to 0.0.
+        6. ``AdaptiveKLController.update(observed_kl)`` adjusts
+           ``beta_{t+1}`` for the next group — frozen during KL warmup
+           so a post-SFT KL spike doesn't saturate the controller.
+
+        Side effects across calls
+        -------------------------
+        * ``self._step`` is incremented every call (used to gate KL
+          warmup and decomposer-refresh cadence).
+        * Updated LoRA tensors are picked up by
+          ``src/policy/weight_sync.py`` on the next sync pass and
+          pushed to vLLM, becoming the new ``pi_theta_old`` for the
+          next rollout batch — closing the on-policy-ish PPO loop.
         """
         import torch  # type: ignore[import-not-found]
 
