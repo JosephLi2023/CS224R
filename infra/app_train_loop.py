@@ -283,6 +283,23 @@ def train_loop_smoke(
         except Exception as exc:
             print(f"ep={ep} CRASHED: {exc!r}")
             log.append({"episode": ep, "task_id": task_id, "error": repr(exc)})
+            # v9 F3: when an episode crashes mid-step (typical: CUDA OOM
+            # or an UnboundLocalError after partial allocations), the
+            # `if sync_every > 0 ...` empty_cache block above is skipped.
+            # That leaves the failed step's activations in the allocator
+            # cache, dramatically increasing the chance the NEXT episode
+            # also OOMs — exactly the cascading-OOM pattern observed in v6
+            # (UnboundLocalError eps left ~1-2 GiB pinned, and the next
+            # ep's larger forward immediately OOM'd). Flush proactively in
+            # the except branch so each crash starts the next ep clean.
+            try:
+                import gc as _gc
+                import torch as _torch
+                _gc.collect()
+                if _torch.cuda.is_available():
+                    _torch.cuda.empty_cache()
+            except Exception:
+                pass
             continue
 
     total_elapsed = round(time.time() - overall_start, 2)

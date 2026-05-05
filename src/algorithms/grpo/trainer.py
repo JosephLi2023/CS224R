@@ -569,13 +569,25 @@ class HGPOTrainer:
 
         adv = self.build_advantages(group)
         combined: list[list[float]] = adv["combined"]
+        # F1 (v9): hoist traj_adv + flat_turn_adv extraction up here so the
+        # V-head override block below can reference traj_adv (Python list)
+        # without UnboundLocalError. Pre-v9 these were at the bottom of
+        # compute_loss, which made the override block at L807 reference an
+        # undefined local — every TurnRD episode crashed on
+        # `UnboundLocalError("cannot access local variable 'traj_adv' ...")`.
+        traj_adv: list[float] = adv["traj_adv"]
+        flat_turn_adv: list[float] = [v for row in adv["turn_adv"] for v in row]
 
         device = next(self.policy.model.parameters()).device
 
         all_new_lp: list[torch.Tensor] = []
         all_old_lp: list[torch.Tensor] = []
         all_ref_lp: list[torch.Tensor] = []
-        all_adv: list[torch.Tensor] = []
+        # NOTE (v9 F2): all_adv assembly is DEFERRED until after the grad
+        # block runs and the V-head override has had a chance to mutate
+        # `combined`. Pre-v9 this loop snapshotted `combined[i][t]` into
+        # `adv_vec` BEFORE the V-head override at L806 ran, making the
+        # override dead code (mutated `combined` was never re-read).
         # Collect all (prompt, action) pairs first; the heavy forward passes
         # (one new, one ref) happen ONCE per group via _batched_logprobs (M6).
         pa_pairs: list[tuple[list[int], list[int]]] = []
@@ -596,18 +608,18 @@ class HGPOTrainer:
         new_lps = self._batched_logprobs(pa_pairs, use_ref=False)
         ref_lps = self._batched_logprobs(pa_pairs, use_ref=True)
 
+        # Phase 1 (v9): build only the logprob tensors here — they don't
+        # depend on `combined`, so they can be assembled before the grad
+        # block. `all_adv` is built in Phase 2 (after grad block) below.
         for k, ((prompt_ids, ids), (i, t)) in enumerate(zip(pa_pairs, per_turn_meta)):
             old_lp = torch.tensor(
                 group.trajectories[i].turns[t].action_token_logprobs,
                 dtype=torch.float32,
                 device=device,
             )
-            a_t = combined[i][t]
-            adv_vec = torch.full((len(ids),), float(a_t), dtype=torch.float32, device=device)
             all_new_lp.append(new_lps[k])
             all_old_lp.append(old_lp)
             all_ref_lp.append(ref_lps[k])
-            all_adv.append(adv_vec)
 
         if not all_new_lp:
             zero = torch.zeros((), device=device, requires_grad=True)
@@ -616,35 +628,6 @@ class HGPOTrainer:
         new_lp_t = torch.cat(all_new_lp).to(torch.float32)
         old_lp_t = torch.cat(all_old_lp).to(torch.float32)
         ref_lp_t = torch.cat(all_ref_lp).to(torch.float32)
-        adv_t = torch.cat(all_adv).to(torch.float32)
-
-        # PPO importance ratio uses (new vs old=rollout) — that's correct.
-        ratio = torch.exp(new_lp_t - old_lp_t)
-        clip_eps = self.cfg.clip_eps
-        clipped = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv_t
-        unclipped = ratio * adv_t
-        policy_loss = -torch.minimum(unclipped, clipped).mean()
-
-        # KL penalty uses (ref vs new) with samples from the current policy π.
-        # For unbiased Schulman-k3 of KL(π||π_ref), the ratio must be r = π_ref/π
-        # (i.e. log_ratio = ref_lp − new_lp), NOT r = π/π_ref. Then
-        # E_π[(r − 1) − log r] = KL(π||π_ref) by Jensen, and the per-token term
-        # is non-negative. (Review item A1: prior version used new − ref which
-        # was a non-negative biased surrogate of neither KL direction.)
-        ref_log_ratio = ref_lp_t - new_lp_t
-        ref_ratio = torch.exp(ref_log_ratio)
-        kl_per_tok = (ref_ratio - 1.0) - ref_log_ratio
-        observed_kl = float(kl_per_tok.mean().detach().item())
-        kl_coef = self.kl_controller.coef
-        # KL warmup: zero out the term during the first N steps with a FRESH
-        # tensor (not 0.0 * kl_per_tok.mean(), which would propagate NaN/inf
-        # if ref_ratio overflowed — exactly the scenario warmup exists to
-        # handle). observed_kl is still computed + logged so we can see what
-        # the un-penalised KL is doing during warmup. (Review items A3 + A4.)
-        if self._step < int(self.cfg.kl_warmup_episodes):
-            kl_term = torch.zeros((), device=device, dtype=torch.float32)
-        else:
-            kl_term = kl_coef * kl_per_tok.mean()
 
         cons = float(adv["consistency"])
         # Consistency reg has zero gradient for Methods A/C (the pure-Python
@@ -836,6 +819,50 @@ class HGPOTrainer:
                 _alpha_progress_corr = (
                     _alpha_corr_sum / _alpha_corr_n if _alpha_corr_n > 0 else 0.0
                 )
+
+        # ----- v9 F2 Phase 2: build advantage tensor AFTER override -----
+        # The grad block above (when active) may have mutated `combined`
+        # via the V-head override. We now build the advantage tensor that
+        # actually feeds the PPO surrogate, reading the post-override
+        # `combined`. Pre-v9 this loop ran BEFORE the override, so the
+        # override was dead code; v9 swaps the order.
+        all_adv: list[torch.Tensor] = []
+        for k, ((prompt_ids, ids), (i, t)) in enumerate(zip(pa_pairs, per_turn_meta)):
+            a_t = combined[i][t]
+            adv_vec = torch.full(
+                (len(ids),), float(a_t), dtype=torch.float32, device=device
+            )
+            all_adv.append(adv_vec)
+        adv_t = torch.cat(all_adv).to(torch.float32)
+
+        # PPO importance ratio uses (new vs old=rollout) — that's correct.
+        ratio = torch.exp(new_lp_t - old_lp_t)
+        clip_eps = self.cfg.clip_eps
+        clipped = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv_t
+        unclipped = ratio * adv_t
+        policy_loss = -torch.minimum(unclipped, clipped).mean()
+
+        # KL penalty uses (ref vs new) with samples from the current policy π.
+        # For unbiased Schulman-k3 of KL(π||π_ref), the ratio must be r = π_ref/π
+        # (i.e. log_ratio = ref_lp − new_lp), NOT r = π/π_ref. Then
+        # E_π[(r − 1) − log r] = KL(π||π_ref) by Jensen, and the per-token term
+        # is non-negative. (Review item A1: prior version used new − ref which
+        # was a non-negative biased surrogate of neither KL direction.)
+        ref_log_ratio = ref_lp_t - new_lp_t
+        ref_ratio = torch.exp(ref_log_ratio)
+        kl_per_tok = (ref_ratio - 1.0) - ref_log_ratio
+        observed_kl = float(kl_per_tok.mean().detach().item())
+        kl_coef = self.kl_controller.coef
+        # KL warmup: zero out the term during the first N steps with a FRESH
+        # tensor (not 0.0 * kl_per_tok.mean(), which would propagate NaN/inf
+        # if ref_ratio overflowed — exactly the scenario warmup exists to
+        # handle). observed_kl is still computed + logged so we can see what
+        # the un-penalised KL is doing during warmup. (Review items A3 + A4.)
+        if self._step < int(self.cfg.kl_warmup_episodes):
+            kl_term = torch.zeros((), device=device, dtype=torch.float32)
+        else:
+            kl_term = kl_coef * kl_per_tok.mean()
+
         # Snapshot the cons_loss_t scalar BEFORE the optimizer step. This
         # is the gradient-bearing C3 loss — distinct from `cons` (the
         # pure-Python residual which is always 0 by construction).
@@ -868,8 +895,8 @@ class HGPOTrainer:
         else:
             total = policy_loss + kl_term
 
-        traj_adv = adv["traj_adv"]
-        flat_turn_adv: list[float] = [v for row in adv["turn_adv"] for v in row]
+        # `traj_adv` and `flat_turn_adv` were hoisted to the top of
+        # compute_loss (v9 F1). They are still used here for stats only.
         stats = TrainStepStats(
             policy_loss=float(policy_loss.detach().item()),
             kl_term=float(kl_term.detach().item()),

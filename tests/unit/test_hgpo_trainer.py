@@ -250,3 +250,142 @@ def test_decomposer_optimizer_only_built_for_learnable_decomposer():
     # train_step on a group with no token ids exercises _ensure_optimizer.
     trainer.train_step(_group(K=2))
     assert trainer._decomposer_optimizer is None
+
+
+def test_v9_v_head_override_does_not_crash_and_actually_drives_ppo_loss():
+    """v9 F4 regression test for two structural bugs in v6's V-head wiring.
+
+    Pre-v9, ``compute_loss`` had two bugs in the V-head override path that
+    were both observable simultaneously and individually catastrophic:
+
+    Bug A (UnboundLocalError):
+        The override block at L807 referenced ``traj_adv[orig_i]`` (Python
+        list), but ``traj_adv = adv["traj_adv"]`` was only assigned at
+        L871, AFTER the override. Every TurnRD episode crashed with
+        ``UnboundLocalError("cannot access local variable 'traj_adv' ...")``,
+        which the train-loop ``except Exception:`` swallowed → 0 PPO
+        updates → frozen policy → byte-identical eval across all rounds.
+
+    Bug B (override is dead code):
+        The override mutated ``combined[orig_i][t]`` at L806, but the
+        actor's ``adv_t`` tensor was already snapshotted from
+        ``combined[i][t]`` ~200 lines earlier (L605), so even if Bug A
+        were fixed, the override would have had ZERO effect on the PPO
+        loss — V was being trained but never wired into the policy
+        gradient.
+
+    This test exercises the override end-to-end with:
+    - A real ``TurnRDDecomposer`` configured with ``value_head=True`` so
+      ``value_per_turn`` is provided to the override path.
+    - ``v_baseline_round_idx >= v_baseline_warmup_rounds`` so β=1 and the
+      override is fully active (vs. β=0 where the M1 short-circuit skips
+      the override entirely).
+    - A monkey-patched ``_batched_logprobs`` returning deterministic
+      tensors so we don't need a real LoRA forward (the test runs CPU-only
+      in <1s).
+
+    Assertions:
+    1. ``compute_loss`` runs to completion at β=1 (catches Bug A).
+    2. ``policy_loss`` at β=1 (override active) DIFFERS from
+       ``policy_loss`` at β=0 (override skipped). If they're equal, the
+       override is dead code (catches Bug B).
+    """
+    torch = pytest.importorskip("torch")
+
+    from src.algorithms.grpo.rollout import Trajectory, TurnRecord
+    from src.algorithms.hgpo.decomposers.turnrd import TurnRDDecomposer
+    from src.turnrd.model import TurnRD, TurnRDConfig
+
+    INPUT_DIM = 16
+    torch.manual_seed(0)
+    cfg_model = TurnRDConfig(
+        n_layers=1,
+        hidden_size=32,
+        n_heads=4,
+        max_turns=8,
+        dropout=0.0,
+        value_head=True,
+        causal=True,
+    )
+    model = TurnRD(cfg_model, input_dim=INPUT_DIM)
+
+    def embedder(traj):
+        T_i = len(traj.turns)
+        # Deterministic per-turn embeddings; offset by trajectory hash so
+        # K samples don't collide.
+        offset = (
+            abs(hash(traj.task_id + "|" + (traj.turns[0].action_text if traj.turns else "")))
+            % 997
+        ) * 1.0
+        base = torch.arange(T_i * INPUT_DIM, dtype=torch.float32).view(T_i, INPUT_DIM)
+        return base + offset
+
+    decomposer = TurnRDDecomposer(model=model, embedder=embedder)
+
+    # Build a group where every turn has token ids → compute_loss runs
+    # the full PPO surrogate path (no early `not pa_pairs` short-circuit).
+    K, T = 3, 3
+    trajectories = []
+    for i in range(K):
+        turns = [
+            TurnRecord(
+                turn_idx=t,
+                observation_text=f"o{i}-{t}",
+                action_text=f"a{i}-{t}",
+                raw_env_reward=0.1 * (t + 1) + 0.05 * i,
+                prompt_token_ids=(1, 2, 3),
+                action_token_ids=(10, 20),
+                action_token_logprobs=(-1.0, -1.0),
+            )
+            for t in range(T)
+        ]
+        trajectories.append(
+            Trajectory(
+                task_id="task-X",
+                env_name="webshop",
+                turns=turns,
+                final_reward=0.3 * (i + 1),
+            )
+        )
+    group = TrajectoryGroup(
+        task_id="task-X", env_name="webshop", trajectories=trajectories
+    )
+
+    def _make_trainer(round_idx: int) -> HGPOTrainer:
+        cfg = HGPOTrainerConfig(
+            alpha=0.5,
+            lambda_consistency=0.1,  # > 0 so the grad block runs
+            v_baseline_round_idx=round_idx,
+            v_baseline_warmup_rounds=2,
+            kl_warmup_episodes=0,
+        )
+        trainer = HGPOTrainer(_StubPolicy(), decomposer, cfg)
+        # Patch the batched-logprob forward so the test is CPU-only and
+        # deterministic. Returns one zero-tensor per (prompt, action) pair.
+        def _stub_logprobs(pa_pairs, use_ref=False):
+            return [
+                torch.zeros(len(ids), dtype=torch.float32) for _, ids in pa_pairs
+            ]
+        trainer._batched_logprobs = _stub_logprobs  # type: ignore[assignment]
+        return trainer
+
+    # β=1 → override fully active. Pre-v9: UnboundLocalError on traj_adv.
+    trainer_full = _make_trainer(round_idx=2)
+    total_full, stats_full = trainer_full.compute_loss(group)
+    assert torch.isfinite(total_full).item(), (
+        "compute_loss returned non-finite total at β=1"
+    )
+
+    # β=0 → override short-circuited. Pre-v9 (without M1 fix) would also
+    # have entered the override loop and crashed; with the M1 fix this
+    # path skips the override entirely.
+    trainer_skip = _make_trainer(round_idx=0)
+    total_skip, stats_skip = trainer_skip.compute_loss(group)
+
+    # Bug B regression: at β=1 the override MUST influence policy_loss.
+    # If equal, the override is dead code (the actual v6 behavior).
+    assert stats_full.policy_loss != pytest.approx(stats_skip.policy_loss), (
+        f"V-head override at β=1 produced policy_loss={stats_full.policy_loss}, "
+        f"identical to β=0 ({stats_skip.policy_loss}). The override is dead "
+        "code — v6's V-head was never actually wired into PPO."
+    )
