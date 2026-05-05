@@ -101,6 +101,13 @@ class OrchestrationConfig:
     # depends on having non-trivially-trained policy producing
     # reward variance from episode 0.
     sft_adapter: str = ""
+    # Held-out eval pass appended to each train_loop call. Uses
+    # greedy sampling on a disjoint task range so the eval is stable
+    # AND comparable across rounds + methods + seeds. The default
+    # range [10000, 10050) is reserved for protocol eval; never used
+    # for training. Set --eval-episodes 0 to disable.
+    eval_episodes: int = 50
+    eval_task_id_base: int = 10000
     # Multi-seed protocol support. None ⇒ no seed-specific offset
     # applied (legacy single-run behavior). When set, each seed gets a
     # disjoint task_id range so different seeds never train on the same
@@ -145,6 +152,22 @@ def _parse_args(argv: Sequence[str]) -> OrchestrationConfig:
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--eval-episodes",
+        type=int,
+        default=50,
+        help="Held-out eval episodes appended to each train_loop call "
+             "(greedy sampling, K=1, disjoint task range). Set to 0 to "
+             "disable. Default 50.",
+    )
+    parser.add_argument(
+        "--eval-task-id-base",
+        type=int,
+        default=10000,
+        help="Starting task ID for the held-out eval range. The range "
+             "[base, base+eval_episodes) MUST be disjoint from any "
+             "training task IDs (see --seed's base_task_id_offset).",
     )
     parser.add_argument(
         "--sft-adapter",
@@ -256,6 +279,8 @@ def _parse_args(argv: Sequence[str]) -> OrchestrationConfig:
         ckpt_path=args.ckpt_path,
         run_name_prefix=args.run_name_prefix,
         sft_adapter=args.sft_adapter,
+        eval_episodes=args.eval_episodes,
+        eval_task_id_base=args.eval_task_id_base,
         seed=args.seed,
         dry_run=args.dry_run,
         skip_warmup_fit=args.skip_warmup_fit,
@@ -494,6 +519,8 @@ def _train_loop_cmd(cfg: OrchestrationConfig, round_idx: int) -> list[str]:
         cmd.extend(["--gpu-mem-util", str(float(gpu_mem_util_cfg))])
     if cfg.sft_adapter:
         cmd.extend(["--sft-adapter", cfg.sft_adapter])
+    cmd.extend(["--eval-episodes", str(cfg.eval_episodes)])
+    cmd.extend(["--eval-task-id-base", str(cfg.eval_task_id_base)])
     cmd.extend(cfg.extra_train_loop_args)
     return cmd
 

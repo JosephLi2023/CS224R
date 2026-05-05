@@ -38,6 +38,11 @@ def train_loop_smoke(
     kl_warmup_episodes: int = 0,
     gpu_mem_util: float = 0.30,
     config: str = "",  # Day 14: when non-empty, build trainer from this JSON config.
+    # Post-training eval pass on a held-out task range with greedy
+    # sampling. Disabled when --eval-episodes 0. Default 50 eps on
+    # task IDs [eval_task_id_base, eval_task_id_base + eval_episodes).
+    eval_episodes: int = 50,
+    eval_task_id_base: int = 10000,
 ) -> dict:
     import json
     import os
@@ -260,6 +265,105 @@ def train_loop_smoke(
     early = rewards[: max(1, len(rewards) // 10)]
     late = rewards[-max(1, len(rewards) // 10):]
 
+    # ---- Held-out eval pass on a disjoint task range, greedy sampling ----
+    eval_block: dict | None = None
+    if eval_episodes > 0:
+        print(
+            f">>> Eval pass: {eval_episodes} held-out tasks at offset "
+            f"{eval_task_id_base} (greedy sampling)"
+        )
+        # Ensure vLLM has the latest trained weights. The training loop
+        # syncs every `sync_every` episodes — if the last episode wasn't
+        # a sync boundary, do one more so eval reflects the final state.
+        if sync_every > 0 and (n_episodes % sync_every) != 0:
+            print(">>> Final weight sync before eval")
+            try:
+                runner.sync_weights(policy.iter_merged_weights())
+            except Exception as exc:  # pragma: no cover
+                print(f">>> WARNING: final weight sync failed: {exc!r}")
+
+        eval_sampling = SamplingParams(
+            n=1, temperature=0.0, top_p=1.0, max_tokens=48,
+            return_logprobs=False, seed=42,
+        )
+        eval_t0 = time.time()
+        eval_returns: list[float] = []
+        eval_turns: list[int] = []
+        eval_completed = 0
+        eval_truncated = 0
+        eval_crashed = 0
+        for j in range(eval_episodes):
+            task_id = eval_task_id_base + j
+            try:
+                # K=1 greedy rollout per held-out task. Disable the
+                # producer hook for eval (set turnrd_emit_path=None on
+                # a fresh collector) so we don't pollute the replay
+                # buffer with held-out task data.
+                eval_collector = RolloutCollector(
+                    runner=runner,
+                    env_factory=env_factory,
+                    prompt_renderer=render_webshop_turn_prompt,
+                    action_parser=parse_react_action,
+                    cfg=RolloutCollectorConfig(max_turns=max_turns),
+                )
+                _, eval_cstats = eval_collector.collect_group(
+                    task_id=task_id, env_name="webshop", K=1, sampling=eval_sampling
+                )
+                eval_returns.extend(eval_cstats.final_rewards)
+                eval_turns.append(eval_cstats.total_turns)
+                eval_completed += eval_cstats.completed
+                eval_truncated += eval_cstats.truncated
+            except Exception as exc:
+                print(f"eval ep={j} task={task_id} CRASHED: {exc!r}")
+                eval_crashed += 1
+                continue
+        eval_elapsed = round(time.time() - eval_t0, 2)
+        if eval_returns:
+            mean_R = sum(eval_returns) / len(eval_returns)
+            pct_success = sum(1 for r in eval_returns if r > 0) / len(eval_returns)
+            std_R = (
+                sum((r - mean_R) ** 2 for r in eval_returns) / len(eval_returns)
+            ) ** 0.5
+        else:
+            mean_R = 0.0
+            pct_success = 0.0
+            std_R = 0.0
+        eval_block = {
+            "n_episodes_attempted": eval_episodes,
+            "n_episodes_ok": len(eval_returns),
+            "n_episodes_crashed": eval_crashed,
+            "task_id_base": eval_task_id_base,
+            "task_id_range": [eval_task_id_base, eval_task_id_base + eval_episodes],
+            "sampling": "greedy (T=0.0, top_p=1.0)",
+            "K": 1,
+            "elapsed_s": eval_elapsed,
+            "avg_return": round(mean_R, 4),
+            "std_return": round(std_R, 4),
+            "pct_success": round(pct_success, 4),
+            "completed": eval_completed,
+            "truncated": eval_truncated,
+            "n_turns_avg": round(sum(eval_turns) / max(1, len(eval_turns)), 2),
+        }
+        print(
+            f">>> Eval done: avg_R={eval_block['avg_return']:.4f} "
+            f"(\u00b1{eval_block['std_return']:.4f}) | "
+            f"pct_success={eval_block['pct_success']:.3f} | "
+            f"ok={eval_block['n_episodes_ok']}/{eval_episodes} | "
+            f"elapsed={eval_elapsed}s"
+        )
+
+        # Persist eval into the same train_log.json so post-hoc
+        # aggregation can find it without a separate file lookup.
+        with open(os.path.join(run_dir, "train_log.json"), "w") as f:
+            json.dump({"rows": log, "config": {
+                "n_episodes": n_episodes, "K": k, "max_turns": max_turns,
+                "task_id_offset": task_id_offset, "num_products": num_products,
+                "sync_every": sync_every, "run_name": run_name,
+                "sft_adapter": sft_adapter,
+            }, "eval": eval_block}, f, indent=2)
+        volume.commit()
+    # -----------------------------------------------------------------
+
     summary = {
         "run_dir": run_dir,
         "n_episodes": n_episodes,
@@ -274,6 +378,10 @@ def train_loop_smoke(
         "mean_kl_coef_final": round(log[-1].get("kl_coef", 0), 4) if log else 0.0,
         "log_path": os.path.join(run_dir, "train_log.json"),
     }
+    if eval_block is not None:
+        summary["eval_avg_return"] = eval_block["avg_return"]
+        summary["eval_pct_success"] = eval_block["pct_success"]
+        summary["eval_n_episodes_ok"] = eval_block["n_episodes_ok"]
     with open(os.path.join(run_dir, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
     volume.commit()
@@ -294,6 +402,8 @@ def main(
     kl_warmup_episodes: int = 0,
     gpu_mem_util: float = 0.30,
     config: str = "",
+    eval_episodes: int = 50,
+    eval_task_id_base: int = 10000,
 ) -> None:
     import json as _json
     print(_json.dumps(
@@ -306,6 +416,8 @@ def main(
             kl_warmup_episodes=kl_warmup_episodes,
             gpu_mem_util=gpu_mem_util,
             config=config,
+            eval_episodes=eval_episodes,
+            eval_task_id_base=eval_task_id_base,
         ),
         indent=2, default=str,
     ))
