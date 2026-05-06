@@ -90,15 +90,6 @@ def build_decomposer(
         from src.algorithms.hgpo.decomposers.turnrd import build_turnrd_decomposer
 
         return build_turnrd_decomposer(cfg, model=model, embedder=embedder, device=device)
-    if name == "residual":
-        if model is None or embedder is None:
-            raise ValueError(
-                "build_decomposer(decomposer='residual'): both `model` and `embedder` "
-                "must be provided."
-            )
-        from src.algorithms.hgpo.decomposers.residual import build_residual_decomposer
-
-        return build_residual_decomposer(cfg, model=model, embedder=embedder, device=device)
     raise ValueError(
-        f"Unknown decomposer name {name!r}; expected 'progress' | 'judge' | 'turnrd' | 'residual'."
+        f"Unknown decomposer name {name!r}; expected 'progress' | 'judge' | 'turnrd'."
     )

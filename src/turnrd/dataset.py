@@ -50,18 +50,12 @@ class TurnRDRecord:
     `turn_embeds` is `list[list[float]]` after `json.loads`; this dataclass
     keeps that shape (it's the cheapest representation to pad later in
     `pad_collate`). All conversion to tensors happens in `pad_collate`.
-
-    `progress` carries the per-turn `raw_env_reward` (env progress signal)
-    used by Method D (Residual Decomposer) as a prior bias on α. `None`
-    on legacy rows that pre-date the field — the standalone fitter then
-    treats those records as Method-B-style (no prior).
     """
 
     task_id: str
     turn_embeds: list[list[float]]  # [T_i][D]
     final_reward: float
     judge_labels: Optional[list[float]] = None  # [T_i] or None
-    progress: Optional[list[float]] = None  # [T_i] or None — raw_env_reward per turn
 
     def __post_init__(self) -> None:
         if not isinstance(self.task_id, str) or not self.task_id:
@@ -98,17 +92,6 @@ class TurnRDRecord:
             if len(self.judge_labels) != T:
                 raise ValueError(
                     f"TurnRDRecord.judge_labels has length {len(self.judge_labels)}; "
-                    f"expected T={T} (must match turn_embeds)."
-                )
-        if self.progress is not None:
-            if not isinstance(self.progress, list):
-                raise ValueError(
-                    f"TurnRDRecord.progress must be list[float] or None; "
-                    f"got {type(self.progress).__name__}."
-                )
-            if len(self.progress) != T:
-                raise ValueError(
-                    f"TurnRDRecord.progress has length {len(self.progress)}; "
                     f"expected T={T} (must match turn_embeds)."
                 )
 
@@ -180,7 +163,6 @@ class TurnRDReplayDataset:
                         turn_embeds=turn_embeds,
                         final_reward=float(obj["final_reward"]),
                         judge_labels=obj.get("judge_labels", None),
-                        progress=obj.get("progress", obj.get("raw_env_rewards", None)),
                     )
                 except (KeyError, TypeError, ValueError) as e:
                     raise ValueError(
@@ -232,11 +214,6 @@ def pad_collate(batch: list[TurnRDRecord]) -> dict[str, torch.Tensor]:
                         the batch has non-None `judge_labels`. Padded
                         positions are 0.0; the trainer's `loss_mode_2`
                         masks them via `attention_mask`.
-    - `progress`:       `[B, T_max]` float32 — present iff EVERY record in
-                        the batch has non-None `progress` (per-turn
-                        `raw_env_reward`). Padded positions are 0.0; the
-                        Method-D fitter multiplies by `gamma_prior` and
-                        passes as `prior_bias` to the model.
 
     Pure-torch — no `torch.nn.utils.rnn.pad_sequence` dep. Matches the
     style of `TurnRDDecomposer.decompose` which also pads inline.
@@ -260,10 +237,6 @@ def pad_collate(batch: list[TurnRDRecord]) -> dict[str, torch.Tensor]:
     judge_labels: torch.Tensor | None = (
         torch.zeros(B, T_max, dtype=torch.float32) if have_all_judge else None
     )
-    have_all_progress = all(rec.progress is not None for rec in batch)
-    progress: torch.Tensor | None = (
-        torch.zeros(B, T_max, dtype=torch.float32) if have_all_progress else None
-    )
 
     for i, rec in enumerate(batch):
         T_i = len(rec.turn_embeds)
@@ -273,9 +246,6 @@ def pad_collate(batch: list[TurnRDRecord]) -> dict[str, torch.Tensor]:
         if judge_labels is not None:
             assert rec.judge_labels is not None
             judge_labels[i, :T_i] = torch.tensor(rec.judge_labels, dtype=torch.float32)
-        if progress is not None:
-            assert rec.progress is not None
-            progress[i, :T_i] = torch.tensor(rec.progress, dtype=torch.float32)
 
     out: dict[str, torch.Tensor] = {
         "turn_embeds": turn_embeds,
@@ -284,6 +254,4 @@ def pad_collate(batch: list[TurnRDRecord]) -> dict[str, torch.Tensor]:
     }
     if judge_labels is not None:
         out["judge_labels"] = judge_labels
-    if progress is not None:
-        out["progress"] = progress
     return out

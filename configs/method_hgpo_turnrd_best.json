@@ -1,6 +1,6 @@
 {
   "run": {
-    "name": "hgpo_residual_webshop",
+    "name": "method_b_best",
     "output_dir": "experiments/manifests",
     "seed": 11
   },
@@ -8,7 +8,7 @@
     "algorithm": "hgpo",
     "total_episodes": 200,
     "batch_size": 4,
-    "learning_rate": 1e-6,
+    "learning_rate": 1e-06,
     "checkpoint_every": 50,
     "eval_every": 25,
     "K_trajectories_per_task": 8,
@@ -16,18 +16,23 @@
     "clip_eps": 0.2,
     "grad_accum_steps": 2,
     "max_tokens_per_microbatch": 1024,
-    "gpu_mem_util": 0.20
+    "gpu_mem_util": 0.2
   },
   "policy": {
     "backbone": "Qwen2.5-1.5B-Instruct",
     "lora": true,
-    "lora_target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+    "lora_target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj"
+    ],
     "lora_rank": 16
   },
   "hgpo": {
     "alpha": 0.5,
     "lambda_consistency": 0.1,
-    "decomposer": "residual"
+    "decomposer": "turnrd"
   },
   "turnrd": {
     "mode": 1,
@@ -40,21 +45,18 @@
     "value_head": true,
     "cls_token": true,
     "refresh_every_episodes": 50,
-    "turnrd_lr": 5e-4,
+    "turnrd_lr": 0.0005,
     "lambda_value": 0.5,
     "gamma": 0.95,
     "lambda_entropy": 0.01,
     "lambda_contrastive": 0.1,
     "contrastive_temperature": 0.1,
-    "replay_buffer_path": "/vol/cache/turnrd_replay.jsonl",
-    "ckpt_path": "/vol/cache/residual_ckpt.pt",
+    "replay_buffer_path": "/vol/cache/best_b/replay.jsonl",
+    "ckpt_path": "/vol/cache/best_b/ckpt.pt",
     "distill_source": null
-  },
-  "residual": {
-    "init_gamma": 1.0
   },
   "logging": {
     "print_every": 10
   },
-  "_notes": "H-GRPO Method D: Residual Decomposer. Adds γ_prior · raw_env_reward as additive bias on the α softmax inside TurnRD's [CLS] cross-attention pool. γ_prior is a learnable nn.Parameter (init from residual.init_gamma; AdamW updates at turnrd_lr). γ → 0 reduces to Method B (TurnRD); γ → ∞ collapses to Method C (Progress). turnrd.gamma is the V-head DISCOUNT factor — different concept from residual.init_gamma."
+  "_notes": "Method-B FULL run using sweep winner 'b_default'. Generated automatically by scripts/materialize_best_b_config.py for the overnight 3-method comparison protocol."
 }

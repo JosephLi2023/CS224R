@@ -87,11 +87,6 @@ class OrchestrationConfig:
     turnrd_mode: int = 1
     turnrd_batch_size: int = 16
     turnrd_lr: float = 1e-4
-    # Method D (Residual Decomposer): initial value for the learnable
-    # `gamma_prior` scalar. Forwarded to the standalone fitter via
-    # `--init-gamma`. Only consumed when the config's
-    # `hgpo.decomposer == "residual"`.
-    init_gamma: float = 1.0
     # Modal volume paths — must match `cfg.turnrd.replay_buffer_path`
     # and `cfg.turnrd.ckpt_path` in the JSON config (we cross-check
     # below to surface mismatches before launching anything on Modal).
@@ -233,15 +228,6 @@ def _parse_args(argv: Sequence[str]) -> OrchestrationConfig:
         help="Standalone TurnRD learning rate (default: 1e-4).",
     )
     parser.add_argument(
-        "--init-gamma",
-        type=float,
-        default=1.0,
-        help="Method D (Residual Decomposer): initial value for the "
-             "learnable gamma_prior scalar. Forwarded to the standalone "
-             "fitter via --init-gamma. Only consumed when the config's "
-             "hgpo.decomposer == 'residual'. Default 1.0.",
-    )
-    parser.add_argument(
         "--replay-path",
         default="/vol/cache/turnrd_replay.jsonl",
         help="Modal-volume replay JSONL path; must match cfg.turnrd.replay_buffer_path.",
@@ -294,7 +280,6 @@ def _parse_args(argv: Sequence[str]) -> OrchestrationConfig:
         turnrd_mode=args.turnrd_mode,
         turnrd_batch_size=args.turnrd_batch_size,
         turnrd_lr=args.turnrd_lr,
-        init_gamma=args.init_gamma,
         replay_path=args.replay_path,
         ckpt_path=args.ckpt_path,
         run_name_prefix=args.run_name_prefix,
@@ -347,11 +332,11 @@ def _preflight(cfg: OrchestrationConfig) -> None:
             "this orchestration only makes sense for Method-B configs."
         )
     decomposer = (cfg_json.get("hgpo", {}) or {}).get("decomposer")
-    if decomposer not in ("turnrd", "residual"):
+    if decomposer != "turnrd":
         raise SystemExit(
             f"ERROR: {cfg.config_path}::hgpo.decomposer = {decomposer!r}, "
-            "expected 'turnrd' or 'residual'. This orchestrator coordinates "
-            "the TurnRD producer + standalone trainer; non-TurnRD/Residual "
+            "expected 'turnrd'. This orchestrator coordinates "
+            "the TurnRD producer + standalone trainer; non-TurnRD "
             "configs should run directly via "
             "`modal run infra/app_train_loop.py --config ...`."
         )
@@ -571,8 +556,6 @@ def _train_turnrd_cmd(cfg: OrchestrationConfig) -> list[str]:
     except Exception:
         cfg_json = {}
     turnrd_block = (cfg_json.get("turnrd", {}) or {})
-    decomposer_name = (cfg_json.get("hgpo", {}) or {}).get("decomposer")
-    is_residual = decomposer_name == "residual"
 
     # Resolve turnrd_lr: prefer JSON's value, fall back to CLI cfg default.
     effective_turnrd_lr = float(turnrd_block.get("turnrd_lr", cfg.turnrd_lr))
@@ -586,15 +569,6 @@ def _train_turnrd_cmd(cfg: OrchestrationConfig) -> list[str]:
         "--lr", str(effective_turnrd_lr),
         "--ckpt-out", cfg.ckpt_path,
     ]
-    # Method D: thread --init-gamma so the standalone fitter uses the
-    # learnable gamma_prior bias on top of TurnRD. Read from the
-    # config's `residual.init_gamma` first, fall back to the CLI's
-    # `--init-gamma`. Only emitted for residual configs so Method-B
-    # invocations of this orchestrator are byte-for-byte unchanged.
-    if is_residual:
-        residual_block = cfg_json.get("residual", {}) if isinstance(cfg_json.get("residual"), dict) else {}
-        effective_init_gamma = float(residual_block.get("init_gamma", cfg.init_gamma))
-        cmd.extend(["--init-gamma", str(effective_init_gamma)])
     # Architecture: must match what the parent train_loop's
     # build_trainer_from_config built, otherwise refresh-fn ckpt load
     # will silently break (state_dict keys mismatch).
