@@ -29,6 +29,10 @@ from src.algorithms.hgpo.decomposers.base import (
     build_decomposer,
 )
 from src.algorithms.hgpo.decomposers.judge import JudgeDecomposer
+from src.algorithms.hgpo.decomposers.residual import (
+    ResidualDecomposer,
+    build_residual_decomposer,
+)
 from src.algorithms.hgpo.decomposers.turnrd import (
     TurnRDDecomposer,
     build_turnrd_decomposer,
@@ -41,4 +45,6 @@ __all__ = [
     "JudgeDecomposer",
     "TurnRDDecomposer",
     "build_turnrd_decomposer",
+    "ResidualDecomposer",
+    "build_residual_decomposer",
 ]

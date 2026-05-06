@@ -86,6 +86,28 @@ class LoRAPolicy:
         )
         self.model: PeftModel = get_peft_model(base, lora_cfg)
 
+        # H1 (v11) memory fix: enable HF gradient checkpointing on the
+        # PEFT-wrapped policy. PPO under K=8 microbatched forwards in
+        # `_batched_logprobs` retained 30-50 GiB of activations until
+        # `backward()` (every microbatch's `grad_fn` chain stays alive
+        # in the `out[]` collection). Gradient checkpointing trades
+        # ~30% extra compute for re-running the forward during
+        # backward, freeing those activations between forward and
+        # backward. `use_reentrant=False` is required for PEFT
+        # (the reentrant variant breaks LoRA gradient flow).
+        # `enable_input_require_grads()` ensures the embedded input has
+        # `requires_grad=True` so the recomputation chain reaches LoRA
+        # params (the frozen base would otherwise short-circuit grad
+        # through the input embeddings).
+        try:
+            self.model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+        except TypeError:  # older transformers signature
+            self.model.gradient_checkpointing_enable()
+        if hasattr(self.model, "enable_input_require_grads"):
+            self.model.enable_input_require_grads()
+
     # ------------------------------------------------------------------
     # Trainer-facing API
     # ------------------------------------------------------------------

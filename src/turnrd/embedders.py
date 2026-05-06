@@ -109,38 +109,55 @@ def policy_hidden_state_embedder(
         model.eval()
         try:
             with torch.no_grad():
-                # We need `output_hidden_states=True` because for
-                # AutoModelForCausalLM (the production policy model),
-                # the bare `outputs.last_hidden_state` field doesn't
-                # exist — `outputs[0]` is the LM-head logits
-                # (vocab_size 151936 for Qwen-1.5B), and consuming
-                # those as a hidden state immediately fails downstream
-                # (`forward: turn_embeds last dim 151936 != 1536`).
-                # `output_hidden_states=True` adds a transient ~2 GB
-                # tuple of all 29 layers; we extract layer [-1] and
-                # immediately drop the rest so the allocator can
-                # release the memory before PPO backward runs. This
-                # is the v10b fix: keep the structural behaviour the
-                # production model expects, but avoid v6's mistake of
-                # KEEPING all 29 layers alive in `outputs.hidden_states`
-                # for the multi-layer pool.
-                outputs = model(
+                # H3 v11 memory fix: bypass the LM head entirely by
+                # walking down to the bare transformer backbone. For
+                # PEFT-wrapped CausalLM:
+                #   PeftModel.base_model = LoraModel
+                #   LoraModel.model      = AutoModelForCausalLM (LoRA-wrapped)
+                #   CausalLM.model       = bare transformer (Qwen2Model)
+                # The bare transformer returns BaseModelOutputWithPast
+                # which has `.last_hidden_state` directly, so we don't
+                # need `output_hidden_states=True` (which builds a
+                # 29-layer tuple — ~0.5-2 GB transient that fragments
+                # the allocator under PPO grad pressure). The LoRA
+                # adapter is STILL applied because LoraModel only wraps
+                # the linear submodules — calling .model.model still
+                # routes through them. We don't disable_adapter() here;
+                # we want hiddens from the trained policy, not the
+                # frozen base.
+                backbone = model
+                # PEFT unwrap (no-op if model is already a bare HF model)
+                backbone = getattr(backbone, "base_model", backbone)
+                backbone = getattr(backbone, "model", backbone)
+                # CausalLM unwrap — `.model` on AutoModelForCausalLM
+                # points to the bare transformer.
+                _bare = getattr(backbone, "model", None)
+                if _bare is not None and hasattr(_bare, "forward"):
+                    backbone = _bare
+                outputs = backbone(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    output_hidden_states=True,
                 )
         finally:
             if was_training:
                 model.train()
 
-        # Last-layer hidden state only. v6's multi-layer ablation is
-        # shelved (it kept all 29 layers in memory and OOM'd at K=8).
-        # Clone the slice so we can drop the layer tuple BEFORE the
-        # next allocation; without the clone, the .hidden_states[-1]
-        # view holds a reference to the full 29-layer tuple.
-        hidden = outputs.hidden_states[-1].clone()  # [T, L, D]
-        # Explicitly drop the remaining 28 layers + the output object
-        # so the CUDA allocator can reuse the ~2 GB before backward.
+        # The bare transformer returns BaseModelOutputWithPast with
+        # `.last_hidden_state` populated. Fall back to .hidden_states[-1]
+        # only if a stub model returns the older format (test path).
+        if getattr(outputs, "last_hidden_state", None) is not None:
+            hidden = outputs.last_hidden_state  # [T, L, D]
+        elif getattr(outputs, "hidden_states", None) is not None:
+            hidden = outputs.hidden_states[-1]  # [T, L, D]
+        else:
+            # Last resort: outputs[0] — only safe when we're certain the
+            # callee returned hidden states (e.g., test stub). Will be
+            # the wrong tensor (logits) if we're wrong about the model
+            # type. Guard with shape check downstream — input_dim
+            # mismatch raises in TurnRD.forward().
+            hidden = outputs[0]
+        # Detach + ensure no autograd graph leaks into the no_grad path.
+        hidden = hidden.detach() if hidden.requires_grad else hidden
         del outputs
 
         # Mean-pool over L using the attention mask.

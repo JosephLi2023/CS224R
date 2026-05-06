@@ -58,6 +58,13 @@ def train_turnrd_run(
     # v8 Tier 1: contrastive aux loss knobs.
     lambda_contrastive: float = 0.1,
     contrastive_temperature: float = 0.1,
+    # Method D (Residual Decomposer): when init_gamma > 0, build a
+    # learnable `gamma_prior` scalar (init = init_gamma) and pass it to
+    # `train_turnrd`. The fitter then biases α with `gamma_prior ·
+    # progress` (per-turn raw_env_reward from the replay JSONL). When
+    # init_gamma <= 0 (default), the fitter behaves like Method B
+    # (no prior). Use a small POSITIVE value (e.g. 1.0) to enable.
+    init_gamma: float = 0.0,
     # The producer pre-embeds turns; the standalone trainer doesn't need
     # the LoRA policy. We DO need the embedding width D, which the
     # producer wrote into the replay (we read it off the first record).
@@ -111,6 +118,18 @@ def train_turnrd_run(
     if torch.cuda.is_available():
         model.to("cuda:0")
 
+    # Method D: when init_gamma > 0, build a learnable scalar Parameter
+    # and pass it to train_turnrd. The fitter then biases α with
+    # `gamma_prior * progress`. When init_gamma <= 0, gamma_prior=None
+    # and the fitter behaves like Method B.
+    gamma_prior: torch.nn.Parameter | None = None
+    if init_gamma > 0.0:
+        device_for_gamma = next(model.parameters()).device
+        gamma_prior = torch.nn.Parameter(
+            torch.tensor(float(init_gamma), dtype=torch.float32, device=device_for_gamma)
+        )
+        print(f">>> Method D enabled: init_gamma={init_gamma}")
+
     t0 = time.time()
     summary = train_turnrd(
         replay,
@@ -127,6 +146,7 @@ def train_turnrd_run(
         lambda_entropy=lambda_entropy,
         lambda_contrastive=lambda_contrastive,
         contrastive_temperature=contrastive_temperature,
+        gamma_prior=gamma_prior,
     )
     elapsed = round(time.time() - t0, 2)
     summary["elapsed_s"] = elapsed
@@ -157,6 +177,7 @@ def main(
     lambda_entropy: float = 0.01,
     lambda_contrastive: float = 0.1,
     contrastive_temperature: float = 0.1,
+    init_gamma: float = 0.0,
 ) -> None:
     import json as _json
 
@@ -181,6 +202,7 @@ def main(
             lambda_entropy=lambda_entropy,
             lambda_contrastive=lambda_contrastive,
             contrastive_temperature=contrastive_temperature,
+            init_gamma=init_gamma,
         ),
         indent=2,
         default=str,

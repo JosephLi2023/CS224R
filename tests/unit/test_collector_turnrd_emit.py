@@ -115,11 +115,19 @@ def test_emit_writes_one_jsonl_row_per_non_empty_trajectory(tmp_path: Path) -> N
     assert emit_path.is_file()
     rows = [json.loads(line) for line in emit_path.read_text().splitlines() if line.strip()]
     assert len(rows) == len(group.trajectories)  # K=3 non-empty
-    for row in rows:
+    for i, row in enumerate(rows):
         assert row["task_id"] == "42"
         assert isinstance(row["turn_embeds"], list) and len(row["turn_embeds"]) > 0
         assert all(len(turn) == INPUT_DIM for turn in row["turn_embeds"])
         assert row["judge_labels"] is None  # Mode 1: no judge_decomposer
+        # Method D: per-turn raw_env_reward must be emitted as `progress`
+        # so the standalone fitter can build the prior bias.
+        assert "progress" in row
+        T_i = len(group.trajectories[i].turns)
+        assert len(row["progress"]) == T_i
+        # Each progress value must equal the trajectory's raw_env_reward.
+        expected = [float(turn.raw_env_reward) for turn in group.trajectories[i].turns]
+        assert row["progress"] == pytest.approx(expected, abs=1e-6)
 
     # Round-trip: dataset reader loads what the producer wrote.
     ds = TurnRDReplayDataset(emit_path, mode=1)

@@ -20,7 +20,7 @@ class VLLMRunnerConfig:
     model_name: str = "Qwen/Qwen2.5-1.5B-Instruct"
     dtype: str = "bfloat16"
     max_model_len: int = 4096
-    gpu_memory_utilization: float = 0.50  # leave room for trainer model on the same GPU
+    gpu_memory_utilization: float = 0.20  # H2 v11: was 0.50 — vLLM was over-reserving KV cache (which it never returns), pushing steady-state past A100-80 cap. K=8 with max_tokens=48 doesn't need much KV; the orchestrator typically passes 0.20 explicitly anyway.
     seed: int = 0
     enforce_eager: bool = False
     download_dir: str | None = None  # HF download cache; align with LoRAPolicy.cache_dir

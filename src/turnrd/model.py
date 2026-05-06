@@ -189,7 +189,22 @@ class TurnRD(nn.Module):
         self,
         turn_embeds: torch.Tensor,
         attention_mask: torch.Tensor,
+        prior_bias: Optional[torch.Tensor] = None,
     ) -> TurnRDOutput:
+        """Forward pass.
+
+        Args:
+            turn_embeds: `[B, T, input_dim]` per-turn embeddings.
+            attention_mask: `[B, T]` long, 1 for real turns, 0 for padding.
+            prior_bias: optional `[B, T]` float additive bias on the
+                pre-softmax logits inside the [CLS] cross-attention
+                pool. Used by Method D (Residual Decomposer) to inject
+                a per-turn prior (e.g. `γ · raw_env_reward`) before
+                the α softmax. The bias is added to `Q·K^T / √d`
+                inside `nn.MultiheadAttention.attn_mask`, so larger
+                values make a turn more likely to receive credit.
+                When `None` the model behaves exactly like Method B.
+        """
         if turn_embeds.dim() != 3:
             raise ValueError(
                 f"forward: turn_embeds must be [B, T, input_dim], got shape "
@@ -210,6 +225,12 @@ class TurnRD(nn.Module):
                 f"forward: attention_mask shape {tuple(attention_mask.shape)} "
                 f"must equal turn_embeds [B, T] = ({B}, {T})."
             )
+        if prior_bias is not None:
+            if prior_bias.dim() != 2 or prior_bias.shape != (B, T):
+                raise ValueError(
+                    f"forward: prior_bias shape {tuple(prior_bias.shape)} "
+                    f"must equal turn_embeds [B, T] = ({B}, {T})."
+                )
         if T > self.cfg.max_turns:
             raise ValueError(
                 f"forward: T={T} exceeds cfg.max_turns={self.cfg.max_turns}; "
@@ -265,11 +286,41 @@ class TurnRD(nn.Module):
         #    - pooled: [B, 1, H]
         #    - attn:   [B, 1, T]   (averaged over heads via average_attn_weights=True)
         #    The softmax attention weights ARE α_t (proposal §3.2).
+        #
+        #    Method D: when `prior_bias` is supplied, we add it to the
+        #    pre-softmax logits via `attn_mask`. PyTorch's MHA expects
+        #    `attn_mask` shape `[B*n_heads, L=1, S=T]`; we broadcast the
+        #    same `[B, T]` bias across heads (no per-head differentiation).
+        #    The bias is added to `Q·K^T / √d` BEFORE the softmax, so
+        #    larger values make the corresponding turn more likely to
+        #    receive credit. The bias is cast to the model's compute
+        #    dtype (it may carry `gamma_prior` grad from upstream).
+        cls_attn_mask: Optional[torch.Tensor] = None
+        cls_key_padding_mask: torch.Tensor = key_padding_mask
+        if prior_bias is not None:
+            n_heads = self.cls_pool.num_heads
+            cls_attn_mask = (
+                prior_bias.to(dtype=h.dtype)
+                .unsqueeze(1)  # [B, 1, T]
+                .expand(B, n_heads, T)
+                .reshape(B * n_heads, 1, T)
+            )
+            # PyTorch ≥2.1 deprecates passing a bool key_padding_mask
+            # alongside a float attn_mask. Convert key_padding_mask to a
+            # float-additive form (0 for keep, -inf for block) so both
+            # masks share the same type. This is mathematically
+            # equivalent — the bool form was being canonicalized to
+            # exactly this internally.
+            cls_key_padding_mask = torch.zeros_like(
+                key_padding_mask, dtype=h.dtype
+            ).masked_fill(key_padding_mask, float("-inf"))
+
         pooled, attn = self.cls_pool(
             cls_q,
             h,
             h,
-            key_padding_mask=key_padding_mask,
+            key_padding_mask=cls_key_padding_mask,
+            attn_mask=cls_attn_mask,
             need_weights=True,
             average_attn_weights=True,
         )

@@ -132,6 +132,38 @@ def _build_turnrd_branch(
       ckpt_path: str | None           (refresh fn loads this when not None)
       max_turns: int (optional; defaults to 64 — matches `TurnRDConfig`)
     """
+    return _build_turnrd_or_residual_branch(cfg, trainer_cfg, policy, residual=False)
+
+
+def _build_residual_branch(
+    cfg: dict[str, Any],
+    trainer_cfg: HGPOTrainerConfig,
+    policy: "LoRAPolicy",
+) -> BuildResult:
+    """Method D (Residual Decomposer): same as Method B but wraps the
+    TurnRD model in a `ResidualDecomposer` that adds `gamma_prior ·
+    raw_env_reward` as a prior bias to the α softmax.
+
+    Reads `cfg["residual"]["init_gamma"]` (default 1.0) for the
+    learnable scalar's starting value.
+    """
+    return _build_turnrd_or_residual_branch(cfg, trainer_cfg, policy, residual=True)
+
+
+def _build_turnrd_or_residual_branch(
+    cfg: dict[str, Any],
+    trainer_cfg: HGPOTrainerConfig,
+    policy: "LoRAPolicy",
+    *,
+    residual: bool,
+) -> BuildResult:
+    """Shared implementation for Methods B (TurnRD) and D (Residual).
+
+    The two branches differ only in (a) which decomposer class wraps the
+    TurnRD model and (b) reading `cfg["residual"]["init_gamma"]` for D.
+    Everything else (model construction, embedder, refresh fn, producer
+    plumbing) is identical.
+    """
     turnrd_cfg = cfg.get("turnrd")
     if not isinstance(turnrd_cfg, dict):
         raise ValueError(
@@ -139,6 +171,7 @@ def _build_turnrd_branch(
             "top-level 'turnrd' config block."
         )
 
+    from src.algorithms.hgpo.decomposers.residual import ResidualDecomposer
     from src.algorithms.hgpo.decomposers.turnrd import TurnRDDecomposer
     from src.turnrd.embedders import policy_hidden_state_embedder
     from src.turnrd.model import TurnRD, TurnRDConfig
@@ -168,7 +201,14 @@ def _build_turnrd_branch(
         input_dim=input_dim,
     )
     embedder = policy_hidden_state_embedder(policy)
-    decomposer = TurnRDDecomposer(model=turnrd_model, embedder=embedder)
+    if residual:
+        residual_cfg = cfg.get("residual", {}) if isinstance(cfg.get("residual"), dict) else {}
+        init_gamma = float(residual_cfg.get("init_gamma", 1.0))
+        decomposer = ResidualDecomposer(
+            model=turnrd_model, embedder=embedder, init_gamma=init_gamma
+        )
+    else:
+        decomposer = TurnRDDecomposer(model=turnrd_model, embedder=embedder)
 
     # Refresh fn (None when no ckpt_path is configured — the trainer
     # then disables the hook even if cfg.refresh_every_episodes > 0,
@@ -288,6 +328,11 @@ def build_trainer_from_config(
                   exposes producer plumbing via the last 3 returns.
                   Requires `cfg["turnrd"]` block; for Mode 2,
                   additionally requires the `cfg["judge"]` block.
+    - "residual": Method D — same as "turnrd" but wraps the model in a
+                  `ResidualDecomposer` that adds `gamma_prior · raw_env_reward`
+                  as a prior bias on the α softmax. Reads
+                  `cfg["residual"]["init_gamma"]` (default 1.0) for
+                  the learnable scalar's initial value.
     """
     train_cfg = cfg.get("train", {}) or {}
     hgpo_cfg = cfg.get("hgpo", {}) or {}
@@ -334,7 +379,9 @@ def build_trainer_from_config(
         return _build_judge_branch(cfg, trainer_cfg, policy)
     if name == "turnrd":
         return _build_turnrd_branch(cfg, trainer_cfg, policy)
+    if name == "residual":
+        return _build_residual_branch(cfg, trainer_cfg, policy)
     raise ValueError(
         f"build_trainer_from_config: unknown hgpo.decomposer "
-        f"{name!r}; expected 'progress' | 'judge' | 'turnrd'."
+        f"{name!r}; expected 'progress' | 'judge' | 'turnrd' | 'residual'."
     )

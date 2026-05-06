@@ -76,6 +76,12 @@ def train_turnrd(
     # use to identify causal turns.
     lambda_contrastive: float = 0.1,
     contrastive_temperature: float = 0.1,
+    # Method D (Residual Decomposer): when not None, a learnable scalar
+    # `nn.Parameter` is multiplied with the per-turn `progress` signal
+    # and passed as `prior_bias` to the model. The optimizer also
+    # updates `gamma_prior` at the same `lr`. When None, the trainer
+    # behaves exactly like Method B (no prior).
+    gamma_prior: torch.nn.Parameter | None = None,
 ) -> dict[str, Any]:
     """Train TurnRD on a replay JSONL.
 
@@ -134,7 +140,19 @@ def train_turnrd(
         target_device = torch.device(device)
     model.to(target_device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=float(lr))
+    # Method D: include `gamma_prior` in the optimizer so its grad gets
+    # applied. `gamma_prior` lives on the residual decomposer (the
+    # caller); we move it to the model's device for compute consistency.
+    optim_params: list[torch.nn.Parameter] = list(model.parameters())
+    if gamma_prior is not None:
+        # Move to the model's device so the multiplication with `progress`
+        # (which lives on `target_device`) works without a device error.
+        if gamma_prior.device != target_device:
+            with torch.no_grad():
+                new_data = gamma_prior.data.to(target_device)
+            gamma_prior.data = new_data
+        optim_params.append(gamma_prior)
+    optimizer = torch.optim.AdamW(optim_params, lr=float(lr))
 
     initial_loss: float | None = None
     final_loss: float = float("nan")
@@ -149,7 +167,17 @@ def train_turnrd(
             final_reward = collated["final_reward"].to(target_device)
 
             optimizer.zero_grad(set_to_none=True)
-            out = model(turn_embeds, attention_mask)
+            # Method D: when gamma_prior is supplied AND the batch carries
+            # `progress` (per-turn raw_env_reward), build the prior bias
+            # tensor and pass it to the model. Backward-compat: when
+            # gamma_prior is None OR the batch lacks progress (legacy
+            # JSONL row), prior_bias=None and the model behaves exactly
+            # like Method B.
+            prior_bias: torch.Tensor | None = None
+            if gamma_prior is not None and "progress" in collated:
+                progress_t = collated["progress"].to(target_device)
+                prior_bias = gamma_prior * progress_t
+            out = model(turn_embeds, attention_mask, prior_bias=prior_bias)
             # Track component losses for the last batch's breakdown
             # (returned in the train_turnrd summary for diagnostics).
             cls_loss_v = 0.0
@@ -227,7 +255,16 @@ def train_turnrd(
     if ckpt_path is not None:
         ckpt_path = Path(ckpt_path)
         ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(model.state_dict(), ckpt_path)
+        # Method D: bundle gamma_prior with the model state_dict so the
+        # parent's `ResidualDecomposer.load_state_dict()` round-trips
+        # both. `ResidualDecomposer.load_state_dict()` pops the
+        # `gamma_prior` key before forwarding the rest to the model.
+        # `TurnRDDecomposer.load_state_dict()` sees no extra key
+        # (Method-B path is unchanged).
+        sd_to_save = dict(model.state_dict())
+        if gamma_prior is not None:
+            sd_to_save["gamma_prior"] = gamma_prior.detach().clone()
+        torch.save(sd_to_save, ckpt_path)
         saved_ckpt = str(ckpt_path)
 
     return {
@@ -247,4 +284,7 @@ def train_turnrd(
             "contrastive_temperature": float(contrastive_temperature),
             "gamma": float(gamma),
         },
+        "gamma_prior": (
+            float(gamma_prior.detach().item()) if gamma_prior is not None else None
+        ),
     }

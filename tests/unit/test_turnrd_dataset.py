@@ -223,3 +223,96 @@ def test_record_post_init_rejects_judge_label_length_mismatch() -> None:
             final_reward=0.0,
             judge_labels=[0.1],
         )
+
+
+# ---------------------------------------------------------------------------
+# Method D — `progress` field tests
+# ---------------------------------------------------------------------------
+
+
+def test_pad_collate_pads_progress_to_T_max() -> None:
+    """When all records have `progress`, pad_collate emits a [B, T_max]
+    `progress` tensor padded with 0.0 at masked positions."""
+    rec_a = TurnRDRecord(
+        task_id="a",
+        turn_embeds=[[1.0, 2.0]],
+        final_reward=0.5,
+        progress=[0.3],
+    )
+    rec_b = TurnRDRecord(
+        task_id="b",
+        turn_embeds=[[3.0, 4.0], [5.0, 6.0], [7.0, 8.0]],
+        final_reward=0.7,
+        progress=[0.1, 0.2, 0.4],
+    )
+
+    out = pad_collate([rec_a, rec_b])
+
+    assert "progress" in out
+    assert out["progress"].shape == (2, 3)
+    assert pytest.approx(out["progress"][0].tolist()) == [0.3, 0.0, 0.0]
+    assert pytest.approx(out["progress"][1].tolist()) == [0.1, 0.2, 0.4]
+
+
+def test_pad_collate_omits_progress_when_any_record_lacks_it() -> None:
+    """If at least one record has progress=None, pad_collate must NOT
+    emit a `progress` key (zeros would look like real env signal)."""
+    rec_a = TurnRDRecord(
+        task_id="a",
+        turn_embeds=[[1.0, 2.0]],
+        final_reward=0.5,
+        progress=[0.3],
+    )
+    rec_b = TurnRDRecord(
+        task_id="b",
+        turn_embeds=[[3.0, 4.0]],
+        final_reward=0.6,
+        progress=None,  # legacy row
+    )
+    out = pad_collate([rec_a, rec_b])
+    assert "progress" not in out
+
+
+def test_dataset_handles_records_without_progress_field(tmp_path: Path) -> None:
+    """Backward compat: legacy JSONL rows without `progress` field load
+    cleanly with `progress=None`."""
+    rows = [
+        {
+            "task_id": "legacy-a",
+            "turn_embeds": _embedding(2, 4, seed=10),
+            "final_reward": 0.5,
+            # NO progress, NO raw_env_rewards
+        },
+        {
+            "task_id": "new-b",
+            "turn_embeds": _embedding(3, 4, seed=11),
+            "final_reward": 0.7,
+            "progress": [0.1, 0.2, 0.4],
+        },
+        {
+            "task_id": "raw-c",
+            "turn_embeds": _embedding(2, 4, seed=12),
+            "final_reward": 0.3,
+            # producer wrote `raw_env_rewards` (alias accepted)
+            "raw_env_rewards": [0.0, 0.3],
+        },
+    ]
+    path = tmp_path / "mixed_progress.jsonl"
+    _write_jsonl(path, rows)
+    ds = TurnRDReplayDataset(path, mode=1)
+    assert len(ds) == 3
+    recs = list(ds)
+    assert recs[0].progress is None
+    assert recs[1].progress == [0.1, 0.2, 0.4]
+    assert recs[2].progress == [0.0, 0.3]
+
+
+def test_record_post_init_rejects_progress_length_mismatch() -> None:
+    """progress length must match T."""
+    with pytest.raises(ValueError, match=r"length"):
+        TurnRDRecord(
+            task_id="bad",
+            turn_embeds=[[1.0, 2.0], [3.0, 4.0]],
+            final_reward=0.0,
+            progress=[0.1],
+        )

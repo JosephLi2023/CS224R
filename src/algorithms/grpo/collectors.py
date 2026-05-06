@@ -349,11 +349,17 @@ class RolloutCollector:
                     judge_labels = None
                 # Round-trip through TurnRDRecord so producer-side schema
                 # bugs surface here, not at the next trainer launch.
+                # `progress` carries per-turn raw_env_reward — required by
+                # Method D (Residual Decomposer) as a prior bias on α.
+                # Always serialized so Method-D fitter runs against ANY
+                # replay file written by this producer.
+                progress = [float(turn.raw_env_reward) for turn in traj.turns]
                 rec = TurnRDRecord(
                     task_id=str(traj.task_id),
                     turn_embeds=turn_embeds,
                     final_reward=float(traj.final_reward),
                     judge_labels=judge_labels,
+                    progress=progress,
                 )
                 fh.write(json.dumps(asdict(rec)) + "\n")
                 fh.flush()
