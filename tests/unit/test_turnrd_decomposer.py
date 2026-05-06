@@ -399,3 +399,95 @@ def test_turnrd_decomposer_is_directly_callable() -> None:
     out_a = decomposer(group)
     out_b = decomposer.decompose(group)
     assert out_a == out_b
+
+
+# ---------------------------------------------------------------------------
+# TurnRDv2 compatibility — the adapter is architecture-agnostic and must
+# work for v2 with no behavior changes (same forward contract,
+# `cls_attn_weights` + `predicted_per_turn_R` populated by both).
+# ---------------------------------------------------------------------------
+
+
+def _make_v2_model(input_dim: int = INPUT_DIM, max_turns: int = 32):
+    """Construct a small TurnRDv2 with shapes matching the v1 test helper."""
+    from src.turnrd.model import TurnRDv2, TurnRDv2Config
+
+    torch.manual_seed(0)
+    cfg = TurnRDv2Config(
+        n_layers=2,
+        hidden_size=32,
+        n_heads=4,
+        max_turns=max_turns,
+        dropout=0.0,
+    )
+    return TurnRDv2(cfg, input_dim=input_dim)
+
+
+def test_turnrd_decomposer_works_with_turnrd_v2_decompose() -> None:
+    """`decompose(group)` returns the expected list-of-lists shape AND
+    the §3.2 invariant (`Σ_t r̂_t == R`) holds when the wrapped model
+    is `TurnRDv2`. Confirms the adapter is genuinely architecture-agnostic.
+    """
+    model = _make_v2_model()
+    embedder, _ = _deterministic_embedder()
+    decomposer = TurnRDDecomposer(model=model, embedder=embedder)
+
+    n_turns = [2, 3, 5]
+    rewards = [1.0, 0.5, -0.4]
+    group = _make_group(n_turns, rewards)
+
+    out = decomposer.decompose(group)
+    assert len(out) == len(rewards)
+    for i, (T_i, r) in enumerate(zip(n_turns, rewards)):
+        assert len(out[i]) == T_i
+        s = sum(out[i])
+        assert abs(s - r) < 1e-5, f"v2 row {i}: Σ r̂_t={s} != R={r}"
+
+
+def test_turnrd_decomposer_decompose_with_grad_works_with_turnrd_v2() -> None:
+    """`decompose_with_grad(group)` on TurnRDv2 returns the C3 dict
+    shape (`alpha`, `attention_mask`, `nonempty_indices`, `final_R`,
+    `value_per_turn`) AND `value_per_turn` is populated (v2 always
+    emits per-turn V from its score+value heads).
+
+    Backward through a position-weighted sum of α populates non-zero
+    grad on the v2 score head — this is the C3 path the trainer relies on.
+    """
+    model = _make_v2_model()
+    embedder, _ = _deterministic_embedder()
+    decomposer = TurnRDDecomposer(model=model, embedder=embedder)
+    model.train()  # the trainer sets train() before this; mimic it here
+
+    n_turns = [2, 3]
+    rewards = [1.0, 0.5]
+    group = _make_group(n_turns, rewards)
+    out = decomposer.decompose_with_grad(group)
+
+    # Shape contract.
+    assert out["alpha"].requires_grad
+    assert out["alpha"].shape == (2, 3)  # K_real=2, T_max=3
+    assert out["attention_mask"].shape == (2, 3)
+    assert out["nonempty_indices"] == [0, 1]
+    assert out["final_R"].shape == (2,)
+    # v2 always populates the value-head slot (unlike v1 which can have
+    # `value_head=False`). The trainer's v6 V-head baseline expects
+    # this for actor-critic-style advantage shaping.
+    assert out["value_per_turn"] is not None
+    assert out["value_per_turn"].shape == (2, 3)
+
+    # α rows still sum to 1 over the unmasked positions (softmax + mask).
+    fmask = out["attention_mask"].to(dtype=out["alpha"].dtype)
+    row_sums = (out["alpha"] * fmask).sum(dim=-1)
+    assert torch.allclose(row_sums, torch.ones(2, dtype=out["alpha"].dtype), atol=1e-5)
+
+    # Backward through a position-weighted α sum: non-zero grad on the
+    # score head's first linear (the v2 layer that controls α).
+    model.zero_grad(set_to_none=True)
+    weights = torch.arange(out["alpha"].shape[1], dtype=out["alpha"].dtype)
+    (out["alpha"] * weights).sum().backward()
+    score_grad = model.score_head[0].weight.grad
+    assert score_grad is not None
+    assert float(score_grad.detach().abs().sum()) > 0.0, (
+        "v2 score-head got zero grad through the C3 path — α isn't "
+        "actually being supervised."
+    )

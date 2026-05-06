@@ -132,6 +132,7 @@ def _build_turnrd_branch(
     producer plumbing.
 
     Reads cfg["turnrd"]:
+      version: "v1" | "v2" (default "v1") — selects architecture.
       mode: 1 | 2
       layers: int
       hidden_size: int
@@ -139,6 +140,7 @@ def _build_turnrd_branch(
       replay_buffer_path: str | None  (forwarded as turnrd_emit_path)
       ckpt_path: str | None           (refresh fn loads this when not None)
       max_turns: int (optional; defaults to 64 — matches `TurnRDConfig`)
+      progress_prior_strength: float  (v2 only; defaults to TurnRDv2Config default)
     """
     turnrd_cfg = cfg.get("turnrd")
     if not isinstance(turnrd_cfg, dict):
@@ -149,7 +151,7 @@ def _build_turnrd_branch(
 
     from src.algorithms.hgpo.decomposers.turnrd import TurnRDDecomposer
     from src.turnrd.embedders import policy_hidden_state_embedder
-    from src.turnrd.model import TurnRD, TurnRDConfig
+    from src.turnrd.model import TurnRD, TurnRDConfig, TurnRDv2, TurnRDv2Config
 
     # Read the policy's hidden size at runtime (1536 for Qwen2.5-1.5B).
     # We DO NOT trust a JSON-supplied input_dim — the policy is the
@@ -163,18 +165,48 @@ def _build_turnrd_branch(
             "TurnRD needs it to size input_proj."
         ) from e
 
-    turnrd_model = TurnRD(
-        TurnRDConfig(
-            n_layers=int(turnrd_cfg.get("layers", TurnRDConfig().n_layers)),
-            hidden_size=int(turnrd_cfg.get("hidden_size", TurnRDConfig().hidden_size)),
-            n_heads=int(turnrd_cfg.get("n_heads", TurnRDConfig().n_heads)),
-            max_turns=int(turnrd_cfg.get("max_turns", TurnRDConfig().max_turns)),
-            dropout=float(turnrd_cfg.get("dropout", TurnRDConfig().dropout)),
-            causal=bool(turnrd_cfg.get("causal", TurnRDConfig().causal)),
-            value_head=bool(turnrd_cfg.get("value_head", TurnRDConfig().value_head)),
-        ),
-        input_dim=input_dim,
-    )
+    version = str(turnrd_cfg.get("version", "v1")).lower()
+    if version not in ("v1", "v2"):
+        raise ValueError(
+            f"build_trainer_from_config: turnrd.version must be 'v1' or 'v2'; "
+            f"got {version!r}."
+        )
+
+    if version == "v2":
+        # v2 architecture: bidirectional encoder + per-turn score/value heads,
+        # progress-prior init bias. Reuses the same JSON keys for the encoder
+        # geometry (n_layers/hidden_size/n_heads/max_turns/dropout/causal) so
+        # configs can swap version with minimal churn.
+        v2_defaults = TurnRDv2Config()
+        turnrd_model: "TurnRD | TurnRDv2" = TurnRDv2(
+            TurnRDv2Config(
+                n_layers=int(turnrd_cfg.get("layers", v2_defaults.n_layers)),
+                hidden_size=int(turnrd_cfg.get("hidden_size", v2_defaults.hidden_size)),
+                n_heads=int(turnrd_cfg.get("n_heads", v2_defaults.n_heads)),
+                max_turns=int(turnrd_cfg.get("max_turns", v2_defaults.max_turns)),
+                dropout=float(turnrd_cfg.get("dropout", v2_defaults.dropout)),
+                causal=bool(turnrd_cfg.get("causal", v2_defaults.causal)),
+                progress_prior_strength=float(
+                    turnrd_cfg.get(
+                        "progress_prior_strength", v2_defaults.progress_prior_strength
+                    )
+                ),
+            ),
+            input_dim=input_dim,
+        )
+    else:
+        turnrd_model = TurnRD(
+            TurnRDConfig(
+                n_layers=int(turnrd_cfg.get("layers", TurnRDConfig().n_layers)),
+                hidden_size=int(turnrd_cfg.get("hidden_size", TurnRDConfig().hidden_size)),
+                n_heads=int(turnrd_cfg.get("n_heads", TurnRDConfig().n_heads)),
+                max_turns=int(turnrd_cfg.get("max_turns", TurnRDConfig().max_turns)),
+                dropout=float(turnrd_cfg.get("dropout", TurnRDConfig().dropout)),
+                causal=bool(turnrd_cfg.get("causal", TurnRDConfig().causal)),
+                value_head=bool(turnrd_cfg.get("value_head", TurnRDConfig().value_head)),
+            ),
+            input_dim=input_dim,
+        )
     embedder = policy_hidden_state_embedder(policy)
     decomposer = TurnRDDecomposer(model=turnrd_model, embedder=embedder)
 

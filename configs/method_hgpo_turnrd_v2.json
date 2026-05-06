@@ -1,0 +1,55 @@
+{
+  "run": {
+    "name": "method_b_v2",
+    "output_dir": "experiments/manifests",
+    "seed": 11
+  },
+  "train": {
+    "algorithm": "hgpo",
+    "total_episodes": 200,
+    "batch_size": 4,
+    "learning_rate": 1e-6,
+    "checkpoint_every": 50,
+    "eval_every": 25,
+    "K_trajectories_per_task": 4,
+    "kl_coeff": 0.04,
+    "clip_eps": 0.2,
+    "grad_accum_steps": 2,
+    "max_tokens_per_microbatch": 1024,
+    "gpu_mem_util": 0.20
+  },
+  "policy": {
+    "backbone": "Qwen2.5-1.5B-Instruct",
+    "lora": true,
+    "lora_target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+    "lora_rank": 16
+  },
+  "hgpo": {
+    "alpha": 0.5,
+    "lambda_consistency": 0.0,
+    "decomposer": "turnrd"
+  },
+  "turnrd": {
+    "version": "v2",
+    "mode": 1,
+    "layers": 2,
+    "hidden_size": 128,
+    "n_heads": 4,
+    "max_turns": 16,
+    "dropout": 0.1,
+    "causal": false,
+    "progress_prior_strength": 1.0,
+    "refresh_every_episodes": 10,
+    "turnrd_lr": 5e-4,
+    "lambda_value": 0.0,
+    "lambda_rank": 0.1,
+    "lambda_progress": 0.01,
+    "rank_margin": 0.1,
+    "replay_buffer_path": "/vol/cache/method_b_v2/replay.jsonl",
+    "ckpt_path": "/vol/cache/method_b_v2/ckpt.pt"
+  },
+  "logging": {
+    "print_every": 10
+  },
+  "_notes": "Method-B v2: TurnRDv2 (bidirectional encoder, identifiable Σα·v R-loss, progress-prior init, no CLS bottleneck). Apples-to-apples vs method_b_lean (5×40 eps, K=4, real WebShop) — only the turnrd block differs. Architecture: 2 layers × 128 hidden (smaller than v1's 6×384 because v2's per-turn heads don't need to push through a CLS bottleneck). Loss mix: loss_v2_pred + 0.1·loss_v2_rank + 0.01·loss_v2_progress_prior; lambda_value=0 until per-turn sibling-CF target lands. Cache paths redirected to /vol/cache/method_b_v2/ so v1 ckpts don't get loaded by mistake. Goal: confirm whether v2's sharper α concentration (validated synthetically) translates into a measurable RL win over method_b_lean (R≈0.10, success=0.265 baseline)."
+}

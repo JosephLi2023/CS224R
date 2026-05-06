@@ -225,6 +225,47 @@ def test_loader_unknown_decomposer_raises() -> None:
         build_trainer_from_config(cfg, policy=_StubPolicy())
 
 
+def test_loader_loads_method_hgpo_turnrd_v2_json(tmp_path: Path) -> None:
+    """End-to-end load of `configs/method_hgpo_turnrd_v2.json` — the
+    config that drives the Method-B v2 sweep. Must construct the
+    trainer + TurnRDDecomposer wrapping a TurnRDv2 model without
+    raising on any of the v2 keys."""
+    import json
+    import shutil
+
+    from src.algorithms.hgpo.decomposers.turnrd import TurnRDDecomposer
+    from src.turnrd.model import TurnRDv2
+
+    src_cfg = Path(__file__).resolve().parent.parent.parent / "configs" / "method_hgpo_turnrd_v2.json"
+    assert src_cfg.is_file(), f"v2 config missing: {src_cfg}"
+
+    # Copy to tmp so we can scrub `/vol/...` paths to local ones (the
+    # ckpt path's eager-startup load shouldn't fire on a missing file
+    # — refresh_fn just logs a warning — but pointing at a writable tmp
+    # location keeps the test hermetic).
+    dst = tmp_path / "v2.json"
+    shutil.copyfile(src_cfg, dst)
+    cfg = json.loads(dst.read_text())
+    cfg["turnrd"]["replay_buffer_path"] = str(tmp_path / "replay.jsonl")
+    cfg["turnrd"]["ckpt_path"] = str(tmp_path / "ckpt.pt")
+
+    trainer, refresh_fn, emit_path, embedder, judge_dec = build_trainer_from_config(
+        cfg, policy=_StubPolicy()
+    )
+    assert isinstance(trainer.decomposer, TurnRDDecomposer)
+    assert isinstance(trainer.decomposer.model, TurnRDv2), (
+        "method_hgpo_turnrd_v2.json must build TurnRDv2 (not v1)."
+    )
+    # Sanity: v2 cfg knobs round-tripped through the loader.
+    assert trainer.decomposer.model.cfg.causal is False
+    # ckpt_path is set ⇒ refresh_fn must be wired up (even if the ckpt
+    # itself doesn't exist yet — that's a no-op + warning, not an error).
+    assert refresh_fn is not None
+    assert emit_path == str(tmp_path / "replay.jsonl")
+    assert embedder is not None
+    assert judge_dec is None  # Mode 1
+
+
 # ---------------------------------------------------------------------------
 # Counterfactual (Method D) branch
 # ---------------------------------------------------------------------------

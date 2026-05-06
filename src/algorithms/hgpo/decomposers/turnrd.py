@@ -15,12 +15,18 @@ The §3.2 invariant `Σ_t r̂_t = R` per trajectory holds by construction
 
 from __future__ import annotations
 
-from typing import Any, Callable, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional, Union
 
 import torch
 
 from src.algorithms.grpo.rollout import Trajectory, TrajectoryGroup
-from src.turnrd.model import TurnRD
+from src.turnrd.model import TurnRD, TurnRDv2
+
+# Type alias for any TurnRD-shaped model accepted by the adapter.
+# Both `TurnRD` (v1) and `TurnRDv2` produce the same `TurnRDOutput`
+# surface (`cls_attn_weights` + `predicted_per_turn_R`), so the adapter
+# is architecture-agnostic. New v2 architectures should be added here.
+TurnRDLike = Union[TurnRD, TurnRDv2]
 
 
 # Embedder contract: per-trajectory callable returning a per-turn embedding
@@ -53,7 +59,7 @@ class TurnRDDecomposer:
 
     def __init__(
         self,
-        model: TurnRD,
+        model: TurnRDLike,
         embedder: TurnEmbedder,
         device: Optional[str] = None,
     ) -> None:
@@ -365,7 +371,7 @@ class TurnRDDecomposer:
 def build_turnrd_decomposer(
     cfg: dict[str, Any],
     *,
-    model: TurnRD,
+    model: TurnRDLike,
     embedder: TurnEmbedder,
     device: Optional[str] = None,
 ) -> "TurnRDDecomposer":

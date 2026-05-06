@@ -41,6 +41,9 @@ def train_turnrd_run(
     lr: float = 5e-4,
     ckpt_out: str = "",
     max_records: int = 0,
+    # Architecture selector. "v1" = legacy TurnRD; "v2" = TurnRDv2
+    # (bidirectional + identifiable R-loss + progress-prior init).
+    version: str = "v1",
     # TurnRD model knobs (defaults match TurnRDConfig + the existing
     # configs/method_hgpo_turnrd.json post-improvement values).
     layers: int = 6,
@@ -50,6 +53,8 @@ def train_turnrd_run(
     dropout: float = 0.1,
     causal: bool = True,
     value_head: bool = True,
+    # v2-only model knob (ignored when version="v1").
+    progress_prior_strength: float = 1.0,
     # Aux-loss knobs (Mode 1 only). lambda_value/gamma drive the
     # per-turn V-head loss; lambda_entropy is the negative-entropy reg.
     lambda_value: float = 0.5,
@@ -58,6 +63,10 @@ def train_turnrd_run(
     # v8 Tier 1: contrastive aux loss knobs.
     lambda_contrastive: float = 0.1,
     contrastive_temperature: float = 0.1,
+    # v2 loss-mix knobs (effective only when version="v2").
+    lambda_rank: float = 0.1,
+    lambda_progress: float = 0.01,
+    rank_margin: float = 0.1,
     # The producer pre-embeds turns; the standalone trainer doesn't need
     # the LoRA policy. We DO need the embedding width D, which the
     # producer wrote into the replay (we read it off the first record).
@@ -76,11 +85,14 @@ def train_turnrd_run(
     # volume.commit() before exiting).
     volume.reload()
 
-    from src.turnrd.model import TurnRD, TurnRDConfig
+    from src.turnrd.model import TurnRD, TurnRDConfig, TurnRDv2, TurnRDv2Config
     from src.turnrd.train import train_turnrd
 
     if mode not in (1, 2):
         raise ValueError(f"--mode must be 1 or 2; got {mode}")
+    version_norm = str(version).lower()
+    if version_norm not in ("v1", "v2"):
+        raise ValueError(f"--version must be 'v1' or 'v2'; got {version!r}")
 
     # Read the embedding width from the first record in the replay so
     # the model's input_proj is sized correctly without forcing the
@@ -96,18 +108,32 @@ def train_turnrd_run(
     print(f">>> Inferred input_dim={input_dim} from {replay}")
 
     torch.manual_seed(0)
-    model = TurnRD(
-        TurnRDConfig(
-            n_layers=layers,
-            hidden_size=hidden_size,
-            n_heads=n_heads,
-            max_turns=max_turns,
-            dropout=dropout,
-            causal=causal,
-            value_head=value_head,
-        ),
-        input_dim=input_dim,
-    )
+    if version_norm == "v2":
+        model: "TurnRD | TurnRDv2" = TurnRDv2(
+            TurnRDv2Config(
+                n_layers=layers,
+                hidden_size=hidden_size,
+                n_heads=n_heads,
+                max_turns=max_turns,
+                dropout=dropout,
+                causal=causal,
+                progress_prior_strength=progress_prior_strength,
+            ),
+            input_dim=input_dim,
+        )
+    else:
+        model = TurnRD(
+            TurnRDConfig(
+                n_layers=layers,
+                hidden_size=hidden_size,
+                n_heads=n_heads,
+                max_turns=max_turns,
+                dropout=dropout,
+                causal=causal,
+                value_head=value_head,
+            ),
+            input_dim=input_dim,
+        )
     if torch.cuda.is_available():
         model.to("cuda:0")
 
@@ -122,11 +148,15 @@ def train_turnrd_run(
         log_every=50,
         ckpt_path=(ckpt_out or None),
         max_records=(max_records or None),
+        version=version_norm,
         lambda_value=lambda_value,
         gamma=gamma,
         lambda_entropy=lambda_entropy,
         lambda_contrastive=lambda_contrastive,
         contrastive_temperature=contrastive_temperature,
+        lambda_rank=lambda_rank,
+        lambda_progress=lambda_progress,
+        rank_margin=rank_margin,
     )
     elapsed = round(time.time() - t0, 2)
     summary["elapsed_s"] = elapsed
@@ -145,6 +175,7 @@ def main(
     lr: float = 5e-4,
     ckpt_out: str = "",
     max_records: int = 0,
+    version: str = "v1",
     layers: int = 6,
     hidden_size: int = 384,
     n_heads: int = 4,
@@ -152,11 +183,15 @@ def main(
     dropout: float = 0.1,
     causal: bool = True,
     value_head: bool = True,
+    progress_prior_strength: float = 1.0,
     lambda_value: float = 0.5,
     gamma: float = 0.95,
     lambda_entropy: float = 0.01,
     lambda_contrastive: float = 0.1,
     contrastive_temperature: float = 0.1,
+    lambda_rank: float = 0.1,
+    lambda_progress: float = 0.01,
+    rank_margin: float = 0.1,
 ) -> None:
     import json as _json
 
@@ -169,6 +204,7 @@ def main(
             lr=lr,
             ckpt_out=ckpt_out,
             max_records=max_records,
+            version=version,
             layers=layers,
             hidden_size=hidden_size,
             n_heads=n_heads,
@@ -176,11 +212,15 @@ def main(
             dropout=dropout,
             causal=causal,
             value_head=value_head,
+            progress_prior_strength=progress_prior_strength,
             lambda_value=lambda_value,
             gamma=gamma,
             lambda_entropy=lambda_entropy,
             lambda_contrastive=lambda_contrastive,
             contrastive_temperature=contrastive_temperature,
+            lambda_rank=lambda_rank,
+            lambda_progress=lambda_progress,
+            rank_margin=rank_margin,
         ),
         indent=2,
         default=str,

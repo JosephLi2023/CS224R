@@ -27,10 +27,15 @@ import torch
 from src.turnrd.dataset import TurnRDRecord, TurnRDReplayDataset, pad_collate
 from src.turnrd.model import (
     TurnRD,
+    TurnRDv2,
     alpha_entropy,
     loss_contrastive,
     loss_mode_1,
     loss_mode_2,
+    loss_v2_pred,
+    loss_v2_progress_prior,
+    loss_v2_rank,
+    loss_v2_value,
     loss_value_head,
 )
 
@@ -55,7 +60,7 @@ def train_turnrd(
     replay_path: str | os.PathLike[str],
     mode: int,
     *,
-    model: TurnRD,
+    model: "TurnRD | TurnRDv2",
     n_epochs: int = 1,
     batch_size: int = 16,
     lr: float = 1e-4,
@@ -63,8 +68,15 @@ def train_turnrd(
     log_every: int = 50,
     ckpt_path: str | os.PathLike[str] | None = None,
     max_records: int | None = None,
-    # Post-WebShop-attempt aux losses (Mode 1 only — Mode 2 has direct
-    # judge-label supervision so doesn't need either).
+    # Architecture selector. "v1" runs the legacy
+    # `loss_mode_1 + value_head + entropy + contrastive` mix.
+    # "v2" runs the new
+    # `loss_v2_pred + λ_rank·loss_v2_rank + λ_progress·loss_v2_progress_prior`
+    # mix (Mode 2 is rejected for v2 — v2 doesn't have a mode-2
+    # distillation path in this prototype).
+    version: str = "v1",
+    # v1 Mode-1 aux losses (Mode 2 has direct judge-label supervision so
+    # doesn't need either).
     lambda_value: float = 0.5,
     gamma: float = 0.95,
     lambda_entropy: float = 0.01,
@@ -76,6 +88,10 @@ def train_turnrd(
     # use to identify causal turns.
     lambda_contrastive: float = 0.1,
     contrastive_temperature: float = 0.1,
+    # v2 loss-mix knobs (effective only when version=="v2").
+    lambda_rank: float = 0.1,
+    lambda_progress: float = 0.01,
+    rank_margin: float = 0.1,
 ) -> dict[str, Any]:
     """Train TurnRD on a replay JSONL.
 
@@ -112,6 +128,20 @@ def train_turnrd(
     """
     if mode not in (1, 2):
         raise ValueError(f"train_turnrd: mode must be 1 or 2; got {mode}.")
+    version_norm = str(version).lower()
+    if version_norm not in ("v1", "v2"):
+        raise ValueError(
+            f"train_turnrd: version must be 'v1' or 'v2'; got {version!r}."
+        )
+    if version_norm == "v2" and mode != 1:
+        # v2 has no mode-2 distillation path — its primary credit
+        # signal is the identifiable Σα·v R-prediction loss + ranking +
+        # progress prior. Reject mode=2 loudly so misconfigured runs
+        # don't silently fall back to v1 semantics.
+        raise ValueError(
+            "train_turnrd: version='v2' currently only supports mode=1; "
+            f"got mode={mode}."
+        )
     if n_epochs <= 0:
         raise ValueError(f"train_turnrd: n_epochs must be positive; got {n_epochs}.")
     if batch_size <= 0:
@@ -156,7 +186,40 @@ def train_turnrd(
             value_loss_v = 0.0
             entropy_v = 0.0
             contrast_loss_v = 0.0
-            if mode == 1:
+            # v2-specific component losses (default to 0 on the v1 path).
+            v2_pred_v = 0.0
+            v2_rank_v = 0.0
+            v2_progress_v = 0.0
+            if version_norm == "v2":
+                # v2 loss mix: identifiable R-prediction + within-batch
+                # ranking hinge + KL pull toward the progress prior.
+                # `lambda_value` reuses the existing kwarg; its target slot
+                # (sibling-CF / counterfactual per-turn deltas) hasn't
+                # landed yet, so the recommended sweep value is 0.0.
+                pred_loss = loss_v2_pred(out, final_reward)
+                rank_loss = loss_v2_rank(out, final_reward, margin=float(rank_margin))
+                progress_loss = loss_v2_progress_prior(out, attention_mask)
+                loss = (
+                    pred_loss
+                    + float(lambda_rank) * rank_loss
+                    + float(lambda_progress) * progress_loss
+                )
+                if float(lambda_value) != 0.0:
+                    # Until the per-turn target is wired (see plan),
+                    # supervise v_t against `final_reward / T_i` per row
+                    # as a sane fallback target. Callers passing
+                    # lambda_value=0 (the default sweep) skip this entirely.
+                    fmask = attention_mask.to(dtype=final_reward.dtype)
+                    T_i = fmask.sum(dim=-1, keepdim=True).clamp_min(1.0)
+                    target_v = (final_reward.unsqueeze(-1) / T_i) * fmask
+                    value_loss = loss_v2_value(out, target_v, attention_mask)
+                    loss = loss + float(lambda_value) * value_loss
+                    value_loss_v = float(value_loss.detach().item())
+                v2_pred_v = float(pred_loss.detach().item())
+                v2_rank_v = float(rank_loss.detach().item())
+                v2_progress_v = float(progress_loss.detach().item())
+                cls_loss_v = v2_pred_v  # report the headline R-loss in cls slot too
+            elif mode == 1:
                 cls_loss = loss_mode_1(out, final_reward)
                 # Aux per-turn value loss: trains V(h_t) to predict
                 # γ^(T-t-1)·R per real turn. Gives the encoder a
@@ -236,14 +299,21 @@ def train_turnrd(
         "n_steps": int(n_steps),
         "ckpt_path": saved_ckpt,
         "skipped_records": int(dataset.skipped_empty + dataset.skipped_missing_judge),
+        "version": version_norm,
         "final_loss_breakdown": {
             "cls_loss": cls_loss_v,
             "value_loss": value_loss_v,
             "alpha_entropy": entropy_v,
             "contrast_loss": contrast_loss_v,
+            "v2_pred_loss": v2_pred_v,
+            "v2_rank_loss": v2_rank_v,
+            "v2_progress_loss": v2_progress_v,
             "lambda_value": float(lambda_value),
             "lambda_entropy": float(lambda_entropy),
             "lambda_contrastive": float(lambda_contrastive),
+            "lambda_rank": float(lambda_rank),
+            "lambda_progress": float(lambda_progress),
+            "rank_margin": float(rank_margin),
             "contrastive_temperature": float(contrastive_temperature),
             "gamma": float(gamma),
         },

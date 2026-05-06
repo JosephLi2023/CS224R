@@ -358,6 +358,20 @@ def _preflight(cfg: OrchestrationConfig) -> None:
             "fn never reads. Align them before launching."
         )
 
+    # Architecture version consistency: the parent train_loop and the
+    # standalone fitter MUST construct the SAME `TurnRD` vs `TurnRDv2`
+    # class for the refresh-fn ckpt load to succeed (state_dict keys
+    # differ across architectures). Both sides read `version` from the
+    # JSON; we just defensively reject obviously-wrong values here so
+    # a typo doesn't silently flip back to v1 default.
+    cfg_version = turnrd_cfg.get("version", "v1")
+    if str(cfg_version).lower() not in ("v1", "v2"):
+        raise SystemExit(
+            f"ERROR: {cfg.config_path}::turnrd.version = {cfg_version!r}; "
+            "expected 'v1' or 'v2'. State-dict load between rounds "
+            "would silently break with a typo here."
+        )
+
     if cfg.rounds <= 0:
         raise SystemExit(f"ERROR: --rounds must be positive; got {cfg.rounds}.")
     if cfg.episodes_per_round <= 0:
@@ -573,16 +587,21 @@ def _train_turnrd_cmd(cfg: OrchestrationConfig) -> list[str]:
     # build_trainer_from_config built, otherwise refresh-fn ckpt load
     # will silently break (state_dict keys mismatch).
     for cli, jkey, default in [
+        ("--version", "version", None),
         ("--layers", "layers", None),
         ("--hidden-size", "hidden_size", None),
         ("--n-heads", "n_heads", None),
         ("--max-turns", "max_turns", None),
         ("--dropout", "dropout", None),
+        ("--progress-prior-strength", "progress_prior_strength", None),
         ("--lambda-value", "lambda_value", None),
         ("--gamma", "gamma", None),
         ("--lambda-entropy", "lambda_entropy", None),
         ("--lambda-contrastive", "lambda_contrastive", None),
         ("--contrastive-temperature", "contrastive_temperature", None),
+        ("--lambda-rank", "lambda_rank", None),
+        ("--lambda-progress", "lambda_progress", None),
+        ("--rank-margin", "rank_margin", None),
     ]:
         if jkey in turnrd_block:
             cmd.extend([cli, str(turnrd_block[jkey])])
