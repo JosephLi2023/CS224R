@@ -25,10 +25,10 @@
   "hgpo": {
     "alpha": 1.0,
     "lambda_consistency": 0.0,
-    "decomposer": "none"
+    "decomposer": "progress"
   },
   "logging": {
     "print_every": 10
   },
-  "_notes": "Flat GRPO baseline (alpha=1, lambda=0). Bit-exact regression target for the HGPO alpha=1 recovery test."
+  "_notes": "Flat GRPO baseline: alpha=1 with the progress decomposer drops all per-turn signal, leaving only the trajectory advantage (mathematically equivalent to flat GRPO). Bit-exact regression target for the HGPO alpha=1 recovery test."
 }

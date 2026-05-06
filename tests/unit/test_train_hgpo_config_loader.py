@@ -223,3 +223,97 @@ def test_loader_unknown_decomposer_raises() -> None:
     cfg = {"train": {}, "hgpo": {"decomposer": "bogus"}}
     with pytest.raises(ValueError, match=r"unknown hgpo\.decomposer"):
         build_trainer_from_config(cfg, policy=_StubPolicy())
+
+
+# ---------------------------------------------------------------------------
+# Counterfactual (Method D) branch
+# ---------------------------------------------------------------------------
+
+
+class _CFFakeRunner:
+    """Minimal vLLM-runner stub for the CF loader test."""
+
+    def generate_rich(self, prompts, sampling):
+        from dataclasses import dataclass
+
+        @dataclass
+        class _G:
+            text: str = "Action: noop"
+
+        n = getattr(sampling, "n", 1)
+        return [[_G() for _ in range(n)] for _ in prompts]
+
+
+def test_loader_builds_counterfactual_decomposer() -> None:
+    """Method D: returns a callable CounterFactualDecomposer + None for
+    the TurnRD-only producer plumbing slots (mirrors Methods A/C)."""
+    from src.algorithms.hgpo.decomposers.counterfactual import (
+        CounterFactualDecomposer,
+    )
+    from src.envs.fake_webshop import FakeWebShopEnv
+    from src.envs.prompts.react_webshop import (
+        parse_react_action,
+        render_webshop_turn_prompt,
+    )
+
+    cfg = {
+        "train": {"learning_rate": 1e-6, "clip_eps": 0.2},
+        "hgpo": {
+            "alpha": 0.5,
+            "lambda_consistency": 0.0,
+            "decomposer": "counterfactual",
+        },
+        "counterfactual": {
+            "n_alt_actions": 2,
+            "max_completion_turns": 1,
+            "n_turns_per_traj": 0,
+            "skip_if_zero_R": True,
+            "output_mode": "raw_delta",
+        },
+    }
+
+    class _SamplingFactory:
+        def __call__(self, **kwargs):
+            from dataclasses import make_dataclass
+
+            DC = make_dataclass(
+                "_S",
+                [(k, type(v), v) for k, v in kwargs.items()],
+            )
+            return DC(**kwargs)
+
+    trainer, refresh_fn, emit_path, embedder, judge_dec = build_trainer_from_config(
+        cfg,
+        policy=_StubPolicy(),
+        runner=_CFFakeRunner(),
+        env_factory=lambda: FakeWebShopEnv(max_steps=8),
+        prompt_renderer=render_webshop_turn_prompt,
+        action_parser=parse_react_action,
+        sampling_factory=_SamplingFactory(),
+    )
+    assert isinstance(trainer, HGPOTrainer)
+    assert isinstance(trainer.decomposer, CounterFactualDecomposer)
+    assert refresh_fn is None
+    assert emit_path is None
+    assert embedder is None
+    assert judge_dec is None
+    assert trainer.cfg.alpha == 0.5
+    assert trainer.cfg.lambda_consistency == 0.0
+    # CF read its own block correctly.
+    assert trainer.decomposer.n_alt == 2
+    assert trainer.decomposer.max_completion == 1
+    assert trainer.decomposer.skip_if_zero_R is True
+    assert trainer.decomposer.output_mode == "raw_delta"
+
+
+def test_loader_counterfactual_branch_requires_runner_deps() -> None:
+    """Missing runner / env_factory / etc. ⇒ loader raises with a clear
+    diagnostic so the orchestrator surfaces the wiring bug at startup,
+    not at the first decompose() call."""
+    cfg = {
+        "train": {},
+        "hgpo": {"decomposer": "counterfactual"},
+        "counterfactual": {},
+    }
+    with pytest.raises(ValueError, match=r"counterfactual"):
+        build_trainer_from_config(cfg, policy=_StubPolicy())

@@ -9,8 +9,9 @@ Method B.
 This is a thin loader — all heavy lifting (decomposer construction,
 TurnRD model init, embedder factory, judge backend wiring) is delegated
 to the factories that already exist in
-`src.algorithms.hgpo.decomposers.{__init__, base, judge, turnrd}`,
-`src.judge.backend::build_judge`, `src.turnrd.{model, embedders}`.
+`src.algorithms.hgpo.decomposers.{__init__, base, judge, turnrd,
+counterfactual}`, `src.judge.backend::build_judge`,
+`src.turnrd.{model, embedders}`.
 
 torch is imported at module top because `TurnRD` instantiation requires
 it. Mac-side tests gate via `pytest.importorskip("torch")`.
@@ -33,6 +34,13 @@ from src.algorithms.grpo.trainer import (
 
 if TYPE_CHECKING:
     from src.algorithms.hgpo.decomposers.base import TurnRewardDecomposer
+    from src.algorithms.hgpo.decomposers.counterfactual import (
+        ActionParser,
+        EnvFactory,
+        PromptRenderer,
+        SamplingFactory,
+        _RunnerLike,
+    )
     from src.algorithms.hgpo.decomposers.turnrd import TurnEmbedder, TurnRDDecomposer
     from src.policy.lora_policy import LoRAPolicy
 
@@ -282,26 +290,108 @@ def _build_turnrd_branch(
     )
 
 
+def _build_counterfactual_branch(
+    cfg: dict[str, Any],
+    trainer_cfg: HGPOTrainerConfig,
+    policy: "LoRAPolicy",
+    *,
+    runner: Optional["_RunnerLike"],
+    env_factory: Optional["EnvFactory"],
+    prompt_renderer: Optional["PromptRenderer"],
+    action_parser: Optional["ActionParser"],
+    sampling_factory: Optional["SamplingFactory"],
+) -> BuildResult:
+    """Method D: counterfactual-rollout decomposer.
+
+    Reuses the SAME runner the rollout collector drives so we don't pay
+    a second vLLM init. The env factory must be the SAME function the
+    collector uses (it's already shared in `app_train_loop.py` —
+    `env_factory = lambda: WebShopAdapter(...)`); the CF decomposer
+    builds its own env pool from it for the replay rollouts.
+
+    Reads `cfg["counterfactual"]` (forwarded to
+    `build_counterfactual_decomposer`):
+      n_alt_actions: int       (default 2)
+      max_completion_turns: int (default 3)
+      cf_temperature: float    (default 1.0)
+      completion_temperature: float (default 0.0)
+      cf_max_tokens: int       (default 48)
+      n_turns_per_traj: int    (default 0 = all turns)
+      skip_if_zero_R: bool     (default True)
+      output_mode: "raw_delta" | "normalized" (default "raw_delta")
+      seed: int                (default 0)
+    """
+    if (
+        runner is None
+        or env_factory is None
+        or prompt_renderer is None
+        or action_parser is None
+        or sampling_factory is None
+    ):
+        raise ValueError(
+            "build_trainer_from_config(decomposer='counterfactual'): all of "
+            "`runner`, `env_factory`, `prompt_renderer`, `action_parser`, and "
+            "`sampling_factory` must be provided. The rollout collector's "
+            "deps must be threaded through to the trainer builder when using "
+            "the CF decomposer."
+        )
+
+    from src.algorithms.hgpo.decomposers.counterfactual import (
+        build_counterfactual_decomposer,
+    )
+
+    cf_decomposer = build_counterfactual_decomposer(
+        cfg,
+        runner=runner,
+        env_factory=env_factory,
+        prompt_renderer=prompt_renderer,
+        action_parser=action_parser,
+        sampling_factory=sampling_factory,
+    )
+    trainer = HGPOTrainer(
+        policy=policy,
+        decomposer=cf_decomposer,  # __call__ → .decompose
+        cfg=trainer_cfg,
+    )
+    # Method D doesn't need TurnRD producer plumbing; mirror Methods A/C.
+    return trainer, None, None, None, None
+
+
 def build_trainer_from_config(
     cfg: dict[str, Any],
     *,
     policy: "LoRAPolicy",
+    # Optional CF-only deps — passed through from `app_train_loop.py`
+    # only when `cfg["hgpo"]["decomposer"] == "counterfactual"`. Methods
+    # A/B/C ignore these.
+    runner: Optional["_RunnerLike"] = None,
+    env_factory: Optional["EnvFactory"] = None,
+    prompt_renderer: Optional["PromptRenderer"] = None,
+    action_parser: Optional["ActionParser"] = None,
+    sampling_factory: Optional["SamplingFactory"] = None,
 ) -> BuildResult:
     """Build the H-GRPO trainer + producer plumbing from a method config.
 
     Returns `(trainer, refresh_fn, turnrd_emit_path, turnrd_embedder,
-    judge_decomposer)`. For Methods A/C the last four are `None`.
+    judge_decomposer)`. For Methods A/C/D the last four are `None`.
 
     Reads `cfg["hgpo"]["decomposer"]`:
-    - "progress": `progress_decomposer`, no refresh fn, no producer.
-    - "judge":    `JudgeDecomposer(backend=build_judge(cfg), ...)`.
-                  Requires `cfg["judge"]["cache"]["path"]`.
-    - "turnrd":   `TurnRDDecomposer(model=TurnRD(...), embedder=
-                  policy_hidden_state_embedder(policy))`. Builds a
-                  refresh fn from `cfg["turnrd"]["ckpt_path"]` when set;
-                  exposes producer plumbing via the last 3 returns.
-                  Requires `cfg["turnrd"]` block; for Mode 2,
-                  additionally requires the `cfg["judge"]` block.
+    - "progress":      `progress_decomposer`, no refresh fn, no producer.
+    - "judge":         `JudgeDecomposer(backend=build_judge(cfg), ...)`.
+                       Requires `cfg["judge"]["cache"]["path"]`.
+    - "turnrd":        `TurnRDDecomposer(model=TurnRD(...), embedder=
+                       policy_hidden_state_embedder(policy))`. Builds a
+                       refresh fn from `cfg["turnrd"]["ckpt_path"]` when set;
+                       exposes producer plumbing via the last 3 returns.
+                       Requires `cfg["turnrd"]` block; for Mode 2,
+                       additionally requires the `cfg["judge"]` block.
+    - "counterfactual": `CounterFactualDecomposer(runner, env_factory, ...)`.
+                       Requires the caller to thread `runner` + `env_factory`
+                       + `prompt_renderer` + `action_parser` +
+                       `sampling_factory` through the kwargs since the CF
+                       decomposer drives short alt rollouts on the same
+                       runner the collector uses. See
+                       `src/algorithms/hgpo/decomposers/counterfactual.py`.
     """
     train_cfg = cfg.get("train", {}) or {}
     hgpo_cfg = cfg.get("hgpo", {}) or {}
@@ -348,7 +438,18 @@ def build_trainer_from_config(
         return _build_judge_branch(cfg, trainer_cfg, policy)
     if name == "turnrd":
         return _build_turnrd_branch(cfg, trainer_cfg, policy)
+    if name == "counterfactual":
+        return _build_counterfactual_branch(
+            cfg,
+            trainer_cfg,
+            policy,
+            runner=runner,
+            env_factory=env_factory,
+            prompt_renderer=prompt_renderer,
+            action_parser=action_parser,
+            sampling_factory=sampling_factory,
+        )
     raise ValueError(
         f"build_trainer_from_config: unknown hgpo.decomposer "
-        f"{name!r}; expected 'progress' | 'judge' | 'turnrd'."
+        f"{name!r}; expected 'progress' | 'judge' | 'turnrd' | 'counterfactual'."
     )

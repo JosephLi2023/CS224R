@@ -18,6 +18,13 @@ from src.judge.cache import JudgeCache
 if TYPE_CHECKING:
     import torch
 
+    from src.algorithms.hgpo.decomposers.counterfactual import (
+        ActionParser,
+        EnvFactory,
+        PromptRenderer,
+        SamplingFactory,
+        _RunnerLike,
+    )
     from src.turnrd.model import TurnRD
 
 
@@ -44,20 +51,33 @@ def build_decomposer(
     model: "TurnRD | None" = None,
     embedder: Optional[Callable[..., "torch.Tensor"]] = None,
     device: str | None = None,
+    runner: Optional["_RunnerLike"] = None,
+    env_factory: Optional["EnvFactory"] = None,
+    prompt_renderer: Optional["PromptRenderer"] = None,
+    action_parser: Optional["ActionParser"] = None,
+    sampling_factory: Optional["SamplingFactory"] = None,
 ) -> PerTurnDecomposer:
     """Dispatch to the decomposer named in `cfg["hgpo"]["decomposer"]`.
 
-    - "progress": returns the existing `progress_decomposer` callable
+    - "progress":      returns the existing `progress_decomposer` callable
       (re-exported from `src.algorithms.grpo.trainer`).
-    - "judge":    requires `backend` + `cache`; returns a callable wrapping
+    - "judge":         requires `backend` + `cache`; returns a callable wrapping
       `JudgeDecomposer.decompose`.
-    - "turnrd":   requires `model` (a `TurnRD` nn.Module) + `embedder` (a
+    - "turnrd":        requires `model` (a `TurnRD` nn.Module) + `embedder` (a
       `Callable[[Trajectory], torch.Tensor]` returning per-turn embeddings of
       shape `[T_i, D]`); returns a callable wrapping
       `TurnRDDecomposer.decompose`. HGPOTrainer integration + refresh hook
       lands Day 14 — today's surface is the model + adapter + tests only
       (see `MEDIUM_FIXES.md::M1` and the
       `~/.llms/plans/cs224r_hgpo_method_b_turnrd_m1.plan.md` plan).
+    - "counterfactual": requires `runner`, `env_factory`, `prompt_renderer`,
+      `action_parser`, and `sampling_factory`. Returns a
+      `CounterFactualDecomposer` instance whose `__call__` matches the
+      `PerTurnDecomposer` contract — re-samples N alternative actions per
+      turn from the policy, completes a short greedy rollout, and emits
+      `r̂_t = R − R_baseline_t`. See
+      `src/algorithms/hgpo/decomposers/counterfactual.py` for the full
+      design + cost rationale.
 
     Returns a callable matching the `PerTurnDecomposer` signature so the
     trainer can plug it in directly.
@@ -90,6 +110,32 @@ def build_decomposer(
         from src.algorithms.hgpo.decomposers.turnrd import build_turnrd_decomposer
 
         return build_turnrd_decomposer(cfg, model=model, embedder=embedder, device=device)
+    if name == "counterfactual":
+        if (
+            runner is None
+            or env_factory is None
+            or prompt_renderer is None
+            or action_parser is None
+            or sampling_factory is None
+        ):
+            raise ValueError(
+                "build_decomposer(decomposer='counterfactual'): all of "
+                "`runner`, `env_factory`, `prompt_renderer`, `action_parser`, "
+                "and `sampling_factory` must be provided."
+            )
+        from src.algorithms.hgpo.decomposers.counterfactual import (
+            build_counterfactual_decomposer,
+        )
+
+        return build_counterfactual_decomposer(
+            cfg,
+            runner=runner,
+            env_factory=env_factory,
+            prompt_renderer=prompt_renderer,
+            action_parser=action_parser,
+            sampling_factory=sampling_factory,
+        )
     raise ValueError(
-        f"Unknown decomposer name {name!r}; expected 'progress' | 'judge' | 'turnrd'."
+        f"Unknown decomposer name {name!r}; expected 'progress' | 'judge' | "
+        "'turnrd' | 'counterfactual'."
     )

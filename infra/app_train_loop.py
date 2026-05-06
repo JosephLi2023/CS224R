@@ -154,13 +154,26 @@ def train_loop_smoke(
     if cfg_dict is not None:
         from src.trainers.train_hgpo import build_trainer_from_config
 
+        # Method D (counterfactual) needs the runner + env_factory +
+        # prompt_renderer + action_parser + sampling_factory threaded
+        # through so the CF decomposer can drive its own short alt
+        # rollouts on the SAME vLLM runner. Methods A/B/C ignore these
+        # kwargs; the loader validates them only on the CF branch.
         (
             trainer,
             _refresh_fn,
             turnrd_emit_path,
             turnrd_embedder,
             judge_decomposer,
-        ) = build_trainer_from_config(cfg_dict, policy=policy)
+        ) = build_trainer_from_config(
+            cfg_dict,
+            policy=policy,
+            runner=runner,
+            env_factory=env_factory,
+            prompt_renderer=render_webshop_turn_prompt,
+            action_parser=parse_react_action,
+            sampling_factory=SamplingParams,
+        )
         # v6 BUG 2 fix plumbing: tell the trainer which round we're in
         # so the V-baseline annealing schedule can compute β.
         trainer.cfg.v_baseline_round_idx = int(round_idx)
