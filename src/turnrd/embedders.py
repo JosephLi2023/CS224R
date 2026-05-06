@@ -109,34 +109,39 @@ def policy_hidden_state_embedder(
         model.eval()
         try:
             with torch.no_grad():
-                # v10 OOM fix: revert v6's `output_hidden_states=True`.
-                # Setting it forced HF to materialize all 29 Qwen-1.5B
-                # hidden-state layers in the output object (~46 MB per
-                # turn × T turns × K trajectories per group), pushing
-                # the GPU past the 79 GiB cap and triggering systematic
-                # OOM in v6/v8/v9 (~all training episodes failed). With
-                # the default (False) only the final layer's hidden
-                # state is kept (~28× memory reduction). The v6
-                # multi-layer-pool ablation is shelved until we have
-                # bandwidth to fit it under a tighter memory budget.
+                # We need `output_hidden_states=True` because for
+                # AutoModelForCausalLM (the production policy model),
+                # the bare `outputs.last_hidden_state` field doesn't
+                # exist — `outputs[0]` is the LM-head logits
+                # (vocab_size 151936 for Qwen-1.5B), and consuming
+                # those as a hidden state immediately fails downstream
+                # (`forward: turn_embeds last dim 151936 != 1536`).
+                # `output_hidden_states=True` adds a transient ~2 GB
+                # tuple of all 29 layers; we extract layer [-1] and
+                # immediately drop the rest so the allocator can
+                # release the memory before PPO backward runs. This
+                # is the v10b fix: keep the structural behaviour the
+                # production model expects, but avoid v6's mistake of
+                # KEEPING all 29 layers alive in `outputs.hidden_states`
+                # for the multi-layer pool.
                 outputs = model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
+                    output_hidden_states=True,
                 )
         finally:
             if was_training:
                 model.train()
 
-        # Use the final hidden state directly. Most HF causal LMs expose
-        # this as `outputs.hidden_states[-1]` when output_hidden_states
-        # is True; with it False we read `outputs.last_hidden_state` if
-        # present, falling back to `outputs[0]` for broader compat.
-        if getattr(outputs, "last_hidden_state", None) is not None:
-            hidden = outputs.last_hidden_state  # [T, L, D]
-        elif getattr(outputs, "hidden_states", None) is not None:
-            hidden = outputs.hidden_states[-1]  # [T, L, D]
-        else:
-            hidden = outputs[0]  # [T, L, D]
+        # Last-layer hidden state only. v6's multi-layer ablation is
+        # shelved (it kept all 29 layers in memory and OOM'd at K=8).
+        # Clone the slice so we can drop the layer tuple BEFORE the
+        # next allocation; without the clone, the .hidden_states[-1]
+        # view holds a reference to the full 29-layer tuple.
+        hidden = outputs.hidden_states[-1].clone()  # [T, L, D]
+        # Explicitly drop the remaining 28 layers + the output object
+        # so the CUDA allocator can reuse the ~2 GB before backward.
+        del outputs
 
         # Mean-pool over L using the attention mask.
         # mask: [T, L] long → cast to hidden's dtype for the multiply.

@@ -230,3 +230,88 @@ def test_embedder_rejects_empty_trajectory() -> None:
     )
     with pytest.raises(ValueError, match=r"no turns"):
         embed(empty)
+
+
+def test_v10b_embedder_uses_hidden_states_not_logits_for_causal_lm() -> None:
+    """v10b regression: the embedder must NOT silently consume LM-head
+    logits as if they were hidden states.
+
+    Background: v10's first attempt removed ``output_hidden_states=True``
+    and tried to read ``outputs.last_hidden_state`` (then fell back to
+    ``outputs[0]``). For HF ``AutoModelForCausalLM`` (the production
+    policy model), ``outputs.last_hidden_state`` does NOT exist, and
+    ``outputs[0]`` is the LM-head logits ([T, L, vocab_size=151936] for
+    Qwen-1.5B). The embedder happily mean-pooled the logits and returned
+    a [T, 151936] tensor, which then crashed inside the TurnRD model with
+    ``forward: turn_embeds last dim 151936 != configured input_dim 1536``.
+    Every TurnRD episode failed.
+
+    This test simulates a CausalLM-shaped model: ``outputs.logits`` is
+    populated (vocab_size 100), ``outputs.hidden_states`` is the proper
+    [T, L, hidden_size=8] tuple, and ``outputs[0]`` aliases logits (the
+    real HF ``CausalLMOutputWithPast`` ordering when ``loss`` is None).
+    The embedder must return a tensor whose last dim is the
+    HIDDEN_SIZE (8), not the VOCAB_SIZE (100).
+    """
+
+    @dataclass
+    class _CausalLMOutput:
+        logits: "torch.Tensor"
+        hidden_states: tuple
+
+        # Mimic HF's tuple-style indexing: outputs[0] = logits when loss
+        # is None. This is exactly what tripped v10's first attempt up.
+        def __getitem__(self, idx):
+            if idx == 0:
+                return self.logits
+            raise IndexError(idx)
+
+        # Note deliberately NO `last_hidden_state` field — that's only on
+        # AutoModel, never on AutoModelForCausalLM.
+
+    class _CausalLMStubModel(_StubModel):
+        VOCAB_SIZE = 100  # would be 151936 in production
+
+        def __init__(self, hidden_size: int = 8) -> None:
+            super().__init__(hidden_size=hidden_size)
+            self._vocab = self.VOCAB_SIZE
+
+        def __call__(
+            self,
+            input_ids: "torch.Tensor",
+            attention_mask: "torch.Tensor" | None = None,
+            output_hidden_states: bool = False,
+            **_: Any,
+        ) -> _CausalLMOutput:
+            T, L = input_ids.shape
+            ids = input_ids.to(dtype=self._dtype)
+            positions = torch.arange(L, dtype=self._dtype).unsqueeze(0)
+            base = (ids + positions * 0.01) * 0.1
+            feat_ramp = torch.arange(self.hidden_size, dtype=self._dtype)
+            hidden = base.unsqueeze(-1) + feat_ramp  # [T, L, D]
+            # Logits are independently shaped [T, L, vocab_size]. Filled
+            # with arange so any accidental "use logits as hidden" path
+            # would produce a tensor whose last dim != hidden_size.
+            logits = torch.arange(
+                T * L * self._vocab, dtype=self._dtype
+            ).view(T, L, self._vocab)
+            return _CausalLMOutput(
+                logits=logits,
+                hidden_states=(hidden, hidden),
+            )
+
+    HIDDEN = 8
+    policy = _StubPolicy(
+        tokenizer=_StubTokenizer(),
+        model=_CausalLMStubModel(hidden_size=HIDDEN),
+    )
+    embed = policy_hidden_state_embedder(policy)
+    out = embed(_traj("task", n_turns=3))
+    # Bug regression: would have been (3, 100) if embedder consumed
+    # outputs[0] (logits) instead of outputs.hidden_states[-1].
+    assert out.shape == (3, HIDDEN), (
+        f"embedder consumed wrong tensor: got shape {tuple(out.shape)}, "
+        f"expected (3, {HIDDEN}). The last dim {out.shape[-1]} matches "
+        f"vocab_size ({_CausalLMStubModel.VOCAB_SIZE}) ⇒ embedder is "
+        "reading LM-head logits, not hidden states."
+    )
