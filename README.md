@@ -29,7 +29,8 @@ src/policy/                     LoRAPolicy, VLLMRunner, weight sync
 src/turnrd/                     TurnRD model + dataset + embedder + standalone trainer
 src/judge/                      Judge backends + cache
 src/envs/                       WebShop + ALFWorld adapters
-infra/                          Modal apps (train_loop, train_turnrd, eval, image, common)
+src/datasets/                   sft_webshop / sft_alfworld loaders
+infra/                          Modal apps (install, sft_train, train_loop, train_turnrd, eval)
 scripts/                        Orchestrators + aggregators + plotters
 tests/                          Unit + smoke + integration tests
 docs/                           User-facing guides
@@ -54,22 +55,189 @@ modal token current        # sanity check
 
 # 3. CPU smoke — first run will build the Modal image (~10 min, cached forever)
 modal run infra/app_train.py::hello
-
-# 4. (Only if running LLMJudge) provision the OpenAI secret on Modal
-modal secret create openai-secret OPENAI_API_KEY=sk-...
 ```
 
 Full walkthrough with troubleshooting: `docs/MODAL_SETUP.md`.
 
-**Shared resources** (already provisioned on the team's Modal workspace):
+### 1.4 OpenAI API key (only required for `LLMJudge`)
 
-| Resource | Path / name |
-|---|---|
-| Modal Volume | `cs224r-hgpo-vol` (mounted at `/vol/` inside every Modal function) |
-| WebShop SFT adapter | `/vol/checkpoints/sft_v3_20260504_154752` |
-| ALFWorld SFT adapter | `/vol/checkpoints/sft_alfworld_v1_<ts>` (ask Joseph for current ts) |
-| Replay/ckpt cache | `/vol/cache/<MethodName>/{replay.jsonl,ckpt.pt}` |
-| Per-run logs | `/vol/manifests/<run_name>_<ts>/train_log.json` |
+The `LLMJudge` method calls **OpenAI gpt-4o-mini** as the per-turn
+reward model. The key reaches the Modal container as a Modal Secret
+named `openai-secret` (env var `OPENAI_API_KEY`). The other 5 methods
+do **not** need a key — you can skip this section unless your task
+list includes `LLMJudge`.
+
+**Cost expectation**: a full 5×40 LLMJudge run makes ~4800 judge
+calls. With gpt-4o-mini at $0.15 / $0.60 per 1M input/output tokens
+and ~500 input + 50 output tokens per call, total **~$0.50 per run**
+on top of the ~$30 Modal A100 cost. Calls are cached in
+`/vol/cache/judge.sqlite` so repeat episodes are free.
+
+**Step 1 — Check whether the secret is already provisioned** (it's
+shared across the workspace; you may not need to add anything):
+
+```bash
+modal secret list
+# Expected if already set:
+#   ┃ Name          ┃ Created at           ┃ Created by ┃ Last used at  ┃
+#   │ openai-secret │ 2026-05-04 10:34 PDT │ <teammate> │ <recent>      │
+```
+
+If `openai-secret` is present, **skip to Step 4 (verify)**. Otherwise
+continue.
+
+**Step 2 — Get an OpenAI API key**
+
+1. Go to <https://platform.openai.com/api-keys> (sign in / create an
+   account if you don't have one).
+2. Click **"Create new secret key"**, scope it to `gpt-4o-mini` (or
+   leave it unrestricted for personal accounts).
+3. **Copy the `sk-...` value immediately** — OpenAI shows it only once.
+4. Make sure your account has a payment method on file
+   (<https://platform.openai.com/account/billing>) — gpt-4o-mini is
+   pay-as-you-go and will fail at first call without billing
+   configured. ~$5 of credit is more than enough for the bake-off.
+
+**Step 3 — Provision the secret on Modal**
+
+```bash
+# The secret name MUST be `openai-secret` and the payload key MUST
+# be `OPENAI_API_KEY` — both are hardcoded in
+# `infra/common.py::OPENAI_SECRET_NAME` and
+# `infra/common.py::OPENAI_SECRET_REQUIRED_KEYS`.
+modal secret create openai-secret OPENAI_API_KEY=sk-proj-xxxxxxxx...
+
+# Verify it landed
+modal secret list | grep openai-secret
+```
+
+**Step 4 — Verify the key reaches a Modal container**
+
+The provided probe function reads `OPENAI_API_KEY` from the container
+env and reports whether it's set:
+
+```bash
+modal run infra/app_train.py::env_probe
+# Expected to print (among other keys):
+#   'openai_api_key_present': True
+```
+
+If `False`, the most common causes are:
+- The secret is named something other than `openai-secret` (Modal is
+  case-sensitive).
+- The payload key is `OPENAI_KEY` instead of `OPENAI_API_KEY`. Recreate
+  the secret: `modal secret create openai-secret OPENAI_API_KEY=sk-...`.
+- You set `CS224R_SKIP_OPENAI_SECRET=1` in your shell — `unset` it.
+
+**Step 5 — (Optional) Opt out if you're only running non-LLMJudge methods**
+
+If you're not running `LLMJudge` and don't want to provision the
+secret, opt out of the secret attachment so deploys / runs don't fail
+at function-decorator time:
+
+```bash
+export CS224R_SKIP_OPENAI_SECRET=1
+modal run infra/app_train_loop.py::train_loop_webshop ...
+```
+
+This skips the `secrets=maybe_openai_secret()` mount on every
+function. `LLMJudge` will then fail at first OpenAI call with a clear
+missing-key error — the other 5 methods are unaffected.
+
+For more detail (live cost dashboard, Modal-side flags, etc.) see
+`docs/MODAL_SETUP.md` § 7.
+
+**Shared resources** (provisioned once on the team's Modal workspace,
+then reused by every run):
+
+| Resource | Path / name | Provisioning step |
+|---|---|---|
+| Modal Volume | `cs224r-hgpo-vol` (mounted at `/vol/` inside every Modal function) | Auto-created on first `modal run` |
+| WebShop env install | `/vol/code/webshop`, `/vol/data/webshop/{indexes_1k,resources_1k}` | Section 1.5a (~$2, ~30 min, one-time) |
+| WebShop SFT trajectories | `/vol/data/webshop/human_trajs/` (~50 trajectories) | Section 1.5a |
+| WebShop SFT adapter | `/vol/checkpoints/sft_v3_<ts>/` (current: `sft_v3_20260504_154752`) | Section 1.5b (~$0.50, ~10 min) |
+| ALFWorld data | `/vol/data/alfworld/json_2.1.1/{train,valid_seen,valid_unseen}/` | Section 1.5c (~$1, ~5 min) |
+| ALFWorld SFT trajectories | `/vol/data/alfworld/sft_trajs.jsonl` | Section 1.5c (~$1, ~15-30 min) |
+| ALFWorld SFT adapter | `/vol/checkpoints/sft_alfworld_v1_<ts>/` | Section 1.5d (~$0.50, ~30 min) |
+
+The Volume is shared across all teammates' workspaces — once any
+teammate provisions a resource it's visible to everyone. **Check first,
+then provision only what's missing:**
+
+```bash
+# Check what's already on the Volume
+modal volume ls cs224r-hgpo-vol /
+modal volume ls cs224r-hgpo-vol /checkpoints | grep sft        # SFT adapters
+modal volume ls cs224r-hgpo-vol /data/webshop                  # WebShop env data
+modal volume ls cs224r-hgpo-vol /data/alfworld/json_2.1.1      # ALFWorld games
+```
+
+If `sft_v3_20260504_154752` (WebShop) and `sft_alfworld_v1_*` (ALFWorld)
+both exist, you can **skip Section 1.5 entirely** and jump to Section 2.
+
+### 1.5 Provisioning (only if a resource above is missing)
+
+#### 1.5a. WebShop env + human-trajectory SFT data
+
+```bash
+# Install WebShop into the Volume (~$2, ~30 min)
+modal run infra/app_webshop_install.py --action pip_install
+modal run infra/app_webshop_install.py --action download_spacy
+modal run infra/app_webshop_install.py --action build_index_1k
+
+# Pull the ~50 human trajectories used for SFT (~$0, ~1 min)
+modal run infra/app_data.py --action download_human_trajs
+
+# Sanity check
+modal run infra/app_data.py --action summarize_sft_succeeded
+# Expected: ~745 (prompt, action) examples with reward ≥ 0.5
+```
+
+#### 1.5b. WebShop SFT adapter
+
+```bash
+# Trains LoRA on the human trajectories (~$0.50, ~10 min on A100).
+# Outputs: /vol/checkpoints/sft_v1_<ts>/
+modal run --detach infra/app_sft_train.py --epochs 3 --min-reward 0.5
+
+# Discover the timestamp of your fresh adapter:
+modal volume ls cs224r-hgpo-vol /checkpoints | grep sft_v1
+# Set this in every subsequent run via --sft-adapter:
+SFT_WEBSHOP=/vol/checkpoints/sft_v1_<ts>
+```
+
+To match the existing `methods_comparison.json` baselines exactly, use
+the team's published adapter:
+
+```bash
+SFT_WEBSHOP=/vol/checkpoints/sft_v3_20260504_154752
+```
+
+#### 1.5c. ALFWorld data + SFT trajectories
+
+```bash
+# Download AlfWorld TextWorld games + THOR scene assets (~$1, ~5 min)
+modal run infra/app_alfworld_install.py --action download
+
+# Verify (should list >100 game directories)
+modal volume ls cs224r-hgpo-vol /data/alfworld/json_2.1.1/train
+
+# Generate SFT trajectories using the PDDL expert (~$1, ~15-30 min CPU)
+# Writes /vol/data/alfworld/sft_trajs.jsonl
+modal run --detach infra/app_alfworld_sft_gen.py
+modal run infra/app_alfworld_sft_gen.py --action inspect    # peek + cardinality
+```
+
+#### 1.5d. ALFWorld SFT adapter
+
+```bash
+# (~$0.50, ~30 min on A100). Outputs /vol/checkpoints/sft_alfworld_v1_<ts>/
+modal run --detach infra/app_sft_train_alfworld.py --epochs 3 --min-reward 0.5
+
+# Discover + set:
+modal volume ls cs224r-hgpo-vol /checkpoints | grep sft_alfworld
+SFT_ALFWORLD=/vol/checkpoints/sft_alfworld_v1_<ts>
+```
 
 ---
 
@@ -81,11 +249,11 @@ eval_task_id_base + eval_episodes)`. Default `eval_task_id_base=6500`,
 `eval_episodes=50`. Disjoint from any seed's training slice by
 construction → apples-to-apples across methods + seeds.
 
-### 2a. Canonical sweep (one shell, one method or all)
+### 2a. WebShop — canonical sweep (one shell, one method or all)
 
-`scripts/run_methods_protocol.sh` is the **canonical launcher**.
+`scripts/run_methods_protocol.sh` is the **canonical WebShop launcher**.
 Defaults: `--seed 11 --rounds 5 --eps-per-round 40`,
-`--sft-adapter /vol/checkpoints/sft_v3_20260504_154752`. WebShop only.
+`--sft-adapter /vol/checkpoints/sft_v3_20260504_154752`.
 
 ```bash
 # Full 6-method WebShop bake-off, seed 11
@@ -99,6 +267,10 @@ bash scripts/run_methods_protocol.sh --seed 11 \
 bash scripts/run_methods_protocol.sh --seed 23 \
   --methods flatGRPO,TurnRDV1,TurnRDV2
 
+# Custom SFT adapter (if you trained your own in 1.5b)
+bash scripts/run_methods_protocol.sh --seed 11 \
+  --sft-adapter /vol/checkpoints/sft_v1_<ts>
+
 # Print commands without executing
 bash scripts/run_methods_protocol.sh --seed 11 --dry-run
 ```
@@ -108,7 +280,7 @@ Flags exposed:
 | Flag | Default | Notes |
 |---|---|---|
 | `--seed` | `11` | Drives `task_id_offset = seed * rounds * eps_per_round` |
-| `--rounds` | `5` | numOfRound — number of train_loop ↔ train_turnrd alternations (or just train_loop rounds for non-TurnRD methods) |
+| `--rounds` | `5` | numOfRound |
 | `--eps-per-round` | `40` | H-GRPO episodes per round |
 | `--sft-adapter` | `/vol/checkpoints/sft_v3_20260504_154752` | Warm-start LoRA adapter on the Volume |
 | `--methods` | all 6 | CSV: `SFTOnly,flatGRPO,TurnRDV1,TurnRDV2,Progressive,LLMJudge` |
@@ -121,18 +293,53 @@ nohup bash scripts/run_methods_protocol.sh --seed 11 \
   > /tmp/methods_seed11.log 2>&1 &
 ```
 
-### 2b. Per-method commands (bypass the launcher)
+### 2b. ALFWorld — canonical sweep
+
+`scripts/run_alfworld_sweep_with_sft.sh` is the canonical ALFWorld
+launcher. **Launches 5 methods in parallel**, each in its own nohup
+process so the local terminal can be closed. Methods supported:
+TurnRDV2, TurnRDV1, Progressive, flatGRPO, SFTOnly.
+*(LLMJudge ALFWorld config is not yet committed — flag Joseph if needed.)*
+
+```bash
+# Full 5-method ALFWorld parallel sweep
+bash scripts/run_alfworld_sweep_with_sft.sh /vol/checkpoints/sft_alfworld_v1_<ts>
+
+# Override defaults via env vars
+N_ROUNDS=4 EPS_PER_ROUND=40 SEED=11 EVAL_EPS=50 \
+  bash scripts/run_alfworld_sweep_with_sft.sh /vol/checkpoints/sft_alfworld_v1_<ts>
+
+# Tail all 5 logs at once
+tail -f /tmp/alfworld_sft_sweep_{TurnRDV2,TurnRDV1,Progressive,flatGRPO,SFTOnly}.log
+```
+
+Wall-clock budget: ~3-6 hr; ~$33 total ($30 RL + $3 SFTOnly).
+Per-method logs: `/tmp/alfworld_sft_sweep_<MethodName>.log`.
+
+Env vars exposed:
+
+| Var | Default | Notes |
+|---|---|---|
+| `N_ROUNDS` | `5` | numOfRound |
+| `EPS_PER_ROUND` | `40` | |
+| `TURNRD_EPOCHS` | `3` | Standalone TurnRD epochs between rounds |
+| `SEED` | `11` | |
+| `EVAL_EPS` | `50` | |
+| `EVAL_TASK_BASE` | `6500` | |
+
+### 2c. Per-method commands (bypass the launchers)
 
 Use these if you want to run a single method with non-default flags
 (e.g. fewer rounds for a quick check). These are exactly the
-invocations the launcher dispatches.
+invocations the launchers dispatch.
 
 **Common values used below** (override per teammate):
 ```
 SEED=11
 ROUNDS=5
 EPS_PER_ROUND=40
-SFT_ADAPTER=/vol/checkpoints/sft_v3_20260504_154752
+SFT_WEBSHOP=/vol/checkpoints/sft_v3_20260504_154752
+SFT_ALFWORLD=/vol/checkpoints/sft_alfworld_v1_<ts>
 EVAL_EPS=50
 EVAL_BASE=6500
 BASE_OFFSET=$(( SEED * ROUNDS * EPS_PER_ROUND ))
@@ -144,10 +351,12 @@ The orchestrator interleaves the parent H-GRPO loop (writes a replay
 buffer + reads the latest TurnRD ckpt) with the standalone TurnRD
 trainer (reads the buffer + writes the ckpt) round by round.
 
+**WebShop:**
 ```bash
-# TurnRDV1
+# TurnRDV1 — WebShop
 scripts/run_turnrd_modal.py \
   --config configs/TurnRDV1.json \
+  --env-name webshop \
   --seed 11 --rounds 5 --episodes-per-round 40 --turnrd-epochs 3 \
   --replay-path /vol/cache/TurnRDV1/replay.jsonl \
   --ckpt-path   /vol/cache/TurnRDV1/ckpt.pt \
@@ -155,14 +364,42 @@ scripts/run_turnrd_modal.py \
   --sft-adapter /vol/checkpoints/sft_v3_20260504_154752 \
   --eval-episodes 50 --eval-task-id-base 6500
 
-# TurnRDV2 — adds --carry-policy-across-rounds
+# TurnRDV2 — WebShop (adds --carry-policy-across-rounds)
 scripts/run_turnrd_modal.py \
   --config configs/TurnRDV2.json \
+  --env-name webshop \
   --seed 11 --rounds 5 --episodes-per-round 40 --turnrd-epochs 3 \
   --replay-path /vol/cache/TurnRDV2/replay.jsonl \
   --ckpt-path   /vol/cache/TurnRDV2/ckpt.pt \
   --run-name-prefix TurnRDV2 \
   --sft-adapter /vol/checkpoints/sft_v3_20260504_154752 \
+  --eval-episodes 50 --eval-task-id-base 6500 \
+  --carry-policy-across-rounds
+```
+
+**ALFWorld:**
+```bash
+# TurnRDV1 — ALFWorld
+scripts/run_turnrd_modal.py \
+  --config configs/method_hgpo_turnrd_lean_alfworld.json \
+  --env-name alfworld \
+  --seed 11 --rounds 5 --episodes-per-round 40 --turnrd-epochs 3 \
+  --replay-path /vol/cache/method_b_lean_alfworld/replay.jsonl \
+  --ckpt-path   /vol/cache/method_b_lean_alfworld/ckpt.pt \
+  --run-name-prefix TurnRDV1_alfworld \
+  --sft-adapter /vol/checkpoints/sft_alfworld_v1_<ts> \
+  --eval-episodes 50 --eval-task-id-base 6500 \
+  --carry-policy-across-rounds
+
+# TurnRDV2 — ALFWorld
+scripts/run_turnrd_modal.py \
+  --config configs/method_hgpo_turnrd_v2_alfworld.json \
+  --env-name alfworld \
+  --seed 11 --rounds 5 --episodes-per-round 40 --turnrd-epochs 3 \
+  --replay-path /vol/cache/method_b_v2_alfworld/replay.jsonl \
+  --ckpt-path   /vol/cache/method_b_v2_alfworld/ckpt.pt \
+  --run-name-prefix TurnRDV2_alfworld \
+  --sft-adapter /vol/checkpoints/sft_alfworld_v1_<ts> \
   --eval-episodes 50 --eval-task-id-base 6500 \
   --carry-policy-across-rounds
 ```
@@ -185,12 +422,22 @@ Selected `run_turnrd_modal.py` flags (full list: `scripts/run_turnrd_modal.py --
 #### SFTOnly — single Modal call (no RL)
 
 ```bash
+# WebShop
 modal run infra/app_train_loop.py::train_loop_webshop \
   --config /workspace/configs/SFTOnly.json \
   --n-episodes 0 --k 4 --max-turns 6 \
   --task-id-offset $(( 11 * 5 * 40 )) \
   --run-name SFTOnly_seed11 --round-idx 0 \
   --sft-adapter /vol/checkpoints/sft_v3_20260504_154752 \
+  --eval-episodes 50 --eval-task-id-base 6500 --gpu-mem-util 0.30
+
+# ALFWorld (max_turns=30, gpu_mem_util=0.30; uses train_loop_alfworld)
+modal run infra/app_train_loop.py::train_loop_alfworld \
+  --config /workspace/configs/SFTOnly_alfworld.json \
+  --n-episodes 0 --k 4 --max-turns 30 \
+  --task-id-offset 0 \
+  --run-name SFTOnly_alfworld_seed11_round00 --round-idx 0 \
+  --sft-adapter /vol/checkpoints/sft_alfworld_v1_<ts> \
   --eval-episodes 50 --eval-task-id-base 6500 --gpu-mem-util 0.30
 ```
 
@@ -199,6 +446,7 @@ RL body and go straight to the held-out eval pass.
 
 #### flatGRPO / Progressive / LLMJudge — per-round Modal loop
 
+**WebShop:**
 ```bash
 SEED=11; ROUNDS=5; EPS=40
 for r in $(seq 0 $((ROUNDS-1))); do
@@ -215,65 +463,51 @@ done
 ```
 
 Replace `Progressive.json` with `flatGRPO.json` or `LLMJudge.json` for
-the other two methods. (LLMJudge requires the `openai-secret` Modal
-Secret; see setup step 4.)
+the other two. (LLMJudge requires the `openai-secret` Modal Secret
+provisioned in setup step 4.)
 
-### 2c. ALFWorld
-
-ALFWorld config support is partial — only three methods have a ready
-`_alfworld.json`:
-
-| Method | ALFWorld config |
-|---|---|
-| Progressive | `configs/method_hgpo_progress_alfworld.json` |
-| TurnRDV2 | `configs/method_hgpo_turnrd_v2_alfworld.json` |
-| TurnRD lean (≈ V1) | `configs/method_hgpo_turnrd_lean_alfworld.json` |
-
-For **SFTOnly / flatGRPO / LLMJudge / TurnRDV1**, you'll need to
-create analogous `*_alfworld.json` configs (clone the WebShop config
-and adjust `env_name`, `max_turns=30`, `gpu_mem_util=0.20`); flag
-Joseph if you need this.
-
-For the 3 supported ALFWorld methods, use the existing parallel
-launcher:
+**ALFWorld** (`max_turns=30`, `gpu_mem_util=0.20`, `train_loop_alfworld`,
+threads `--save-adapter-out` so each round inherits the previous round's
+adapter — matches `run_alfworld_sweep_with_sft.sh`):
 
 ```bash
-# Launches all 3 methods under nohup, in parallel.
-# Per-method logs: /tmp/alfworld_sft_sweep_{method_b_v2,method_b_lean,method_c}.log
-bash scripts/run_alfworld_sweep_with_sft.sh /vol/checkpoints/sft_alfworld_v1_<ts>
-```
+SEED=11; ROUNDS=5; EPS=40; SFT_ALFWORLD=/vol/checkpoints/sft_alfworld_v1_<ts>
+RUN_PREFIX=Progressive_alfworld_seed${SEED}            # or flatGRPO_alfworld_seed${SEED}
+CONFIG=configs/method_hgpo_progress_alfworld.json      # or configs/flatGRPO_alfworld.json
+INLINE_BASE_OFFSET=$(( SEED * ROUNDS * EPS ))
+ADAPTER_DIR=/vol/checkpoints
 
-Or invoke a single method by hand:
-
-```bash
-# TurnRDV2 on ALFWorld
-scripts/run_turnrd_modal.py \
-  --config configs/method_hgpo_turnrd_v2_alfworld.json \
-  --env-name alfworld \
-  --seed 11 --rounds 5 --episodes-per-round 40 --turnrd-epochs 3 \
-  --replay-path /vol/cache/method_b_v2_alfworld/replay.jsonl \
-  --ckpt-path   /vol/cache/method_b_v2_alfworld/ckpt.pt \
-  --run-name-prefix TurnRDV2_alfworld \
-  --sft-adapter /vol/checkpoints/sft_alfworld_v1_<ts> \
-  --eval-episodes 50 --eval-task-id-base 6500 \
-  --carry-policy-across-rounds
-
-# Progressive on ALFWorld (per-round modal-run loop, max_turns=30)
-SEED=11; ROUNDS=5; EPS=40
 for r in $(seq 0 $((ROUNDS-1))); do
-  OFFSET=$(( SEED * ROUNDS * EPS + r * EPS ))
-  modal run infra/app_train_loop.py::train_loop_alfworld \
-    --config /workspace/configs/method_hgpo_progress_alfworld.json \
+  OFFSET=$(( INLINE_BASE_OFFSET + r * EPS ))
+  RUN_NAME=${RUN_PREFIX}_round$(printf '%02d' $r)
+  if [[ $r -eq 0 ]]; then
+    LOAD_ADAPTER=${SFT_ALFWORLD}
+  else
+    LOAD_ADAPTER=${ADAPTER_DIR}/${RUN_PREFIX}_round$(printf '%02d' $((r-1)))_adapter
+  fi
+  modal run --detach infra/app_train_loop.py::train_loop_alfworld \
+    --config /workspace/${CONFIG} \
     --n-episodes ${EPS} --k 4 --max-turns 30 \
     --task-id-offset ${OFFSET} \
-    --run-name Progressive_alfworld_seed${SEED}_round$(printf '%02d' $r) \
-    --round-idx ${r} \
-    --sft-adapter /vol/checkpoints/sft_alfworld_v1_<ts> \
+    --run-name ${RUN_NAME} --round-idx ${r} \
+    --sft-adapter ${LOAD_ADAPTER} \
+    --save-adapter-out ${ADAPTER_DIR}/${RUN_NAME}_adapter \
     --eval-episodes 50 --eval-task-id-base 6500 --gpu-mem-util 0.20
 done
 ```
 
-### 2d. Cost / wall-clock estimates
+### 2d. ALFWorld config availability
+
+| Method | WebShop config | ALFWorld config |
+|---|---|---|
+| SFTOnly | `configs/SFTOnly.json` | `configs/SFTOnly_alfworld.json` |
+| flatGRPO | `configs/flatGRPO.json` | `configs/flatGRPO_alfworld.json` |
+| Progressive | `configs/Progressive.json` | `configs/method_hgpo_progress_alfworld.json` |
+| TurnRDV1 | `configs/TurnRDV1.json` | `configs/method_hgpo_turnrd_lean_alfworld.json` |
+| TurnRDV2 | `configs/TurnRDV2.json` | `configs/method_hgpo_turnrd_v2_alfworld.json` |
+| **LLMJudge** | `configs/LLMJudge.json` | **Not yet — clone `LLMJudge.json` and set `env`-related fields, or skip LLMJudge for ALFWorld** |
+
+### 2e. Cost / wall-clock estimates
 
 | Method | Cost / round | Wall / round | 5×40 total |
 |---|---|---|---|
@@ -284,9 +518,10 @@ done
 | TurnRDV1 | ~$8 (loop+fit) | ~20 min | ~$40 |
 | TurnRDV2 | ~$8 (loop+fit) | ~20 min | ~$40 |
 
-Full bake-off (all 6 methods, single seed): **~$160, ~3 hr wall**. Two
-teammates running disjoint method subsets in parallel halves the wall
-time. See `docs/METHOD_B_SWEEP_INTEGRATION.md` for the underlying
+Full WebShop bake-off (all 6 methods, single seed): **~$160, ~3 hr
+wall**. Full ALFWorld 5-method parallel sweep: **~$33, ~3-6 hr wall**.
+Two teammates running disjoint method subsets in parallel halves the
+wall time. See `docs/METHOD_B_SWEEP_INTEGRATION.md` for underlying
 estimates.
 
 ---
@@ -298,7 +533,7 @@ Each round writes `train_log.json` to
 local repo:
 
 ```bash
-# TurnRDV2 example (4 rounds, seed 11) — adjust prefix + count for other methods
+# TurnRDV2 example (5 rounds, seed 11) — adjust prefix + count for other methods
 mkdir -p experiments/manifests/_TurnRDV2_seed11
 modal volume ls cs224r-hgpo-vol /manifests | grep TurnRDV2_seed11
 # pick the timestamps printed above, then for each:
@@ -309,7 +544,8 @@ for ts_dir in TurnRDV2_seed11_round00_<ts0> TurnRDV2_seed11_round01_<ts1> ... ; 
 done
 ```
 
-For non-TurnRD methods the run name pattern is `<METHOD>_seed<S>_round<NN>_<ts>`.
+Run-name pattern: `<METHOD>_seed<S>_round<NN>_<ts>` for WebShop;
+`<METHOD>_alfworld_seed<S>_round<NN>_<ts>` for ALFWorld.
 
 ---
 
@@ -362,13 +598,12 @@ dirs (auto-merged on the fly).
 - **Middle**: held-out eval `avg_return` markers — one dot per round per method
 - **Bottom** (if `--turnrd-diagnostics`): `cls_query_norm` + `alpha_var` trajectories for any TurnRD method
 
-### Per-round eval table (CSV-style for the report)
+### Per-round eval table for the report
 
-`experiments/manifests/methods_comparison.json` already records the
-canonical per-round eval for SFTOnly / flatGRPO / Progressive /
-LLMJudge / TurnRDV1 / TurnRDV2 at seed=11. New seeds should append
-entries with the same schema (`n_rounds`, `best_eval_return`,
-`mean_pct_success`, `_per_round_eval[]`).
+`experiments/manifests/methods_comparison.json` records the canonical
+per-round eval for the WebShop bake-off. New seeds / new env runs
+should append entries with the same schema (`n_rounds`,
+`best_eval_return`, `mean_pct_success`, `_per_round_eval[]`).
 
 ---
 
@@ -434,24 +669,23 @@ bash scripts/run_methods_protocol.sh --methods Progressive --dry-run
 
 ## 9. Who runs what (suggested split for the milestone)
 
-| Owner | WebShop methods | ALFWorld methods | Seeds |
-|---|---|---|---|
-| Joseph | TurnRDV1, TurnRDV2 | TurnRDV2 (existing config) | 11, 23 |
-| Teammate B | flatGRPO, Progressive | Progressive (existing config) | 11, 23 |
-| Teammate C | SFTOnly, LLMJudge | (create configs first) | 11, 23 |
+Assumes the team-shared SFT adapters
+(`/vol/checkpoints/sft_v3_20260504_154752` for WebShop and
+`/vol/checkpoints/sft_alfworld_v1_<ts>` for ALFWorld) are already on
+the Volume. If not, the owner of each env runs Section 1.5 first.
 
-Each teammate runs e.g.:
+| Owner | Env | Methods | Seeds | One-line invocation |
+|---|---|---|---|---|
+| Joseph | WebShop | TurnRDV1, TurnRDV2 | 11, 23 | `nohup bash scripts/run_methods_protocol.sh --seed 11 --methods TurnRDV1,TurnRDV2 > /tmp/joseph_ws_11.log 2>&1 &` |
+| Teammate B | WebShop | flatGRPO, Progressive | 11, 23 | `nohup bash scripts/run_methods_protocol.sh --seed 11 --methods flatGRPO,Progressive > /tmp/B_ws_11.log 2>&1 &` |
+| Teammate C | WebShop | SFTOnly, LLMJudge | 11, 23 | `nohup bash scripts/run_methods_protocol.sh --seed 11 --methods SFTOnly,LLMJudge > /tmp/C_ws_11.log 2>&1 &` |
+| Joseph | ALFWorld | TurnRDV2, TurnRDV1 | 11 | `bash scripts/run_alfworld_sweep_with_sft.sh /vol/checkpoints/sft_alfworld_v1_<ts>` (this script runs all 5 methods in parallel; pick PIDs from output if you want to kill TurnRDV2/TurnRDV1 only) |
+| Teammate B | ALFWorld | Progressive, flatGRPO | 11 | (same script as above; logs at `/tmp/alfworld_sft_sweep_{Progressive,flatGRPO}.log`) |
+| Teammate C | ALFWorld | SFTOnly | 11 | (same script as above; log at `/tmp/alfworld_sft_sweep_SFTOnly.log`) |
 
-```bash
-# Teammate B, WebShop seed 11
-nohup bash scripts/run_methods_protocol.sh --seed 11 \
-  --methods flatGRPO,Progressive \
-  > /tmp/teammate_b_seed11.log 2>&1 &
-```
+After your method finishes:
 
-Then `modal volume get` your method's per-round dirs into
-`experiments/manifests/_<Method>_seed<S>/`, run
-`scripts/plot_protocol_comparison.py` once everyone's logs are local,
-and add a `<Method>` entry to
-`experiments/manifests/methods_comparison.json` with the per-round
-eval block.
+1. **Pull logs locally** (Section 3) into `experiments/manifests/_<Method>_seed<S>/`
+2. **Aggregate** if it's a TurnRD method (`scripts/merge_turnrd_round_logs.py`)
+3. **Run the comparison plot** once everyone's logs are local (Section 4 final command) — this needs all 6 methods' artifacts to overlay
+4. **Append a `<Method>` entry** to `experiments/manifests/methods_comparison.json` with the per-round eval block

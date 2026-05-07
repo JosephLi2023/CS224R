@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import modal  # type: ignore[import-not-found]
 
-from infra.common import VOLUME_MOUNT, volume
+from infra.common import VOLUME_MOUNT, maybe_openai_secret, volume
 from infra.image import alfworld_image, webshop_image
 
 app = modal.App("cs224r-hgpo-train-loop")
@@ -556,7 +556,7 @@ def _train_loop_impl(
 # ---- Two image-bound entrypoints. Modal image binding is decorator-time so
 # ---- a single @app.function cannot switch images at call time.
 
-@app.function(image=webshop_image, gpu="A100-80GB", volumes={VOLUME_MOUNT: volume}, timeout=120 * 60)
+@app.function(image=webshop_image, gpu="A100-80GB", volumes={VOLUME_MOUNT: volume}, secrets=maybe_openai_secret(), timeout=120 * 60)
 def train_loop_webshop(
     n_episodes: int = 50,
     k: int = 4,
@@ -589,7 +589,7 @@ def train_loop_webshop(
     )
 
 
-@app.function(image=alfworld_image, gpu="A100-80GB", volumes={VOLUME_MOUNT: volume}, timeout=120 * 60)
+@app.function(image=alfworld_image, gpu="A100-80GB", volumes={VOLUME_MOUNT: volume}, secrets=maybe_openai_secret(), timeout=120 * 60)
 def train_loop_alfworld(
     n_episodes: int = 50,
     k: int = 4,

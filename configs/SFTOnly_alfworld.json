@@ -1,0 +1,116 @@
+{
+  "run": {
+    "name": "SFTOnly_alfworld",
+    "output_dir": "experiments/manifests",
+    "seed": 11
+  },
+  "env": {
+    "name": "alfworld",
+    "max_steps": 40,
+    "observation_mode": "text",
+    "task_split": "train",
+    "env_kwargs": {
+      "config": {
+        "dataset": {
+          "data_path": "$ALFWORLD_DATA/json_2.1.1/train",
+          "eval_id_data_path": "$ALFWORLD_DATA/json_2.1.1/valid_seen",
+          "eval_ood_data_path": "$ALFWORLD_DATA/json_2.1.1/valid_unseen",
+          "num_train_games": 200,
+          "num_eval_games": 50
+        },
+        "env": {
+          "type": "AlfredTWEnv",
+          "regen_game_files": false,
+          "domain_randomization": false,
+          "task_types": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6
+          ],
+          "expert_timeout_steps": 150,
+          "expert_type": "handcoded",
+          "goal_desc_human_anns_prob": 0.0,
+          "hybrid": {
+            "start_eps": 100000,
+            "thor_prob": 0.5,
+            "eval_mode": "tw"
+          }
+        },
+        "general": {
+          "random_seed": 42,
+          "use_cuda": false,
+          "visdom": false,
+          "task": "alfred",
+          "training_method": "dagger",
+          "save_path": "./training/",
+          "observation_pool_capacity": 3,
+          "hide_init_receptacles": false
+        },
+        "controller": {
+          "type": "oracle",
+          "debug": false,
+          "load_receps": false
+        },
+        "logic": {
+          "domain": "$ALFWORLD_DATA/logic/alfred.pddl",
+          "grammar": "$ALFWORLD_DATA/logic/alfred.twl2"
+        },
+        "dagger": {
+          "training": {
+            "max_nb_steps_per_episode": 50
+          },
+          "fraction_assist": {
+            "fraction_assist_anneal_episodes": 0,
+            "fraction_assist_anneal_from": 1.0,
+            "fraction_assist_anneal_to": 0.01
+          },
+          "fraction_random": {
+            "fraction_random_anneal_episodes": 0,
+            "fraction_random_anneal_from": 0.0,
+            "fraction_random_anneal_to": 0.0
+          },
+          "replay": {
+            "replay_memory_capacity": 0,
+            "replay_memory_priority_fraction": 0.0,
+            "update_per_k_game_steps": 1,
+            "replay_batch_size": 1,
+            "multi_step": 1,
+            "replay_sample_history_length": 1,
+            "replay_sample_update_from": 1
+          }
+        }
+      }
+    }
+  },
+  "train": {
+    "algorithm": "hgpo",
+    "total_episodes": 0,
+    "batch_size": 4,
+    "learning_rate": 1e-6,
+    "checkpoint_every": 50,
+    "eval_every": 25,
+    "K_trajectories_per_task": 4,
+    "kl_coeff": 0.04,
+    "clip_eps": 0.2,
+    "grad_accum_steps": 2,
+    "gpu_mem_util": 0.30
+  },
+  "policy": {
+    "backbone": "Qwen2.5-1.5B-Instruct",
+    "lora": true,
+    "lora_target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+    "lora_rank": 16
+  },
+  "hgpo": {
+    "alpha": 0.5,
+    "lambda_consistency": 0.0,
+    "decomposer": "progress"
+  },
+  "logging": {
+    "print_every": 10
+  },
+  "_notes": "SFTOnly_alfworld = SFT-warm-started Qwen2.5-1.5B with NO RL training, AlfWorld twin of configs/SFTOnly.json. Eval-only spec: total_episodes=0 makes infra/app_train_loop.py::_train_loop_impl skip the `for ep in range(n_episodes)` body and go straight to the held-out eval pass on AlfWorld's valid_seen + valid_unseen splits. Launch via `modal run infra/app_train_loop.py::train_loop_alfworld --config /workspace/configs/SFTOnly_alfworld.json --n-episodes 0 --eval-episodes 50 --eval-task-id-base 6500 --sft-adapter /vol/checkpoints/sft_alfworld_v1_<ts> --gpu-mem-util 0.30`. Cost ~$3, ~10 min. The hgpo block is irrelevant when total_episodes=0 but the schema requires a decomposer; `progress` is chosen because it has zero learnable parameters and zero side-effects. Populates 4method_comparison_alfworld.json::SFTOnly as the literal pre-RL anchor for the AlfWorld 5-method sweep."
+}

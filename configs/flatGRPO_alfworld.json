@@ -1,0 +1,121 @@
+{
+  "run": {
+    "name": "flatGRPO_alfworld",
+    "output_dir": "experiments/manifests",
+    "seed": 11
+  },
+  "env": {
+    "name": "alfworld",
+    "max_steps": 40,
+    "observation_mode": "text",
+    "task_split": "train",
+    "env_kwargs": {
+      "config": {
+        "dataset": {
+          "data_path": "$ALFWORLD_DATA/json_2.1.1/train",
+          "eval_id_data_path": "$ALFWORLD_DATA/json_2.1.1/valid_seen",
+          "eval_ood_data_path": "$ALFWORLD_DATA/json_2.1.1/valid_unseen",
+          "num_train_games": 200,
+          "num_eval_games": 50
+        },
+        "env": {
+          "type": "AlfredTWEnv",
+          "regen_game_files": false,
+          "domain_randomization": false,
+          "task_types": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6
+          ],
+          "expert_timeout_steps": 150,
+          "expert_type": "handcoded",
+          "goal_desc_human_anns_prob": 0.0,
+          "hybrid": {
+            "start_eps": 100000,
+            "thor_prob": 0.5,
+            "eval_mode": "tw"
+          }
+        },
+        "general": {
+          "random_seed": 42,
+          "use_cuda": false,
+          "visdom": false,
+          "task": "alfred",
+          "training_method": "dagger",
+          "save_path": "./training/",
+          "observation_pool_capacity": 3,
+          "hide_init_receptacles": false
+        },
+        "controller": {
+          "type": "oracle",
+          "debug": false,
+          "load_receps": false
+        },
+        "logic": {
+          "domain": "$ALFWORLD_DATA/logic/alfred.pddl",
+          "grammar": "$ALFWORLD_DATA/logic/alfred.twl2"
+        },
+        "dagger": {
+          "training": {
+            "max_nb_steps_per_episode": 50
+          },
+          "fraction_assist": {
+            "fraction_assist_anneal_episodes": 0,
+            "fraction_assist_anneal_from": 1.0,
+            "fraction_assist_anneal_to": 0.01
+          },
+          "fraction_random": {
+            "fraction_random_anneal_episodes": 0,
+            "fraction_random_anneal_from": 0.0,
+            "fraction_random_anneal_to": 0.0
+          },
+          "replay": {
+            "replay_memory_capacity": 0,
+            "replay_memory_priority_fraction": 0.0,
+            "update_per_k_game_steps": 1,
+            "replay_batch_size": 1,
+            "multi_step": 1,
+            "replay_sample_history_length": 1,
+            "replay_sample_update_from": 1
+          }
+        }
+      }
+    }
+  },
+  "train": {
+    "algorithm": "flat_grpo",
+    "total_episodes": 200,
+    "batch_size": 4,
+    "learning_rate": 1e-06,
+    "checkpoint_every": 50,
+    "eval_every": 25,
+    "K_trajectories_per_task": 4,
+    "kl_coeff": 0.04,
+    "clip_eps": 0.2,
+    "grad_accum_steps": 2,
+    "gpu_mem_util": 0.20
+  },
+  "policy": {
+    "backbone": "Qwen2.5-1.5B-Instruct",
+    "lora": true,
+    "lora_target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj"
+    ],
+    "lora_rank": 16
+  },
+  "hgpo": {
+    "alpha": 1.0,
+    "lambda_consistency": 0.0,
+    "decomposer": "progress"
+  },
+  "logging": {
+    "print_every": 10
+  },
+  "_notes": "flatGRPO_alfworld = H-GRPO with alpha=1.0 (drops per-turn signal), trivial-decomposer baseline on AlfWorld. AlfWorld twin of configs/flatGRPO.json. With alpha=1.0 the choice of decomposer is mathematically inert (only the trajectory advantage survives); progress is used because it is parameter-free. Apples-to-apples no-decomposer baseline vs TurnRDV1/V2/Progressive on the AlfWorld 5-method sweep — same lr=1e-6, kl_coeff=0.04, K=4, gpu_mem_util=0.20 as the existing alfworld method configs. Populates 4method_comparison_alfworld.json::flatGRPO."
+}
