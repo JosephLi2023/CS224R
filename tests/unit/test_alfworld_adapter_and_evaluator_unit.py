@@ -10,10 +10,16 @@ from src.trainers.evaluator import evaluate_policy
 class _FakeALFWorldEnv:
     def __init__(self) -> None:
         self.last_action = None
+        # Game-files list + pointer used by the adapter's deterministic
+        # task_id → game-index mapping. The adapter sets `next_game_idx`
+        # before calling `reset()`; we expose it so tests can verify
+        # selection determinism.
+        self.game_files = [f"game_{i}.tw" for i in range(64)]
+        self.next_game_idx: int = 0
 
     def reset(self, split: str = "train"):
         return (
-            [f"{split} room"],
+            [f"{split} room (game_idx={self.next_game_idx})"],
             {"admissible_commands": ["look", "open fridge"]},
         )
 
@@ -39,13 +45,84 @@ class TestALFWorldAdapter(unittest.TestCase):
         state = adapter.reset()
         next_state, reward, done, info = adapter.step(1)
 
-        self.assertEqual(state.observation_text, "train room")
+        # Without task_id, the fake env's `next_game_idx` stays at 0.
+        self.assertEqual(state.observation_text, "train room (game_idx=0)")
         self.assertEqual(state.valid_actions, ["look", "open fridge"])
         self.assertEqual(next_state.observation_text, "after open fridge")
         self.assertEqual(next_state.valid_actions, ["go north"])
         self.assertEqual(reward, 0.75)
         self.assertFalse(done)
         self.assertEqual(info["resolved_action"], "open fridge")
+
+    def test_reset_honors_task_id(self) -> None:
+        """`reset(task_id=42)` must point the underlying env at game-index
+        42 BEFORE calling env.reset() — without this, K parallel adapter
+        instances in a GRPO group would each hit a different randomized
+        game (breaks the K-trajectories-per-task invariant)."""
+        adapter = _TestableALFWorldAdapter(max_steps=4)
+        state = adapter.reset(task_id=42)
+        # 42 % 64 (the fake's game_files length) == 42.
+        self.assertEqual(adapter._last_task_idx, 42)
+        # The fake env reflects `next_game_idx` in its observation, so
+        # the adapter's hand-off through reset() is end-to-end verifiable.
+        self.assertEqual(state.observation_text, "train room (game_idx=42)")
+
+    def test_reset_task_id_wraps_modulo_game_pool(self) -> None:
+        """task_id larger than the game-files list wraps via `%`."""
+        adapter = _TestableALFWorldAdapter(max_steps=4)
+        # 64 game files in the fake; 130 % 64 == 2.
+        adapter.reset(task_id=130)
+        self.assertEqual(adapter._last_task_idx, 2)
+
+    def test_observation_mode_forwarded_to_constructor(self) -> None:
+        """`observation_mode` must reach the adapter (was previously dropped)
+        — parallel to WebShop. Verifies via the adapter's stored attribute
+        since the fake `_build_alfworld_env` ignores constructor kwargs."""
+        adapter = _TestableALFWorldAdapter(
+            max_steps=4, observation_mode="text+image"
+        )
+        self.assertEqual(adapter.observation_mode, "text+image")
+
+    def test_task_split_injected_into_env_kwargs(self) -> None:
+        """`task_split` must land in env_kwargs as `train_eval` (the
+        upstream `AlfredTWEnv` constructor's canonical key) — not as a
+        runtime `reset(split=...)` kwarg, which the prior implementation
+        relied on (and which a real `AlfredTWEnv.reset()` doesn't accept)."""
+        adapter = _TestableALFWorldAdapter(
+            max_steps=4, task_split="eval_in_distribution"
+        )
+        self.assertEqual(
+            adapter.env_kwargs.get("train_eval"), "eval_in_distribution"
+        )
+
+    def test_factory_forwards_observation_mode_to_alfworld_adapter(self) -> None:
+        """Smoke: `make_env({...}, seed=...)` must thread observation_mode
+        through to the adapter (was dropped before this fix)."""
+        from src.envs.factory import make_env
+
+        # Patch the build so the factory call doesn't try to import the
+        # real alfworld package.
+        import src.envs.alfworld_adapter as adapter_mod
+
+        original_build = adapter_mod.ALFWorldAdapter._build_alfworld_env
+        adapter_mod.ALFWorldAdapter._build_alfworld_env = lambda self: _FakeALFWorldEnv()
+        try:
+            env = make_env(
+                {
+                    "name": "alfworld",
+                    "max_steps": 8,
+                    "observation_mode": "text+image",
+                    "task_split": "train",
+                    "env_kwargs": {},
+                },
+                seed=11,
+            )
+        finally:
+            adapter_mod.ALFWorldAdapter._build_alfworld_env = original_build
+        self.assertEqual(env.observation_mode, "text+image")
+        # `seed` must be threaded through into env_kwargs (parity with
+        # WebShop's reproducible task ordering).
+        self.assertEqual(env.env_kwargs.get("seed"), 11)
 
     def test_normalize_step_handles_five_tuple(self) -> None:
         adapter = _TestableALFWorldAdapter(max_steps=5)

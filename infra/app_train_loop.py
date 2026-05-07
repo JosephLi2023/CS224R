@@ -1,6 +1,7 @@
-"""Modal A100 app: 50-episode flat-GRPO training loop on real WebShop.
+"""Modal A100 app: H-GRPO training loop on real WebShop OR AlfWorld.
 
-  modal run infra/app_train_loop.py --n_episodes 50 --k 4 --max_turns 6
+  modal run infra/app_train_loop.py --env-name webshop  --n-episodes 50 --k 4 --max-turns 6
+  modal run infra/app_train_loop.py --env-name alfworld --n-episodes 50 --k 4 --max-turns 30 --config configs/method_hgpo_turnrd_v2_alfworld.json
 
 Per-episode loop:
   task_id = task_id_offset + episode_idx
@@ -12,6 +13,17 @@ Per-episode loop:
 Persists `train_log.json` to /vol/manifests/<run_name>/train_log.json so we
 have a per-episode reward curve we can plot offline.
 
+Env-name dispatch (Day 16+):
+  Two `@app.function` entrypoints — `train_loop_webshop` (binds
+  `webshop_image`, deps include Java/pyserini/spaCy) and
+  `train_loop_alfworld` (binds `alfworld_image`, much lighter). Both
+  delegate to `_train_loop_impl(env_name, ...)` which holds the actual
+  training loop and resolves env-specific bindings via `_ENV_REGISTRY`.
+  The `local_entrypoint` reads `--env-name` and dispatches.
+
+  Modal's image binding is decorator-time — a single `@app.function`
+  cannot switch images at call time — hence the two-entrypoint shape.
+
 Cost: ~$3-5 for 50 episodes (~10-15 min on A100).
 """
 from __future__ import annotations
@@ -19,45 +31,87 @@ from __future__ import annotations
 import modal  # type: ignore[import-not-found]
 
 from infra.common import VOLUME_MOUNT, volume
-from infra.image import webshop_image
+from infra.image import alfworld_image, webshop_image
 
 app = modal.App("cs224r-hgpo-train-loop")
 
 
-@app.function(image=webshop_image, gpu="A100-80GB", volumes={VOLUME_MOUNT: volume}, timeout=60 * 60)
-def train_loop_smoke(
-    n_episodes: int = 50,
-    k: int = 4,
-    max_turns: int = 6,
-    task_id_offset: int = 0,
-    num_products: int = 1000,
-    sync_every: int = 1,
-    run_name: str = "flat_grpo_webshop_smoke",
-    sft_adapter: str = "",
-    use_sft_as_ref: bool = True,
-    kl_warmup_episodes: int = 0,
-    gpu_mem_util: float = 0.30,
-    config: str = "",  # Day 14: when non-empty, build trainer from this JSON config.
-    # Post-training eval pass on a held-out task range with greedy
-    # sampling. Disabled when --eval-episodes 0. Default 50 eps on
-    # task IDs [eval_task_id_base, eval_task_id_base + eval_episodes).
-    # NOTE: WebShop's `web_agent_site/envs/web_agent_text_env.py`
-    # holds a finite `goals` list (~6910 entries with default
-    # `num_products=1000`); requesting `task_id >= len(goals)` raises
-    # `IndexError` from `goal = self.goals[idx]`. Default 6500 is
-    # WITHIN that range AND disjoint from the training task ranges
-    # used by `scripts/run_turnrd_modal.py --seed N`
-    # (`seed * rounds * episodes_per_round`, e.g. seed 11 → [2200, 2400),
-    # seed 23 → [4600, 4800)). If you change `num_products` or the
-    # protocol seeds, recheck disjointness + range.
-    eval_episodes: int = 50,
-    eval_task_id_base: int = 6500,
-    # v6 BUG 2 fix: round index for V-baseline annealing. The orchestrator
-    # passes the current round (0-indexed) so the trainer can ramp V from
-    # 0% (Round 0, V is fresh-init noise) → 100% (Round
-    # `v_baseline_warmup_rounds`+, V has converged via standalone trainer).
-    round_idx: int = 0,
+# Resolved inside the Modal container after `sys.path` is set up. Each entry
+# returns the (adapter_class, prompt_renderer, action_parser) triple for that
+# env. Adding a new env = adding a new entry here + a new `@app.function`
+# entrypoint binding the right image.
+def _resolve_env_bindings(env_name: str):
+    """Lazily import + return (adapter_cls, prompt_renderer, action_parser)
+    for the requested env. Pure-Python (torch-free) so unit tests can
+    invoke this without a GPU.
+
+    Raises ValueError on an unknown env_name with a clear diagnostic so
+    typos in `--env-name` don't silently fall back to WebShop.
+    """
+    if env_name == "webshop":
+        from src.envs.prompts.react_webshop import (
+            parse_react_action,
+            render_webshop_turn_prompt,
+        )
+        from src.envs.webshop_adapter import WebShopAdapter
+
+        return WebShopAdapter, render_webshop_turn_prompt, parse_react_action
+
+    if env_name == "alfworld":
+        from src.envs.alfworld_adapter import ALFWorldAdapter
+        from src.envs.prompts.react_alfworld import (
+            parse_react_action,
+            render_alfworld_turn_prompt,
+        )
+
+        return ALFWorldAdapter, render_alfworld_turn_prompt, parse_react_action
+
+    raise ValueError(
+        f"_resolve_env_bindings: unknown env_name {env_name!r}; "
+        "expected 'webshop' or 'alfworld'."
+    )
+
+
+def _train_loop_impl(
+    env_name: str,
+    n_episodes: int,
+    k: int,
+    max_turns: int,
+    task_id_offset: int,
+    num_products: int,
+    sync_every: int,
+    run_name: str,
+    sft_adapter: str,
+    use_sft_as_ref: bool,
+    kl_warmup_episodes: int,
+    gpu_mem_util: float,
+    config: str,
+    eval_episodes: int,
+    eval_task_id_base: int,
+    round_idx: int,
 ) -> dict:
+    """Env-agnostic training loop body. Both `train_loop_webshop` and
+    `train_loop_alfworld` delegate here so the loop body lives in one
+    place and image-binding is the only thing the entrypoints differ on.
+
+    `env_name` is "webshop" | "alfworld" — drives `_resolve_env_bindings`
+    and is used as the `env_name` field on collected groups.
+
+    `num_products` is WebShop-specific; ignored when env_name != "webshop".
+    For AlfWorld and any future env, `env_kwargs` come from the config
+    JSON's `env.env_kwargs` block.
+
+    Eval-task-id range guards (env-aware):
+      - WebShop: `web_agent_text_env.py` holds a finite `goals` list
+        (~6910 entries with default `num_products=1000`). Default
+        `eval_task_id_base=6500` is WITHIN range AND disjoint from the
+        per-seed training ranges used by `scripts/run_turnrd_modal.py`.
+      - AlfWorld: `valid_seen` (~140) + `valid_unseen` (~140) is the
+        eval pool. The adapter maps task_id → `task_id % len(games)`
+        deterministically, so any non-negative integer is safe — but to
+        keep eval disjoint from training task_ids, the orchestrator
+        pre-flight enforces `eval_task_id_base >= seed*rounds*ep_per_round`.
+    """
     import json
     import os
     import sys
@@ -80,10 +134,10 @@ def train_loop_smoke(
         HGPOTrainerConfig,
         progress_decomposer,
     )
-    from src.envs.webshop_adapter import WebShopAdapter
-    from src.envs.prompts.react_webshop import parse_react_action, render_webshop_turn_prompt
     from src.policy.lora_policy import LoRAPolicy, LoRAPolicyConfig
     from src.policy.vllm_runner import SamplingParams, VLLMRunner, VLLMRunnerConfig
+
+    adapter_cls, prompt_renderer, action_parser = _resolve_env_bindings(env_name)
 
     # Day 14: optional JSON config — overrides the per-flag trainer/decomposer
     # construction with a `build_trainer_from_config` call. When config is
@@ -142,11 +196,38 @@ def train_loop_smoke(
         if _torch.cuda.is_available():
             _torch.cuda.empty_cache()
 
+    # --- Env factory: env-aware kwargs ---
+    # WebShop: legacy `num_products` flag has dominated the call surface;
+    #   if the cfg JSON doesn't carry an `env.env_kwargs` block, fall back
+    #   to {"num_products": num_products} for backward compat with all
+    #   prior WebShop runs that use the flag-only path.
+    # AlfWorld + others: read `env.env_kwargs` from the cfg JSON verbatim
+    #   (these envs need a non-trivial config dict — see configs/env_alfworld.json).
+    env_block: dict = {}
+    if cfg_dict is not None and isinstance(cfg_dict.get("env"), dict):
+        env_block = dict(cfg_dict["env"])
+
+    cfg_env_kwargs = dict(env_block.get("env_kwargs", {}) or {})
+    if env_name == "webshop" and not cfg_env_kwargs:
+        cfg_env_kwargs = {"num_products": num_products}
+
+    # Adapter constructor kwargs sourced from the env block. We pass
+    # `observation_mode` and `task_split` only when the JSON provides them
+    # so the adapter's defaults stand otherwise (matches both adapters'
+    # constructor defaults). `max_steps` is overridden from `max_turns`
+    # to keep the legacy flag's semantics ("steps = turns + 2").
+    adapter_max_steps = int(env_block.get("max_steps", max_turns + 2))
+    adapter_obs_mode = str(env_block.get("observation_mode", "text"))
+    adapter_task_split = str(env_block.get("task_split", "train"))
+
     def env_factory():
-        return WebShopAdapter(
-            max_steps=max_turns + 2,
-            observation_mode="text",
-            env_kwargs={"num_products": num_products},
+        # Both adapters share the same constructor signature shape
+        # (max_steps, observation_mode, task_split, env_kwargs).
+        return adapter_cls(
+            max_steps=adapter_max_steps,
+            observation_mode=adapter_obs_mode,
+            task_split=adapter_task_split,
+            env_kwargs=dict(cfg_env_kwargs),
         )
 
     # Day 14: choose between the legacy flag-driven trainer/collector
@@ -170,8 +251,8 @@ def train_loop_smoke(
             policy=policy,
             runner=runner,
             env_factory=env_factory,
-            prompt_renderer=render_webshop_turn_prompt,
-            action_parser=parse_react_action,
+            prompt_renderer=prompt_renderer,
+            action_parser=action_parser,
             sampling_factory=SamplingParams,
         )
         # v6 BUG 2 fix plumbing: tell the trainer which round we're in
@@ -180,8 +261,8 @@ def train_loop_smoke(
         collector = RolloutCollector(
             runner=runner,
             env_factory=env_factory,
-            prompt_renderer=render_webshop_turn_prompt,
-            action_parser=parse_react_action,
+            prompt_renderer=prompt_renderer,
+            action_parser=action_parser,
             cfg=RolloutCollectorConfig(max_turns=max_turns),
             turnrd_emit_path=turnrd_emit_path,
             turnrd_embedder=turnrd_embedder,
@@ -191,8 +272,8 @@ def train_loop_smoke(
         collector = RolloutCollector(
             runner=runner,
             env_factory=env_factory,
-            prompt_renderer=render_webshop_turn_prompt,
-            action_parser=parse_react_action,
+            prompt_renderer=prompt_renderer,
+            action_parser=action_parser,
             cfg=RolloutCollectorConfig(max_turns=max_turns),
         )
         trainer = HGPOTrainer(
@@ -217,6 +298,18 @@ def train_loop_smoke(
         n = trainer.snapshot_current_lora_as_ref()
         print(f">>> Snapshotted {n} LoRA modules as KL reference (RL-from-SFT)")
 
+    # Generic config snapshot for train_log.json — env-agnostic now that
+    # `num_products` is just one possible env_kwarg among many.
+    def _config_snapshot() -> dict:
+        return {
+            "env_name": env_name,
+            "env_kwargs": cfg_env_kwargs,
+            "n_episodes": n_episodes, "K": k, "max_turns": max_turns,
+            "task_id_offset": task_id_offset,
+            "sync_every": sync_every, "run_name": run_name,
+            "sft_adapter": sft_adapter,
+        }
+
     log: list[dict] = []
     overall_start = time.time()
 
@@ -225,7 +318,7 @@ def train_loop_smoke(
         task_id = task_id_offset + ep
         try:
             group, cstats = collector.collect_group(
-                task_id=task_id, env_name="webshop", K=k, sampling=sampling
+                task_id=task_id, env_name=env_name, K=k, sampling=sampling
             )
             stats = trainer.train_step(group)
 
@@ -286,12 +379,7 @@ def train_loop_smoke(
             # Persist log every episode so a crash or local timeout still leaves
             # a useful artifact on the Volume.
             with open(os.path.join(run_dir, "train_log.json"), "w") as f:
-                json.dump({"rows": log, "config": {
-                    "n_episodes": n_episodes, "K": k, "max_turns": max_turns,
-                    "task_id_offset": task_id_offset, "num_products": num_products,
-                    "sync_every": sync_every, "run_name": run_name,
-                    "sft_adapter": sft_adapter,
-                }}, f, indent=2)
+                json.dump({"rows": log, "config": _config_snapshot()}, f, indent=2)
             volume.commit()
         except Exception as exc:
             print(f"ep={ep} CRASHED: {exc!r}")
@@ -344,14 +432,14 @@ def train_loop_smoke(
         )
         # Single eval collector reused across all eval episodes. Its env
         # pool is built once on the first call and reused via env.reset()
-        # for subsequent episodes (saves the ~5-8 s per-ep WebShop env
-        # construction). Producer hook is disabled here so eval rollouts
-        # don't pollute the replay buffer.
+        # for subsequent episodes (saves the per-ep env construction cost
+        # — ~5-8 s WebShop, much higher for AlfWorld). Producer hook is
+        # disabled here so eval rollouts don't pollute the replay buffer.
         eval_collector = RolloutCollector(
             runner=runner,
             env_factory=env_factory,
-            prompt_renderer=render_webshop_turn_prompt,
-            action_parser=parse_react_action,
+            prompt_renderer=prompt_renderer,
+            action_parser=action_parser,
             cfg=RolloutCollectorConfig(max_turns=max_turns),
         )
         eval_t0 = time.time()
@@ -364,7 +452,7 @@ def train_loop_smoke(
             task_id = eval_task_id_base + j
             try:
                 _, eval_cstats = eval_collector.collect_group(
-                    task_id=task_id, env_name="webshop", K=1, sampling=eval_sampling
+                    task_id=task_id, env_name=env_name, K=1, sampling=eval_sampling
                 )
                 eval_returns.extend(eval_cstats.final_rewards)
                 eval_turns.append(eval_cstats.total_turns)
@@ -420,17 +508,16 @@ def train_loop_smoke(
         # Persist eval into the same train_log.json so post-hoc
         # aggregation can find it without a separate file lookup.
         with open(os.path.join(run_dir, "train_log.json"), "w") as f:
-            json.dump({"rows": log, "config": {
-                "n_episodes": n_episodes, "K": k, "max_turns": max_turns,
-                "task_id_offset": task_id_offset, "num_products": num_products,
-                "sync_every": sync_every, "run_name": run_name,
-                "sft_adapter": sft_adapter,
-            }, "eval": eval_block}, f, indent=2)
+            json.dump(
+                {"rows": log, "config": _config_snapshot(), "eval": eval_block},
+                f, indent=2,
+            )
         volume.commit()
     # -----------------------------------------------------------------
 
     summary = {
         "run_dir": run_dir,
+        "env_name": env_name,
         "n_episodes": n_episodes,
         "K": k,
         "completed_episodes": len(rewards),
@@ -453,8 +540,85 @@ def train_loop_smoke(
     return summary
 
 
+# ---- Two image-bound entrypoints. Modal image binding is decorator-time so
+# ---- a single @app.function cannot switch images at call time.
+
+@app.function(image=webshop_image, gpu="A100-80GB", volumes={VOLUME_MOUNT: volume}, timeout=120 * 60)
+def train_loop_webshop(
+    n_episodes: int = 50,
+    k: int = 4,
+    max_turns: int = 6,
+    task_id_offset: int = 0,
+    num_products: int = 1000,
+    sync_every: int = 1,
+    run_name: str = "flat_grpo_webshop_smoke",
+    sft_adapter: str = "",
+    use_sft_as_ref: bool = True,
+    kl_warmup_episodes: int = 0,
+    gpu_mem_util: float = 0.30,
+    config: str = "",
+    eval_episodes: int = 50,
+    eval_task_id_base: int = 6500,
+    round_idx: int = 0,
+) -> dict:
+    return _train_loop_impl(
+        env_name="webshop",
+        n_episodes=n_episodes, k=k, max_turns=max_turns,
+        task_id_offset=task_id_offset, num_products=num_products,
+        sync_every=sync_every, run_name=run_name,
+        sft_adapter=sft_adapter, use_sft_as_ref=use_sft_as_ref,
+        kl_warmup_episodes=kl_warmup_episodes, gpu_mem_util=gpu_mem_util,
+        config=config,
+        eval_episodes=eval_episodes, eval_task_id_base=eval_task_id_base,
+        round_idx=round_idx,
+    )
+
+
+@app.function(image=alfworld_image, gpu="A100-80GB", volumes={VOLUME_MOUNT: volume}, timeout=120 * 60)
+def train_loop_alfworld(
+    n_episodes: int = 50,
+    k: int = 4,
+    max_turns: int = 30,
+    task_id_offset: int = 0,
+    num_products: int = 0,  # unused for AlfWorld — kept for shared signature
+    sync_every: int = 1,
+    run_name: str = "method_alfworld_smoke",
+    sft_adapter: str = "",
+    use_sft_as_ref: bool = True,
+    kl_warmup_episodes: int = 0,
+    gpu_mem_util: float = 0.30,
+    config: str = "",
+    # AlfWorld eval pool (`valid_seen` + `valid_unseen`) is much smaller
+    # than WebShop's. The adapter wraps task_id with `% len(games)` so
+    # any non-negative integer is safe; we pick a default base WELL
+    # outside the multi-seed training ranges (`seed * rounds * eps`),
+    # mirroring WebShop's 6500. Override via --eval-task-id-base.
+    eval_episodes: int = 50,
+    eval_task_id_base: int = 6500,
+    round_idx: int = 0,
+) -> dict:
+    return _train_loop_impl(
+        env_name="alfworld",
+        n_episodes=n_episodes, k=k, max_turns=max_turns,
+        task_id_offset=task_id_offset, num_products=num_products,
+        sync_every=sync_every, run_name=run_name,
+        sft_adapter=sft_adapter, use_sft_as_ref=use_sft_as_ref,
+        kl_warmup_episodes=kl_warmup_episodes, gpu_mem_util=gpu_mem_util,
+        config=config,
+        eval_episodes=eval_episodes, eval_task_id_base=eval_task_id_base,
+        round_idx=round_idx,
+    )
+
+
+# Backward-compat alias: the orchestrator + prior callers reference
+# `train_loop_smoke`. Default to the WebShop entrypoint to preserve all
+# existing WebShop sweeps unchanged.
+train_loop_smoke = train_loop_webshop
+
+
 @app.local_entrypoint()
 def main(
+    env_name: str = "webshop",
     n_episodes: int = 50,
     k: int = 4,
     max_turns: int = 6,
@@ -471,9 +635,23 @@ def main(
     eval_task_id_base: int = 6500,
     round_idx: int = 0,
 ) -> None:
+    """Local entrypoint: dispatches to the right `@app.function` based
+    on `--env-name`. Default `webshop` preserves backward compat with
+    the orchestrator (`scripts/run_turnrd_modal.py`) and all prior
+    `modal run` invocations that don't set the flag."""
     import json as _json
+
+    if env_name == "webshop":
+        fn = train_loop_webshop
+    elif env_name == "alfworld":
+        fn = train_loop_alfworld
+    else:
+        raise ValueError(
+            f"--env-name must be 'webshop' or 'alfworld'; got {env_name!r}."
+        )
+
     print(_json.dumps(
-        train_loop_smoke.remote(
+        fn.remote(
             n_episodes=n_episodes, k=k, max_turns=max_turns,
             task_id_offset=task_id_offset, num_products=num_products,
             sync_every=sync_every, run_name=run_name,

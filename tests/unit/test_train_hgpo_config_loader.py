@@ -267,6 +267,108 @@ def test_loader_loads_method_hgpo_turnrd_v2_json(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# AlfWorld method configs — same loader, different env block. Verifies the
+# 3 new alfworld-flavored configs construct trainers correctly and the
+# `env` block round-trips (the loader itself doesn't touch `env`, but the
+# train_loop's _train_loop_impl reads `env.env_kwargs` and we want to
+# verify the JSON is shaped as expected).
+# ---------------------------------------------------------------------------
+
+
+def _load_alfworld_method_cfg(tmp_path: Path, name: str) -> dict:
+    """Copy the alfworld method config to tmp, scrub vol paths, return
+    the parsed dict. Each method config contains a TurnRD block whose
+    `replay_buffer_path` and `ckpt_path` point at `/vol/...`; we redirect
+    to tmp so the eager refresh_fn at startup doesn't try to write there."""
+    import json
+    import shutil
+
+    src_cfg = Path(__file__).resolve().parent.parent.parent / "configs" / name
+    assert src_cfg.is_file(), f"alfworld method config missing: {src_cfg}"
+    dst = tmp_path / name
+    shutil.copyfile(src_cfg, dst)
+    cfg = json.loads(dst.read_text())
+    if "turnrd" in cfg:
+        cfg["turnrd"]["replay_buffer_path"] = str(tmp_path / "replay.jsonl")
+        cfg["turnrd"]["ckpt_path"] = str(tmp_path / "ckpt.pt")
+    return cfg
+
+
+def test_loader_loads_method_hgpo_progress_alfworld_json(tmp_path: Path) -> None:
+    """Method C on AlfWorld: progress decomposer, no TurnRD plumbing.
+    Trainer must build, `env.name` must be `alfworld`."""
+    cfg = _load_alfworld_method_cfg(tmp_path, "method_hgpo_progress_alfworld.json")
+    trainer, refresh_fn, emit_path, embedder, judge_dec = build_trainer_from_config(
+        cfg, policy=_StubPolicy()
+    )
+    assert isinstance(trainer, HGPOTrainer)
+    assert refresh_fn is None
+    assert emit_path is None
+    assert embedder is None
+    assert judge_dec is None
+    # Env block sanity (the loader doesn't touch env, but the JSON shape
+    # is what _train_loop_impl needs).
+    assert cfg["env"]["name"] == "alfworld"
+    assert "config" in cfg["env"]["env_kwargs"], (
+        "alfworld env_kwargs MUST include the upstream `config` dict — "
+        "AlfredTWEnv fails to construct without it."
+    )
+
+
+def test_loader_loads_method_hgpo_turnrd_lean_alfworld_json(tmp_path: Path) -> None:
+    """Method B v1 lean on AlfWorld: TurnRD v1 (CLS-bottlenecked causal)."""
+    from src.algorithms.hgpo.decomposers.turnrd import TurnRDDecomposer
+    from src.turnrd.model import TurnRD
+
+    cfg = _load_alfworld_method_cfg(
+        tmp_path, "method_hgpo_turnrd_lean_alfworld.json"
+    )
+    trainer, refresh_fn, emit_path, embedder, judge_dec = build_trainer_from_config(
+        cfg, policy=_StubPolicy()
+    )
+    assert isinstance(trainer.decomposer, TurnRDDecomposer)
+    assert isinstance(trainer.decomposer.model, TurnRD), (
+        "method_hgpo_turnrd_lean_alfworld.json must build v1 TurnRD."
+    )
+    assert refresh_fn is not None
+    assert emit_path == str(tmp_path / "replay.jsonl")
+    assert embedder is not None
+    assert judge_dec is None  # Mode 1
+    assert cfg["env"]["name"] == "alfworld"
+
+
+def test_loader_loads_method_hgpo_turnrd_v2_alfworld_json(tmp_path: Path) -> None:
+    """Method B v2 on AlfWorld: TurnRDv2 (bidirectional + identifiable
+    Σα·v R-loss + progress-prior init)."""
+    from src.algorithms.hgpo.decomposers.turnrd import TurnRDDecomposer
+    from src.turnrd.model import TurnRDv2
+
+    cfg = _load_alfworld_method_cfg(
+        tmp_path, "method_hgpo_turnrd_v2_alfworld.json"
+    )
+    trainer, refresh_fn, emit_path, embedder, judge_dec = build_trainer_from_config(
+        cfg, policy=_StubPolicy()
+    )
+    assert isinstance(trainer.decomposer, TurnRDDecomposer)
+    assert isinstance(trainer.decomposer.model, TurnRDv2), (
+        "method_hgpo_turnrd_v2_alfworld.json must build TurnRDv2."
+    )
+    assert trainer.decomposer.model.cfg.causal is False  # v2 default — bidirectional
+    assert refresh_fn is not None
+    assert emit_path == str(tmp_path / "replay.jsonl")
+    assert embedder is not None
+    assert judge_dec is None  # Mode 1
+    assert cfg["env"]["name"] == "alfworld"
+    # Cache paths must be alfworld-specific so v1 ckpts don't get mistakenly
+    # loaded by the alfworld v2 run (and vice versa).
+    import json as _json
+    src_cfg = Path(__file__).resolve().parent.parent.parent / "configs" / "method_hgpo_turnrd_v2_alfworld.json"
+    raw = _json.loads(src_cfg.read_text())
+    assert "method_b_v2_alfworld" in raw["turnrd"]["replay_buffer_path"]
+    assert "method_b_v2_alfworld" in raw["turnrd"]["ckpt_path"]
+
+
+# ---------------------------------------------------------------------------
 # Counterfactual (Method D) branch
 # ---------------------------------------------------------------------------
 

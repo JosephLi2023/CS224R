@@ -35,13 +35,14 @@
     "cf_temperature": 1.0,
     "completion_temperature": 0.0,
     "cf_max_tokens": 48,
-    "n_turns_per_traj": 2,
+    "n_turns_per_traj": 0,
     "skip_if_zero_R": true,
     "output_mode": "raw_delta",
-    "seed": 11
+    "seed": 11,
+    "max_env_pool_size": 40
   },
   "logging": {
     "print_every": 10
   },
-  "_notes": "H-GRPO Method D: counterfactual-rollout decomposer. For each (i, t) we sample N=2 alt actions from the policy at state_t, complete a 3-turn greedy rollout, and emit r_t = R - mean(R_alt). With n_turns_per_traj=2 we randomly subsample 2 turns per trajectory to bound the per-group cost (≈ K*2*N = 32 alt rollouts/group instead of K*T_avg*N ≈ 80). lambda_consistency=0 because the CF deltas don't satisfy the §3.2 sum-to-R invariant — the C3 consistency loss would just push α toward zero. skip_if_zero_R=true halves wall-clock on early training when most trajectories fail."
+  "_notes": "H-GRPO Method D: counterfactual-rollout decomposer. For each (i, t) we sample N=2 alt actions from the policy at state_t, complete a 3-turn greedy rollout, and emit r_t = R - mean(R_alt). n_turns_per_traj=0 (all turns) per the post-mortem of seed11_round00 — subsampling injects structured zeros that pollute compute_turn_advantages's per-position normalization (most positions end up with K-1 spurious zeros and 1 real Δ_t, which then becomes a huge ±1.7σ advantage with the others getting a spurious negative). Cost = K*N*T̄ = 4*2*5 = 40 alt rollouts/group (~2.5x the subsample setting). lambda_consistency=0 because the CF deltas don't satisfy the §3.2 sum-to-R invariant. skip_if_zero_R=true halves wall-clock on early training when most trajectories fail."
 }

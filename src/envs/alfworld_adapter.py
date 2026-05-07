@@ -18,33 +18,77 @@ class ALFWorldAdapter:
     ALFWorld environment adapter with normalized state/action wiring.
 
     This wrapper accepts several common ALFWorld API shapes and normalizes outputs.
+
+    Construction:
+        - `observation_mode`: forwarded to the upstream env constructor when
+          accepted (parallel to WebShop). The default `"text"` matches the
+          ReAct-style prompt format the rollout collector expects.
+        - `task_split`: ALFWorld's upstream `AlfredTWEnv` takes the split
+          (`"train"` / `"eval_in_distribution"` / `"eval_out_of_distribution"`)
+          at *construction* time, not at `reset()` time. We inject it into
+          `env_kwargs` (under the `train_eval` key, the upstream's canonical
+          name) when the caller hasn't already provided one. Configs that
+          want a different upstream key should set `env_kwargs.train_eval`
+          explicitly and leave `task_split` at its default — the `train_eval`
+          value wins.
+
+    Reset semantics:
+        - `reset(task_id=N)` — when N is not None, the adapter maps it
+          deterministically to a game-file index `N % len(game_files)` and
+          points the underlying env at that game BEFORE calling `env.reset()`.
+          This preserves H-GRPO's K-trajectories-per-task invariant: K
+          parallel adapter instances all reset to task_id=N produce K
+          rollouts on the SAME game.
+        - When `task_id` is None or the adapter can't find a game-files
+          list to index into, falls back to bare `env.reset()` (random
+          game from the upstream's internal pointer).
     """
 
     def __init__(
         self,
         max_steps: int,
+        observation_mode: str = "text",
         task_split: str = "train",
         env_kwargs: dict[str, Any] | None = None,
     ) -> None:
         self.max_steps = max_steps
+        self.observation_mode = observation_mode
         self.task_split = task_split
-        self.env_kwargs = env_kwargs or {}
+        # Inject task_split as the upstream `train_eval` kwarg when the
+        # caller hasn't already set one. Construct a fresh dict so we
+        # don't mutate the caller's input.
+        merged_kwargs: dict[str, Any] = dict(env_kwargs or {})
+        merged_kwargs.setdefault("train_eval", task_split)
+        self.env_kwargs = merged_kwargs
 
         self._steps = 0
         self._last_state: ALFWorldState | None = None
+        # Records the most recent task_id-derived game index so callers
+        # (and tests) can verify deterministic selection.
+        self._last_task_idx: int | None = None
         self._env = self._build_alfworld_env()
 
     def _build_alfworld_env(self):
         import_error: Exception | None = None
 
-        # Common ALFWorld text env path.
+        # Try the canonical ALFWorld text env path. Prefer to forward
+        # `observation_mode` when the constructor accepts it (parallel to
+        # WebShop); fall back to the kwargs-only construction for forks
+        # that don't take it.
         try:
             from importlib import import_module
 
             module = import_module("alfworld.agents.environment")
             get_env = getattr(module, "get_environment", None)
             if callable(get_env):
-                return get_env("alfred")(**self.env_kwargs)
+                env_cls = get_env("alfred")
+                try:
+                    return env_cls(
+                        observation_mode=self.observation_mode,
+                        **self.env_kwargs,
+                    )
+                except TypeError:
+                    return env_cls(**self.env_kwargs)
         except Exception as exc:  # pragma: no cover - depends on local install
             import_error = exc
 
@@ -54,7 +98,13 @@ class ALFWorldAdapter:
 
             module = import_module("alfworld.agents.environment.alfred_tw_env")
             env_cls = getattr(module, "AlfredTWEnv")
-            return env_cls(**self.env_kwargs)
+            try:
+                return env_cls(
+                    observation_mode=self.observation_mode,
+                    **self.env_kwargs,
+                )
+            except TypeError:
+                return env_cls(**self.env_kwargs)
         except Exception as exc:  # pragma: no cover - depends on local install
             import_error = exc
 
@@ -140,16 +190,54 @@ class ALFWorldAdapter:
             )
         return valid_actions[action]
 
-    def reset(self, **kwargs: Any) -> ALFWorldState:
-        self._steps = 0
+    def _game_files(self) -> list[Any]:
+        """Return the underlying env's game-files list, if exposed.
 
-        # Try split-aware reset first where available.
-        reset_kwargs = dict(kwargs)
-        if "split" not in reset_kwargs:
-            reset_kwargs["split"] = self.task_split
+        ALFWorld's `AlfredTWEnv` typically holds the loaded TextWorld game
+        file paths under `game_files` (or `task_files` in some forks). This
+        is the source of truth for deterministic task selection.
+        """
+        for attr in ("game_files", "task_files", "_game_files"):
+            candidates = getattr(self._env, attr, None)
+            if isinstance(candidates, (list, tuple)) and candidates:
+                return list(candidates)
+        return []
+
+    def _select_task(self, task_id: int) -> int:
+        """Map `task_id` → deterministic game index, then point env at it.
+
+        Returns the resolved game index (`task_id % len(game_files)` when
+        the game-files list is discoverable, else `task_id` verbatim — at
+        minimum the `_last_task_idx` attribute records what was attempted
+        so tests can assert determinism).
+
+        ALFWorld's various forks expose the game pointer under different
+        attribute names. We try the common ones; configs that need a
+        different attribute can subclass and override `_select_task`.
+        """
+        game_files = self._game_files()
+        idx = int(task_id) % len(game_files) if game_files else int(task_id)
+        for attr in (
+            "next_game_idx",
+            "game_index",
+            "_next_game",
+            "_game_pointer",
+        ):
+            if hasattr(self._env, attr):
+                setattr(self._env, attr, idx)
+                break
+        return idx
+
+    def reset(self, **kwargs: Any) -> ALFWorldState:
+        """Reset the env. Maps `task_id=<int>` → deterministic game-file
+        selection (see `_select_task`); absorbs other unknown kwargs."""
+        self._steps = 0
+        task_id = kwargs.pop("task_id", None)
+        if task_id is not None:
+            self._last_task_idx = self._select_task(int(task_id))
 
         try:
-            raw_obs, raw_info = self._normalize_reset(self._env.reset(**reset_kwargs))
+            raw_obs, raw_info = self._normalize_reset(self._env.reset(**kwargs))
         except TypeError:
             raw_obs, raw_info = self._normalize_reset(self._env.reset())
 

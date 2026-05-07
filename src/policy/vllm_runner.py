@@ -24,6 +24,19 @@ class VLLMRunnerConfig:
     seed: int = 0
     enforce_eager: bool = False
     download_dir: str | None = None  # HF download cache; align with LoRAPolicy.cache_dir
+    # vLLM CPU swap space in GiB. Default vLLM value is 4 GiB. We override
+    # to 0 to disable CPU↔GPU KV-block swapping entirely. Rationale:
+    # vLLM 0.6.3.post1 has a known bug where `blocks_to_swap_in` can
+    # contain a non-int element under race conditions during weight
+    # syncs / KV preemption, causing
+    #   `RuntimeError: unknown parameter type` inside
+    #   `worker.prepare_worker_input → torch.tensor(blocks_to_swap_in)`
+    # This bug reliably fires after ~30 weight-sync cycles in our
+    # heavy-rollout protocols (CF, TurnRDv2). Setting swap_space=0
+    # means the KV scheduler never swaps blocks → the buggy code path
+    # is never entered. Safe for our workload (K≤8, max_tokens≤48,
+    # gpu_memory_utilization≤0.30 leaves >50% GPU headroom for KV).
+    swap_space_gib: int = 0
 
 
 @dataclass
@@ -69,6 +82,7 @@ class VLLMRunner:
             seed=cfg.seed,
             enforce_eager=cfg.enforce_eager,
             download_dir=cfg.download_dir,
+            swap_space=cfg.swap_space_gib,
         )
 
     # ------------------------------------------------------------------

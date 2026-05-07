@@ -116,6 +116,14 @@ class OrchestrationConfig:
     # disjoint task_id range so different seeds never train on the same
     # WebShop tasks. Also tags the run-name-prefix with `_seed{N}`.
     seed: int | None = None
+    # Env-name dispatch (default `webshop` for backward compat with
+    # all prior single-env sweeps). When set to `alfworld`, the
+    # orchestrator calls `train_loop_alfworld.remote(...)` (binding
+    # the AlfWorld-runtime image) and the eval-task-id-range guard is
+    # widened — AlfWorld's adapter wraps task_id with `% len(games)`
+    # so any non-negative integer is safe, but training/eval ranges
+    # must still be disjoint per the same per-seed offset math.
+    env_name: str = "webshop"
     dry_run: bool = False
     skip_warmup_fit: bool = False
     extra_train_loop_args: list[str] = field(default_factory=list)
@@ -254,6 +262,16 @@ def _parse_args(argv: Sequence[str]) -> OrchestrationConfig:
              "protocol sweep; omit for ad-hoc single-run launches.",
     )
     parser.add_argument(
+        "--env-name",
+        choices=("webshop", "alfworld"),
+        default="webshop",
+        help="Which env's train_loop entrypoint to invoke. Default "
+             "'webshop' preserves backward compat with all prior sweeps. "
+             "'alfworld' routes to `train_loop_alfworld` (the lighter "
+             "alfworld_image, no Java/pyserini/spaCy) and widens the "
+             "eval-task-id-range pre-flight check.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print the modal commands without executing them.",
@@ -287,6 +305,7 @@ def _parse_args(argv: Sequence[str]) -> OrchestrationConfig:
         eval_episodes=args.eval_episodes,
         eval_task_id_base=args.eval_task_id_base,
         seed=args.seed,
+        env_name=args.env_name,
         dry_run=args.dry_run,
         skip_warmup_fit=args.skip_warmup_fit,
         extra_train_loop_args=list(args.extra_train_loop_args or []),
@@ -377,6 +396,35 @@ def _preflight(cfg: OrchestrationConfig) -> None:
     if cfg.episodes_per_round <= 0:
         raise SystemExit(
             f"ERROR: --episodes-per-round must be positive; got {cfg.episodes_per_round}."
+        )
+
+    # Env-aware eval-task-id range guard. WebShop's `web_agent_text_env.py`
+    # holds a finite `goals` list (~6910 with default `num_products=1000`);
+    # `eval_task_id_base + eval_episodes` must be within that range. AlfWorld
+    # has a much smaller eval pool (~140 valid_seen + ~140 valid_unseen) but
+    # the adapter wraps task_id with `% len(games)`, so any non-negative
+    # integer is technically safe. We still warn when the requested range
+    # overlaps the per-seed training slice, since training/eval should be
+    # disjoint regardless of env.
+    if cfg.env_name == "webshop":
+        WEBSHOP_GOALS_LEN = 6910  # at default num_products=1000
+        if cfg.eval_task_id_base + cfg.eval_episodes > WEBSHOP_GOALS_LEN:
+            raise SystemExit(
+                f"ERROR: WebShop eval range "
+                f"[{cfg.eval_task_id_base}, "
+                f"{cfg.eval_task_id_base + cfg.eval_episodes}) exceeds the "
+                f"WebShop goals pool (~{WEBSHOP_GOALS_LEN}). Lower "
+                "--eval-task-id-base or --eval-episodes."
+            )
+    train_lo = cfg.base_task_id_offset
+    train_hi = cfg.base_task_id_offset + cfg.rounds * cfg.episodes_per_round
+    eval_lo = cfg.eval_task_id_base
+    eval_hi = cfg.eval_task_id_base + cfg.eval_episodes
+    if not (eval_hi <= train_lo or eval_lo >= train_hi):
+        raise SystemExit(
+            f"ERROR: eval task range [{eval_lo}, {eval_hi}) overlaps "
+            f"training task range [{train_lo}, {train_hi}). Pick a "
+            "disjoint --eval-task-id-base."
         )
 
 
@@ -521,7 +569,8 @@ def _train_loop_cmd(cfg: OrchestrationConfig, round_idx: int) -> list[str]:
     )
 
     cmd = [
-        "modal", "run", "--detach", "infra/app_train_loop.py",
+        "modal", "run", "--detach",
+        f"infra/app_train_loop.py::train_loop_{cfg.env_name}",
         "--config", _to_container_path(cfg.config_path),
         "--n-episodes", str(cfg.episodes_per_round),
         "--k", str(k_per_task),
@@ -688,6 +737,7 @@ def _run(cmd: list[str], *, dry_run: bool, label: str) -> int:
 def _orchestrate(cfg: OrchestrationConfig) -> int:
     """Execute the round-robin loop. Returns the final exit code (0 on success)."""
     print("=== Method-B (TurnRD) end-to-end orchestration ===")
+    print(f"  env name           : {cfg.env_name}")
     print(f"  config             : {cfg.config_path}")
     print(f"  rounds             : {cfg.rounds}")
     print(f"  episodes/round     : {cfg.episodes_per_round}")

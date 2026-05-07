@@ -26,10 +26,19 @@ def make_env(env_cfg: dict, seed: int):
         )
 
     if name == "alfworld":
+        # `seed` is currently unused by the ALFWorldAdapter constructor
+        # but we accept it via factory signature for parity with WebShop
+        # / future deterministic seed propagation. The adapter forwards
+        # `train_eval=task_split` into env_kwargs internally so configs
+        # don't need to set it explicitly.
+        env_kwargs = dict(env_cfg.get("env_kwargs", {}))
+        if seed is not None and "seed" not in env_kwargs:
+            env_kwargs.setdefault("seed", int(seed))
         return ALFWorldAdapter(
             max_steps=int(env_cfg.get("max_steps", 40)),
+            observation_mode=str(env_cfg.get("observation_mode", "text")),
             task_split=str(env_cfg.get("task_split", "train")),
-            env_kwargs=dict(env_cfg.get("env_kwargs", {})),
+            env_kwargs=env_kwargs,
         )
 
     raise ValueError(f"Unsupported env name: {env_cfg['name']}")
