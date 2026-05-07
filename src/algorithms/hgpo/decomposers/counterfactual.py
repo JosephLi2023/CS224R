@@ -1,4 +1,4 @@
-"""CounterFactual per-turn reward decomposer (proposal §3.2 Method A revival).
+"""CounterFactual per-turn reward decomposer (Method A revival).
 
 Idea
 ----
@@ -13,7 +13,7 @@ state ``s_t`` and completing the rollout greedily for up to
 ``max_completion_turns`` more turns.
 
 This is the literal "counterfactual rollouts" signal the original
-proposal §3.2 listed as **Method A** but had to cut from the WebShop
+design listed as **Method A** but had to cut from the WebShop
 plan because WebShop's *in-progress* state is not snapshot-able. The
 trick we use here is **deterministic replay**: WebShop episodes are
 deterministic given ``(task_id, action_sequence)``, so we can recover
@@ -95,7 +95,7 @@ Knobs:
      ``compute_turn_advantages`` normalizes per-position across the
      K-group so absolute scale matters less than ordering.
    - ``"normalized"`` — rescale so ``Σ_t r̂_t = R`` (preserves the
-     §3.2 invariant the C3 consistency loss expects). Falls back to
+     sum invariant the C3 consistency loss expects). Falls back to
      uniform ``R/T`` when all Δ_t ≤ 0.
 
 Reward accounting precondition
@@ -183,7 +183,7 @@ class CounterFactualDecomposer:
     object is also directly callable via ``__call__`` so callers can
     pass either ``cf_decomposer`` or ``cf_decomposer.decompose`` to
     ``HGPOTrainer(decomposer=...)`` — same convention as
-    ``TurnRDDecomposer`` (Day 13).
+    ``TurnRDDecomposer``.
     """
 
     def __init__(

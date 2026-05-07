@@ -1,5 +1,4 @@
-"""Unit tests for `src.trainers.train_hgpo.build_trainer_from_config`
-(Day 14).
+"""Unit tests for `src.trainers.train_hgpo.build_trainer_from_config`.
 
 Verification matrix:
 1. `test_loader_builds_progress_decomposer`

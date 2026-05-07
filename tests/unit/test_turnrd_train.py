@@ -1,4 +1,4 @@
-"""Unit tests for `src.turnrd.train.train_turnrd` (Day 13 — standalone trainer).
+"""Unit tests for `src.turnrd.train.train_turnrd` (standalone trainer).
 
 Verification matrix:
 1. `test_train_mode_1_loss_decreases_on_synthetic`

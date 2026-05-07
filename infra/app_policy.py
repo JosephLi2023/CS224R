@@ -4,9 +4,9 @@ Three entrypoints, run incrementally to bound cost:
 
   modal run infra/app_policy.py::lora_load_smoke      # ~2 min, ~$0.10
   modal run infra/app_policy.py::vllm_generate_smoke  # ~3 min, ~$0.15
-  modal run infra/app_policy.py::weight_sync_smoke    # ~5 min, ~$0.30 (full Day-3 deliverable)
+  modal run infra/app_policy.py::weight_sync_smoke    # ~5 min, ~$0.30 (full weight-sync deliverable)
 
-`weight_sync_smoke` is the canonical Day-3 deliverable: 4 prompts → 4 vLLM
+`weight_sync_smoke` is the canonical weight-sync deliverable: 4 prompts → 4 vLLM
 generations → perturb LoRA → sync to vLLM → 4 fresh generations → assert
 they differ.
 """
@@ -88,7 +88,7 @@ def vllm_generate_smoke() -> dict:
     timeout=30 * 60,
 )
 def weight_sync_smoke() -> dict:
-    """Full Day-3 verification:
+    """Full weight-sync verification:
 
     1. Build LoRAPolicy (trainer-side).
     2. Build VLLMRunner pointing at the same backbone.

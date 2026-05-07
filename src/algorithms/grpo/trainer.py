@@ -1,5 +1,5 @@
 """HGPOTrainer: PPO-clipped policy update over K-trajectory groups, with the
-H-GRPO advantage construction (proposal §3.1) and an adaptive KL controller
+H-GRPO advantage construction and an adaptive KL controller
 to a frozen reference model.
 
 torch / transformers imports are deferred to method bodies so the module
@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 @dataclass
 class HGPOTrainerConfig:
     """Hyperparameters for one `train_step` call."""
-    # H-GRPO advantage knobs (proposal §3.1)
+    # H-GRPO advantage knobs
     alpha: float = 0.5
     lambda_consistency: float = 0.1
     # PPO knobs
@@ -56,7 +56,7 @@ class HGPOTrainerConfig:
     # Default 2048 keeps forward+backward activations under ~10 GiB for
     # Qwen2.5-1.5B; raise on larger cards or single-tenant GPUs.
     max_tokens_per_microbatch: int = 2048
-    # H-GRPO Method B (TurnRD) integration knobs (Day 13).
+    # H-GRPO Method B (TurnRD) integration knobs.
     # Re-load the TurnRD checkpoint every N rollout groups (0 disables —
     # preserves prior behavior for Methods A/C and existing tests).
     refresh_every_episodes: int = 0
@@ -65,12 +65,12 @@ class HGPOTrainerConfig:
     # small standalone Transformer that benefits from a higher rate (~1e-4
     # is the standalone trainer default).
     turnrd_lr: float = 1e-4
-    # v6 BUG 2 fix: V-baseline annealing across rounds. In Round 0 the
+    # V-baseline annealing across rounds. In Round 0 the
     # standalone TurnRD trainer hasn't run yet, so V_θ predictions are
     # at random init (noise). Using V as a per-turn PPO baseline that
     # early would inject noise into the policy gradient. Linear ramp:
     # β = clamp(round_idx / warmup_rounds, 0, 1). Round 0 = β=0 (use
-    # OLD per-position-normalized turn_adv exclusively, == v5 behavior);
+    # per-position-normalized turn_adv exclusively);
     # Round 1 = β=0.5 (50/50 blend); Rounds 2+ = β=1.0 (full V baseline).
     # The orchestrator sets `v_baseline_round_idx` per Modal call.
     v_baseline_round_idx: int = 0
@@ -206,7 +206,7 @@ class HGPOTrainer:
         # weights afterwards. None ⇒ ref is the C2 frozen-base path
         # (LoRA disabled). Populate via `snapshot_current_lora_as_ref()`.
         self._ref_lora_snapshot: dict[str, dict[str, Any]] | None = None
-        # H-GRPO Method B integration (Day 13).
+        # H-GRPO Method B integration.
         # Detect whether the decomposer is a learnable Method B (TurnRD)
         # decomposer. Other decomposers (Methods A/C) inherit the False
         # default via `getattr` so they don't need to declare anything.
@@ -280,7 +280,7 @@ class HGPOTrainer:
             self._trainable_params,
             lr=self.cfg.learning_rate,
         )
-        # Day 13: also build a separate AdamW for the TurnRD parameters
+        # Also build a separate AdamW for the TurnRD parameters
         # when the decomposer is learnable. Kept separate from the policy
         # optimizer so each param group can use its own lr (`turnrd_lr`
         # vs `learning_rate`) without sharing AdamW state.
@@ -518,7 +518,7 @@ class HGPOTrainer:
         """Compute the H-GRPO total loss for one group.
 
         Reads `prompt_token_ids` and `action_token_ids` directly from each
-        `TurnRecord` (the rollout collector populates both as of Day 5.5).
+        `TurnRecord` (the rollout collector populates both).
 
         Gradient flow (``L = L_PPO + beta_t * KL_k3 + lambda * L_cons``)
         ----------------------------------------------------------------
@@ -583,9 +583,9 @@ class HGPOTrainer:
         all_new_lp: list[torch.Tensor] = []
         all_old_lp: list[torch.Tensor] = []
         all_ref_lp: list[torch.Tensor] = []
-        # NOTE (v9 F2): all_adv assembly is DEFERRED until after the grad
+        # NOTE: all_adv assembly is DEFERRED until after the grad
         # block runs and the V-head override has had a chance to mutate
-        # `combined`. Pre-v9 this loop snapshotted `combined[i][t]` into
+        # `combined`. An earlier version snapshotted `combined[i][t]` into
         # `adv_vec` BEFORE the V-head override at L806 ran, making the
         # override dead code (mutated `combined` was never re-read).
         # Collect all (prompt, action) pairs first; the heavy forward passes
@@ -820,12 +820,11 @@ class HGPOTrainer:
                     _alpha_corr_sum / _alpha_corr_n if _alpha_corr_n > 0 else 0.0
                 )
 
-        # ----- v9 F2 Phase 2: build advantage tensor AFTER override -----
+        # ----- Phase 2: build advantage tensor AFTER override -----
         # The grad block above (when active) may have mutated `combined`
         # via the V-head override. We now build the advantage tensor that
         # actually feeds the PPO surrogate, reading the post-override
-        # `combined`. Pre-v9 this loop ran BEFORE the override, so the
-        # override was dead code; v9 swaps the order.
+        # `combined`.
         all_adv: list[torch.Tensor] = []
         for k, ((prompt_ids, ids), (i, t)) in enumerate(zip(pa_pairs, per_turn_meta)):
             a_t = combined[i][t]
@@ -896,7 +895,7 @@ class HGPOTrainer:
             total = policy_loss + kl_term
 
         # `traj_adv` and `flat_turn_adv` were hoisted to the top of
-        # compute_loss (v9 F1). They are still used here for stats only.
+        # compute_loss. They are still used here for stats only.
         stats = TrainStepStats(
             policy_loss=float(policy_loss.detach().item()),
             kl_term=float(kl_term.detach().item()),
@@ -968,7 +967,7 @@ class HGPOTrainer:
         """
         import torch  # type: ignore[import-not-found]
 
-        # Day 13: refresh the TurnRD checkpoint at the configured cadence
+        # Refresh the TurnRD checkpoint at the configured cadence
         # BEFORE building any optimizer (the refresh may swap the
         # decomposer's underlying model; the optimizer must see the new
         # parameters). Skipped at step 0 so we don't refresh the brand-new
@@ -1006,7 +1005,7 @@ class HGPOTrainer:
             stats.grad_norm = float(grad_norm)
             self._optimizer.step()
             self._optimizer.zero_grad(set_to_none=True)
-            # Day 13: also step the TurnRD optimizer when present.
+            # Also step the TurnRD optimizer when present.
             if self._decomposer_optimizer is not None and self._decomposer_params:
                 turnrd_grad_norm = torch.nn.utils.clip_grad_norm_(
                     self._decomposer_params, self.cfg.max_grad_norm

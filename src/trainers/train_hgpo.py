@@ -1,4 +1,4 @@
-"""H-GRPO trainer config loader (Day 14).
+"""H-GRPO trainer config loader.
 
 `build_trainer_from_config(cfg, *, policy)` builds the full Method-A/B/C
 machinery from a `configs/method_hgpo_*.json`-shaped dict and returns

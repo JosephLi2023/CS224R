@@ -1,15 +1,12 @@
-"""TurnRD per-turn reward decomposer adapter (Method B; proposal §3.2).
+"""TurnRD per-turn reward decomposer adapter (Method B).
 
-Inference-only adapter that the trainer plugs in. The training loop
-(replay-buffer reader + standalone train script + HGPOTrainer refresh hook)
-ships Day 13–14 — see `~/.llms/plans/cs224r_hgpo_method_b_turnrd_m1.plan.md`
-"What's deliberately NOT included" section.
+Inference-only adapter that the trainer plugs in.
 
 torch is imported at the top of this file; the embedder callable is supplied
 by the caller, so unit tests can drive the adapter with a deterministic
 stub embedder that returns plain tensors — no LoRAPolicy or HF model needed.
 
-The §3.2 invariant `Σ_t r̂_t = R` per trajectory holds by construction
+The invariant `Σ_t r̂_t = R` per trajectory holds by construction
 (`TurnRDOutput.decompose(R) = α · R` where `Σ α = 1` after masking).
 """
 
@@ -33,7 +30,7 @@ TurnRDLike = Union[TurnRD, TurnRDv2]
 # tensor of shape `[T_i, D]` (D == TurnRD.input_dim).
 #
 # Production wires this from `LoRAPolicy.model.eval()` mean-pooled hidden
-# states (Day 14); tests pass a deterministic stub.
+# states; tests pass a deterministic stub.
 #
 # Contract requirements (the adapter enforces (a)+(b) defensively, (c) is
 # the embedder's responsibility but the adapter wraps the call in
@@ -81,7 +78,7 @@ class TurnRDDecomposer:
         # Resolve the model's parameter dtype too: the embedder is allowed to
         # return any dtype, and we'll cast `stacked` into the model dtype
         # before forward. This avoids the fp16-embedder vs fp32-input_proj
-        # dtype-mismatch RuntimeError that would otherwise greet the Day-14
+        # dtype-mismatch RuntimeError that would otherwise greet the
         # production wiring.
         try:
             self._model_dtype: torch.dtype = next(self.model.parameters()).dtype
@@ -173,7 +170,7 @@ class TurnRDDecomposer:
 
         # 3. Forward in eval mode with no grad. Use `__call__` (not `.forward`)
         #    so any `nn.Module` forward-pre/post hooks the trainer attaches
-        #    on Day 14 (e.g. refresh-cadence telemetry) still fire.
+        #    (e.g. refresh-cadence telemetry) still fire.
         was_training = self.model.training
         self.model.eval()
         try:
@@ -208,7 +205,7 @@ class TurnRDDecomposer:
         return out_list
 
     # -------------------------------------------------------------------
-    # Learnable surface (Day 13)
+    # Learnable surface
     # -------------------------------------------------------------------
 
     def __call__(self, group: TrajectoryGroup) -> list[list[float]]:
@@ -347,7 +344,7 @@ class TurnRDDecomposer:
         out = self.model(stacked, attn_mask)
         # alpha == cls_attn_weights (already mask-zeroed inside the model).
         alpha = out.cls_attn_weights  # [K_real, T_max], grad-tracking
-        # v6: V-head per-turn predictions for the actor-critic baseline
+        # V-head per-turn predictions for the actor-critic baseline
         # in HGPOTrainer.compute_loss. None when the model was built
         # with cfg.value_head=False (back-compat); the trainer falls
         # back to the per-position-normalized turn_adv path then.
@@ -378,7 +375,7 @@ def build_turnrd_decomposer(
     """Factory used by `build_decomposer` for the `"turnrd"` branch.
 
     Returns the `TurnRDDecomposer` *object* (not its `.decompose` method)
-    so the trainer can reach the Day-13 learnable surface
+    so the trainer can reach the learnable surface
     (`has_learnable_params`, `parameters`, `decompose_with_grad`,
     `state_dict`, `load_state_dict`). `TurnRDDecomposer.__call__` forwards
     to `.decompose`, so the returned value is still a valid

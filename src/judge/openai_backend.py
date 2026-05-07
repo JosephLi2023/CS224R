@@ -1,6 +1,6 @@
 """OpenAI GPT-4o-mini judge backend.
 
-Default backend per proposal §3.2. Costs ~$0.65/1k judge calls with caching;
+Default judge backend. Costs ~$0.65/1k judge calls with caching;
 expected total study spend ~$3-6.
 
 Requires `OPENAI_API_KEY` env var (loaded from a Modal Secret in production).

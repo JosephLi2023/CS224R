@@ -1,7 +1,7 @@
 """Pluggable LLM-as-judge backends for H-GRPO Method A.
 
 Exposes a `JudgeBackend` Protocol plus two implementations:
-- `OpenAIJudge` (default per proposal §3.2): GPT-4o-mini via OpenAI API.
+- `OpenAIJudge` (default): GPT-4o-mini via OpenAI API.
 - `VLLMJudge` (fallback): Qwen2.5-7B-Instruct served behind a Modal vLLM app.
 
 Select the backend via config `judge.backend ∈ {openai, vllm}`.

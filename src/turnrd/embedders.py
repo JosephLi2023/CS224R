@@ -1,4 +1,4 @@
-"""Production policy-hidden-state embedder for the TurnRD decomposer (Day 13).
+"""Production policy-hidden-state embedder for the TurnRD decomposer.
 
 `policy_hidden_state_embedder(policy, *, max_len_per_turn=512)` returns a
 closure that satisfies the `TurnEmbedder` contract enforced by
@@ -24,7 +24,7 @@ For each `Trajectory`:
    on a CUDA bf16 device.
 
 The LoRA adapter stays ENABLED — we want hiddens from the current trained
-policy, not the frozen base. (Day 14+ may add a "frozen-backbone" variant
+policy, not the frozen base. (A "frozen-backbone" variant could be added
 if a frozen-embedder experiment is desired.)
 """
 from __future__ import annotations

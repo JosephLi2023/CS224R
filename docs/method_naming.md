@@ -3,13 +3,13 @@
 The codebase accumulated a few generations of method naming
 (`method_a/b/c/d`, `Method A/B/C/D`, `flat_grpo`, `judge`,
 `progress`, `turnrd`, `turnrd_v2`, `counterfactual`, etc.). The
-writeup uses a single canonical vocabulary; this file is the
+report uses a single canonical vocabulary; this file is the
 old↔new mapping for navigating between code/configs/manifests
 and the report text.
 
 ## Mapping table
 
-| Canonical name (writeup) | Description | Legacy keys (configs / manifest rows / register keys) |
+| Canonical name | Description | Legacy keys (configs / manifest rows / register keys) |
 |---|---|---|
 | **SFTOnly** | SFT-warm-started Qwen2.5-1.5B, no RL — the floor baseline. | (no prior key — new in this rename pass) |
 | **flatGRPO** | H-GRPO with α=1.0 (drops per-turn signal) — the trivial-decomposer baseline. | `flat_grpo` (manifest), `configs/method_flat_grpo.json`, `flat_grpo_compare_seed11_*` (run names) |
@@ -21,7 +21,7 @@ and the report text.
 
 ## What stays legacy-named
 
-The rename is **writeup-facing + new-config + new-run-name** only.
+The rename is **report-facing + new-config + new-run-name** only.
 The following deliberately keep their old names so prior runs,
 artifacts, plots, and tests don't break:
 
@@ -40,7 +40,7 @@ artifacts, plots, and tests don't break:
   `tests/unit/test_train_hgpo_config_loader.py`, etc.)
 
 The legacy 4-method comparison artifacts (the JSON, the TXT, and
-the milestone PNGs) live under
+the comparison PNGs) live under
 `experiments/manifests/_legacy/` for archaeology.
 
 ## Where the canonical vocabulary lives

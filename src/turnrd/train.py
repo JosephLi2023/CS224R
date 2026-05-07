@@ -1,4 +1,4 @@
-"""Standalone TurnRD trainer (Method B; Day 13).
+"""Standalone TurnRD trainer (Method B).
 
 `train_turnrd(replay_path, mode, model, ...)` runs SGD over a replay
 buffer of trajectory records (see `src/turnrd/dataset.py` for the schema).
@@ -9,8 +9,7 @@ Two modes:
   (MSE via `loss_mode_2`).
 
 This entrypoint is pure-Python; any Modal `@app.function` can wrap it.
-The corresponding Modal app (`infra/app_train_turnrd.py`) is a
-follow-up — see plan "Deliberately NOT included".
+The corresponding Modal app is `infra/app_train_turnrd.py`.
 
 torch is imported at module top — same gating pattern as
 `src/turnrd/model.py`.

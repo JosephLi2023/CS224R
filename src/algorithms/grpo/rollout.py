@@ -2,10 +2,10 @@
 
 These are pure Python (no torch) so the advantage math + decomposers can be
 unit-tested without a GPU. The actual rollout collector that materializes
-these from a vLLM policy + env will land Week 1 Day 4 in
+these from a vLLM policy + env lives in
 `src/algorithms/grpo/collectors.py`.
 
-Conventions match proposal §3.1:
+Conventions:
 - A "task" is one environment instance (one WebShop product query, one
   ALFWorld household goal).
 - For each task we sample K trajectories τ_1, ..., τ_K from π_θ.
@@ -32,7 +32,7 @@ class TurnRecord:
     # Per-turn intermediate reward as observed from the env (often 0 for
     # sparse-reward tasks; populated by `progress` decomposer for Method C).
     raw_env_reward: float = 0.0
-    # ----- token-level fields populated by the rollout collector (Day 4) -----
+    # ----- token-level fields populated by the rollout collector -----
     # Token ids of the model-generated action (matches `action_text` after detokenization).
     action_token_ids: tuple[int, ...] = ()
     # Per-token log-probs under the rollout-time policy (used by the PPO

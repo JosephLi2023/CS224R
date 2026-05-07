@@ -264,7 +264,7 @@ def test_turnrd_decomposer_casts_stacked_to_model_dtype() -> None:
     """Embedder may return a different dtype than the model's parameters.
     The adapter must cast `stacked` to the model dtype before forward;
     otherwise `nn.Linear(input_proj)` would raise dtype-mismatch on the
-    Day-14 production wiring (LoRAPolicy fp16/bf16 hidden states feeding
+    production wiring (LoRAPolicy fp16/bf16 hidden states feeding
     a fp32 TurnRD).
     """
     model = _make_model()  # fp32 by default
@@ -325,13 +325,13 @@ def test_turnrd_decomposer_neutralises_grad_tracking_embedder() -> None:
     assert seen_requires_grad == [False, False], (
         f"embedder ran outside torch.no_grad(): saw requires_grad={seen_requires_grad}"
     )
-    # Sanity: §3.2 invariant still holds.
+    # Sanity: Σ invariant still holds.
     assert abs(sum(out[0]) - 1.0) < 1e-5
     assert abs(sum(out[1]) - 0.5) < 1e-5
 
 
 # ---------------------------------------------------------------------------
-# Day-13 learnable surface
+# Learnable surface
 # ---------------------------------------------------------------------------
 
 

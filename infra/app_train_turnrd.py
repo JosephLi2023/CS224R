@@ -1,9 +1,9 @@
-"""Modal A100 app: standalone TurnRD trainer (Day 14, Method B).
+"""Modal A100 app: standalone TurnRD trainer (Method B).
 
 Wraps `src.turnrd.train.train_turnrd` so the standalone Method-B
 fitting pass can run on a single A100 against a replay JSONL written
 by the in-loop producer (see `src/algorithms/grpo/collectors.py`'s
-Day-14 emit hook).
+emit hook).
 
 Usage:
 

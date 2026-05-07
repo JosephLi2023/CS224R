@@ -1,4 +1,4 @@
-"""Unit tests for the Day-14 TurnRD replay-buffer producer in
+"""Unit tests for the TurnRD replay-buffer producer in
 `src.algorithms.grpo.collectors.RolloutCollector._emit_turnrd_records`.
 
 Verification matrix:

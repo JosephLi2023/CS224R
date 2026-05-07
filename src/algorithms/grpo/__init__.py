@@ -1,5 +1,5 @@
 """GRPO trainer building blocks: rollout collection, advantage computation,
-loss, KL controller, and the HGPOTrainer class. See proposal §3.1 for the math."""
+loss, KL controller, and the HGPOTrainer class."""
 
 from src.algorithms.grpo.advantage import (
     combine,

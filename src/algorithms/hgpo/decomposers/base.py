@@ -66,10 +66,7 @@ def build_decomposer(
     - "turnrd":        requires `model` (a `TurnRD` nn.Module) + `embedder` (a
       `Callable[[Trajectory], torch.Tensor]` returning per-turn embeddings of
       shape `[T_i, D]`); returns a callable wrapping
-      `TurnRDDecomposer.decompose`. HGPOTrainer integration + refresh hook
-      lands Day 14 — today's surface is the model + adapter + tests only
-      (see `MEDIUM_FIXES.md::M1` and the
-      `~/.llms/plans/cs224r_hgpo_method_b_turnrd_m1.plan.md` plan).
+      `TurnRDDecomposer.decompose`. See `MEDIUM_FIXES.md::M1`.
     - "counterfactual": requires `runner`, `env_factory`, `prompt_renderer`,
       `action_parser`, and `sampling_factory`. Returns a
       `CounterFactualDecomposer` instance whose `__call__` matches the

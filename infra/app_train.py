@@ -102,8 +102,8 @@ def train(
 ) -> str:
     """Run a single training job inside Modal A100.
 
-    For now this delegates to the existing toy `src.trainers.train`. Once
-    `src/trainers/train_hgpo.py` lands (Week 1 Day 6), swap the import.
+    For now this delegates to the existing toy `src.trainers.train`. Swap
+    the import to `src/trainers/train_hgpo.py` once that module is ready.
     """
     sys.path.insert(0, "/workspace")
     # Confirm the OpenAI secret reached us when judge.backend=openai.

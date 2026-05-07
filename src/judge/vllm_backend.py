@@ -23,13 +23,13 @@ class VLLMJudge:
         self.api_token = str(cfg.get("api_token", ""))  # optional shared secret
 
     def score_turns(self, request: JudgeRequest) -> list[TurnScore]:
-        # TODO Day 11:
+        # TODO:
         #   1. POST request as JSON to self.endpoint (use httpx).
         #   2. Parse JSON {"scores": [...]}; len must match request.turns.
         #   3. Apply normalize_scores(raw, request.final_reward).
         #   4. Retry on 5xx with exponential backoff.
-        raise NotImplementedError("VLLMJudge.score_turns: implement on Day 11.")
+        raise NotImplementedError("VLLMJudge.score_turns: not implemented.")
 
     async def score_turns_async(self, request: JudgeRequest) -> list[TurnScore]:
         # TODO: use httpx.AsyncClient; gate concurrency with asyncio.Semaphore.
-        raise NotImplementedError("VLLMJudge.score_turns_async: implement on Day 11.")
+        raise NotImplementedError("VLLMJudge.score_turns_async: not implemented.")

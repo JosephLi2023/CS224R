@@ -4,16 +4,15 @@ artifacts.
 
 Each `--method label=path` argument names a method and points at one of:
 - A single `train_log.json` (Methods A/C: one file per protocol run).
-- A directory containing multiple round dirs (Method B post-fix: the
-  patched `--run-name method_b_orchestrated_seed{N}_round{NN}_<ts>`
+- A directory containing multiple round dirs (Method B with the
+  `--run-name method_b_orchestrated_seed{N}_round{NN}_<ts>`
   pattern; this script auto-aggregates them via the same logic as
   `merge_turnrd_round_logs.py`).
 - A pre-merged train_log.json (output of `merge_turnrd_round_logs.py`).
 
 Top panel: per-episode training reward (5-pt moving average) per method.
 Mid panel: held-out eval `avg_return` markers — one dot per round per
-method (assumed populated by `app_train_loop.py`'s eval block, added in
-the post-mortem follow-up).
+method (assumed populated by `app_train_loop.py`'s eval block).
 Bottom panel (optional, only when at least one method has TurnRD
 diagnostics): cls_query_norm + alpha_var trajectories across episodes.
 

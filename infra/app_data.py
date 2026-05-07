@@ -1,7 +1,7 @@
 """Modal app: WebShop dataset acquisition into the shared Volume.
 
-Day 2 of the plan: bake the WebShop product index into `/vol/data/webshop/`
-so subsequent training runs (Day 4+) can mount the Volume and find the
+Bake the WebShop product index into `/vol/data/webshop/`
+so subsequent training runs can mount the Volume and find the
 index without re-downloading.
 
 Strategy:
@@ -18,11 +18,11 @@ Cost-saving knobs:
   - `small=True` (default): pulls `items_shuffle_1000.json` (~5 MB, 1000
     products) for dev iteration. Use this for first-run verification.
   - `small=False`: pulls the full `items_shuffle.json` (~1.4 GB, 1.18 M
-    products) needed for the proposal §3.3 protocol runs.
+    products) needed for the full WebShop protocol runs.
 
 This app intentionally does NOT install pyserini/Java/spacy yet — those
-heavy deps are only needed when we actually instantiate `WebAgentTextEnv`
-(Day 3-4 work). Keeping data acquisition cheap and fast.
+heavy deps are only needed when we actually instantiate `WebAgentTextEnv`.
+Keeping data acquisition cheap and fast.
 """
 
 from __future__ import annotations

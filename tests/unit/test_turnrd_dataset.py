@@ -1,4 +1,4 @@
-"""Unit tests for `src.turnrd.dataset` (Day 13 — replay-buffer reader).
+"""Unit tests for `src.turnrd.dataset` (replay-buffer reader).
 
 Verification matrix:
 1. `test_dataset_loads_all_records_round_trip_shapes`

@@ -1,9 +1,9 @@
-"""LLM-as-judge per-turn reward decomposer (Method A; proposal §3.2).
+"""LLM-as-judge per-turn reward decomposer (Method A).
 
 For each `Trajectory τ_i` in a `TrajectoryGroup`, builds a `JudgeRequest`
 with one `JudgeTurn` per `TurnRecord`, hits the SQLite read-through cache
 to skip already-scored turns, and asks the `JudgeBackend` to score any
-missing turns. The returned per-turn rewards satisfy the §3.2 invariant
+missing turns. The returned per-turn rewards satisfy the invariant
 `Σ_t r̂_t = R` (within ~1e-9) by construction (`to_turn_scores` does the
 rescaling — see `src/judge/prompts.py:81`).
 
@@ -37,7 +37,7 @@ def _build_request(group_task_id: str, env_name: str, traj: Trajectory, k_index:
     (because their action prefixes match) and they had different `R`s,
     reading the stored `normalized` values would silently produce
     per-turn rewards that DO NOT sum to that trajectory's `R`,
-    violating the proposal §3.2 invariant the cache exists to preserve.
+    violating the invariant the cache exists to preserve.
     Per-K qualification makes the entries disjoint so this can't happen.
 
     Side effect: this defeats the cross-K prefix-sharing that the cache's

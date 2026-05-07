@@ -2,7 +2,7 @@
 
   modal run infra/app_train_step.py::train_step_smoke
 
-Exercises the full Day 5.5 pipeline:
+Exercises the full pipeline:
   LoRAPolicy → VLLMRunner.generate_rich → RolloutCollector → TrajectoryGroup
   (with prompt_token_ids populated) → HGPOTrainer.compute_loss → backward →
   AdamW step → AdaptiveKLController.update → TrainStepStats returned.
@@ -70,7 +70,7 @@ def train_step_smoke(k: int = 2, max_turns: int = 3) -> dict:
     for traj in group.trajectories:
         for turn in traj.turns:
             assert len(turn.prompt_token_ids) > 0, (
-                "prompt_token_ids missing — Day 5.5 wiring regressed"
+                "prompt_token_ids missing — wiring regressed"
             )
 
     print(">>> Building trainer")

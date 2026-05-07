@@ -41,7 +41,7 @@ class VLLMRunnerConfig:
 
 @dataclass
 class SamplingParams:
-    n: int = 4               # how many trajectories per prompt (K from proposal §3.1)
+    n: int = 4               # how many trajectories per prompt (K)
     temperature: float = 1.0
     top_p: float = 0.95
     max_tokens: int = 256
@@ -159,7 +159,7 @@ class VLLMRunner:
         return results
 
     # ------------------------------------------------------------------
-    # Weight sync (the core Day-3 deliverable)
+    # Weight sync
     # ------------------------------------------------------------------
 
     def sync_weights(self, state_dict) -> dict[str, int]:

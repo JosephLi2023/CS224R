@@ -130,7 +130,7 @@ modal run infra/app_train.py::train --train-config configs/baseline_train.json
 ```
 
 This proves the train function dispatches correctly. The real LLM trainer
-replaces the underlying `src.trainers.train` import on Day 6 of Week 1.
+replaces the underlying `src.trainers.train` import.
 
 ---
 
@@ -189,8 +189,7 @@ Method A (`judge.backend=openai`) will then fail at first
 
 - View live spend: <https://modal.com/settings/usage>
 - Soft limits per app: set in dashboard → App → Settings → Spending limits.
-- Plan budget table (target ~$200 of $500 credit) is in
-  `~/.llms/plans/cs224r_hgpo_execution.plan.md` under "Compute budget".
+- Plan budget target: ~$200 of $500 credit.
 
 ---
 

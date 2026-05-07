@@ -19,9 +19,9 @@ app = modal.App(APP_NAME)
 )
 def evaluate(checkpoint_path: str, episodes: int = 100) -> str:
     """Eval-only entrypoint. Stub until LoRAPolicy + LLM evaluator land Week 1."""
-    # TODO Week 1 Day 7: load LoRAPolicy from checkpoint_path, run evaluator
+    # TODO: load LoRAPolicy from checkpoint_path, run evaluator
     # against the eval split, write results to /vol/manifests/<run>/eval_log.json.
-    raise NotImplementedError("Eval entrypoint pending Week 1 Day 7.")
+    raise NotImplementedError("Eval entrypoint not implemented.")
 
 
 @app.local_entrypoint()

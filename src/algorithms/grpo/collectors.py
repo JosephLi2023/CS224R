@@ -4,12 +4,12 @@ Drives a vLLM-style runner through K parallel env instances for one task,
 returning a `TrajectoryGroup` populated with action token ids and
 rollout-time logprobs ready for the GRPO trainer.
 
-Day 14: optional opt-in **TurnRD replay-buffer producer**. When the
+Optional opt-in **TurnRD replay-buffer producer**. When the
 collector is constructed with `turnrd_emit_path` + `turnrd_embedder`
 (and, for Mode 2, `judge_decomposer`), each `collect_group` call
 appends one JSONL row per non-empty trajectory using
-`src.turnrd.dataset.TurnRDRecord` for schema validation. All Day-14
-producer params default to `None`, so the existing flag-driven
+`src.turnrd.dataset.TurnRDRecord` for schema validation. All producer
+params default to `None`, so the existing flag-driven
 `infra/app_train_loop.py` path is byte-for-byte unchanged.
 """
 from __future__ import annotations
@@ -92,7 +92,7 @@ class RolloutCollector:
         cfg: RolloutCollectorConfig | None = None,
         reuse_envs: bool = True,
         *,
-        # Day 14: optional TurnRD replay-buffer producer hook.
+        # Optional TurnRD replay-buffer producer hook.
         # All None ⇒ producer disabled, default behavior unchanged.
         turnrd_emit_path: str | os.PathLike[str] | None = None,
         turnrd_embedder: TurnEmbedder | None = None,
@@ -134,7 +134,7 @@ class RolloutCollector:
         self.cfg = cfg or RolloutCollectorConfig()
         self.reuse_envs = reuse_envs
         self._env_pool: list[Any] = []
-        # Day 14: producer plumbing (validated lazily so the import-time
+        # Producer plumbing (validated lazily so the import-time
         # surface remains torch-free).
         self._turnrd_emit_path: Optional[Path] = (
             Path(turnrd_emit_path) if turnrd_emit_path is not None else None
@@ -261,7 +261,7 @@ class RolloutCollector:
             task_id=str(task_id), env_name=env_name, trajectories=trajectories
         )
 
-        # Day 14: emit TurnRD replay-buffer rows (if the producer was
+        # Emit TurnRD replay-buffer rows (if the producer was
         # configured at construction time). Skipped entirely otherwise.
         if self._turnrd_emit_path is not None:
             self._emit_turnrd_records(group)
@@ -269,7 +269,7 @@ class RolloutCollector:
         return group, stats
 
     # -------------------------------------------------------------------
-    # Day 14: TurnRD replay-buffer producer
+    # TurnRD replay-buffer producer
     # -------------------------------------------------------------------
 
     def _emit_turnrd_records(self, group: TrajectoryGroup) -> None:

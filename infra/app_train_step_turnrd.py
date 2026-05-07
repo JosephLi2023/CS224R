@@ -2,8 +2,8 @@
 
   modal run infra/app_train_step_turnrd.py::train_step_turnrd_smoke
 
-Mirrors `infra/app_train_step.py` (the Day-5.5 flat-GRPO smoke) but
-exercises the Day-13/14 Method-B path on real hardware:
+Mirrors `infra/app_train_step.py` (the flat-GRPO smoke) but
+exercises the Method-B path on real hardware:
 
   LoRAPolicy  → VLLMRunner.generate_rich → RolloutCollector
                                             ├─ TurnRD producer hook writes
@@ -20,7 +20,7 @@ exercises the Day-13/14 Method-B path on real hardware:
                 └─ total = policy_loss + kl_term + cons_loss_t
               → backward
               → policy AdamW step + clip
-              → TurnRD AdamW step + clip   ← Day-13 second optimizer
+              → TurnRD AdamW step + clip   ← second optimizer
               → AdaptiveKLController.update
               → TrainStepStats
 
@@ -139,7 +139,7 @@ def train_step_turnrd_smoke(
     cls_query_before = turnrd_model.cls_query.detach().clone().cpu()
 
     # -----------------------------------------------------------------
-    # 3. Collector with the Day-14 producer plumbing
+    # 3. Collector with the producer plumbing
     # -----------------------------------------------------------------
 
     replay_path = "/vol/cache/turnrd_replay_smoke.jsonl"
@@ -170,7 +170,7 @@ def train_step_turnrd_smoke(
     for traj in group.trajectories:
         for turn in traj.turns:
             assert len(turn.prompt_token_ids) > 0, (
-                "prompt_token_ids missing — Day 5.5 wiring regressed"
+                "prompt_token_ids missing — wiring regressed"
             )
 
     # FakeWebShopEnv is fully deterministic (`src/envs/fake_webshop.py`).
@@ -221,7 +221,7 @@ def train_step_turnrd_smoke(
     )
     assert trainer._decomposer_learnable is True, (
         "Trainer did not detect TurnRDDecomposer as learnable — "
-        "Day-13 has_learnable_params getattr regressed"
+        "has_learnable_params getattr regressed"
     )
 
     trainable = policy.trainable_parameters()
@@ -240,7 +240,7 @@ def train_step_turnrd_smoke(
     raw_param_deltas = [abs(a - b) for a, b in zip(after_norms, before_norms)]
     param_deltas = [round(d, 9) for d in raw_param_deltas]
 
-    # The Day-13 C3 reattach end-to-end check: cls_query MUST have moved
+    # The C3 reattach end-to-end check: cls_query MUST have moved
     # IF the rollout group produced any reward variance (no variance →
     # all advantages collapse to 0 → zero gradient on policy AND
     # turnrd, even though the code paths are correct).
@@ -339,7 +339,7 @@ def train_step_turnrd_smoke(
         "mean_traj_adv": stats.mean_traj_adv,
         "mean_turn_adv": stats.mean_turn_adv,
         "param_norm_deltas_first4": param_deltas,
-        # Day-13/14 extras:
+        # Method-B extras:
         "cls_query_delta": round(cls_query_delta, 6),
         "reward_variance": round(reward_variance, 4),
         "input_dim_from_policy": input_dim,

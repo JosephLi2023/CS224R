@@ -62,9 +62,8 @@ def render_webshop_turn_prompt(
         valid_actions: explicit action whitelist; defaults to
                        `state.valid_actions` if available, else None.
         max_history_turns: keep only the most recent N turns of history in
-                           the prompt to bound vLLM context growth (Day 6
-                           hardening; default 3 keeps prompts well under
-                           the 2048-token cap).
+                           the prompt to bound vLLM context growth (default
+                           3 keeps prompts well under the 2048-token cap).
 
     Returns:
         Prompt string ending with `Thought:` so the model is prompted to

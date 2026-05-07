@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launches the proposal §3.3 WebShop protocol: 6 methods × 1 seed = 6 runs.
+# Launches the WebShop protocol: 6 methods × 1 seed = 6 runs.
 # Run twice (seed=11 then seed=23) for the full 12-run protocol.
 #
 # Usage:

@@ -1,4 +1,4 @@
-"""TurnRD model — learned per-turn reward decomposer (Method B; proposal §3.2).
+"""TurnRD model — learned per-turn reward decomposer (Method B).
 
 Architecture:
 - `input_proj`: learned linear `[input_dim → hidden_size]` so we can run
@@ -11,7 +11,7 @@ Architecture:
   performed by a separate cross-attention pool below.
 - `cls_pool`: a single cross-attention layer where a learned `cls_query`
   attends over the encoder outputs. Its softmax `attn` weights ARE the
-  `α_t` of proposal §3.2 (non-negative, sum-to-1 along T, mask-respecting).
+  `α_t` (non-negative, sum-to-1 along T, mask-respecting).
   This is the cleanest way to extract attention weights from PyTorch:
   the built-in `nn.TransformerEncoder` does not surface per-layer attention
   via its forward signature.
@@ -20,7 +20,7 @@ Architecture:
 
 Per-turn rewards are constructed as `r̂_t = α_t · R` via
 `TurnRDOutput.decompose(R)`. Because `Σ_t α_t = 1` by softmax (with
-masking), the §3.2 invariant `Σ_t r̂_t = R` holds exactly.
+masking), the invariant `Σ_t r̂_t = R` holds exactly.
 
 torch is imported at module top — this module is consumed only on
 torch-enabled hosts (Modal A100); Mac-side tests gate via
@@ -226,7 +226,7 @@ class TurnRD(nn.Module):
         # (well-known PyTorch behavior), and the post-pool clamp_min(1e-12) won't
         # rescue an already-NaN attention weight tensor. The TurnRDDecomposer
         # adapter short-circuits empty trajectories before they reach forward,
-        # so this only fires for direct callers (Day-13 standalone trainer,
+        # so this only fires for direct callers (the standalone trainer,
         # ad-hoc debugging) — fail loudly rather than silently emit NaN rewards.
         if not bool((attention_mask.sum(dim=-1) > 0).all().item()):
             raise ValueError(
@@ -270,7 +270,7 @@ class TurnRD(nn.Module):
         # 6. Single cross-attention pool. Returns:
         #    - pooled: [B, 1, H]
         #    - attn:   [B, 1, T]   (averaged over heads via average_attn_weights=True)
-        #    The softmax attention weights ARE α_t (proposal §3.2).
+        #    The softmax attention weights ARE α_t.
         pooled, attn = self.cls_pool(
             cls_q,
             h,

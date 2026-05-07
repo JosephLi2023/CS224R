@@ -1,7 +1,7 @@
 """Integration tests for the judge backend factory + sqlite cache.
 
-These exercise the full read-through cache path that the trainer will use on
-Day 11 (`src/algorithms/hgpo/decomposers/judge.py`):
+These exercise the full read-through cache path used by the trainer
+(`src/algorithms/hgpo/decomposers/judge.py`):
 
     cached, hashes = cache.get_or_miss(request, model_tag)
     missing_indices = [i for i, c in enumerate(cached) if c is None]

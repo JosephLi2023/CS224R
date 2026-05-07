@@ -1,4 +1,4 @@
-"""Unit tests for `src.algorithms.grpo.advantage.consistency_loss_tensor` (Day 13).
+"""Unit tests for `src.algorithms.grpo.advantage.consistency_loss_tensor`.
 
 Twin of the pure-Python `consistency_loss`; verifies:
 1. Numerical equivalence on identical inputs (within 1e-6).

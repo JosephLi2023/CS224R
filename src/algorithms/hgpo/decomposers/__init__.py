@@ -1,10 +1,10 @@
 """Per-turn reward decomposers for H-GRPO.
 
-Methods supported (proposal §3):
+Methods supported:
 - "progress" (Method C): per-turn reward = `TurnRecord.raw_env_reward`.
 - "judge"    (Method A): per-turn reward = LLM-as-judge normalized score.
 - "turnrd"   (Method B): per-turn reward = learned TurnRD model output
-  (`r̂_t = α_t · R` from a [CLS] cross-attention head). Day 13 added the
+  (`r̂_t = α_t · R` from a [CLS] cross-attention head). Provides the
   full learnable surface (`has_learnable_params`, `parameters`,
   `decompose_with_grad`, `state_dict`/`load_state_dict`) plus the
   HGPOTrainer refresh hook + C3 consistency-loss reattach.

@@ -13,7 +13,7 @@ Per-episode loop:
 Persists `train_log.json` to /vol/manifests/<run_name>/train_log.json so we
 have a per-episode reward curve we can plot offline.
 
-Env-name dispatch (Day 16+):
+Env-name dispatch:
   Two `@app.function` entrypoints — `train_loop_webshop` (binds
   `webshop_image`, deps include Java/pyserini/spaCy) and
   `train_loop_alfworld` (binds `alfworld_image`, much lighter). Both
@@ -141,7 +141,7 @@ def _train_loop_impl(
 
     adapter_cls, prompt_renderer, action_parser = _resolve_env_bindings(env_name)
 
-    # Day 14: optional JSON config — overrides the per-flag trainer/decomposer
+    # Optional JSON config — overrides the per-flag trainer/decomposer
     # construction with a `build_trainer_from_config` call. When config is
     # empty, the legacy flag-driven path runs unchanged (preserves all
     # existing callers' behavior — Methods A/C and the flat-GRPO smoke tests).
@@ -159,7 +159,7 @@ def _train_loop_impl(
         # (`<prefix>_round00`, `_round01`, …) would collapse onto a
         # single `cfg.run.name` and the per-round log aggregator
         # (`scripts/merge_turnrd_round_logs.py`) couldn't auto-detect
-        # rounds — see the post-mortem in the execution plan.
+        # rounds.
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     run_dir = f"/vol/manifests/{run_name}_{timestamp}"
@@ -232,7 +232,7 @@ def _train_loop_impl(
             env_kwargs=dict(cfg_env_kwargs),
         )
 
-    # Day 14: choose between the legacy flag-driven trainer/collector
+    # Choose between the legacy flag-driven trainer/collector
     # construction and the JSON-config-driven path.
     if cfg_dict is not None:
         from src.trainers.train_hgpo import build_trainer_from_config
@@ -386,12 +386,12 @@ def _train_loop_impl(
         except Exception as exc:
             print(f"ep={ep} CRASHED: {exc!r}")
             log.append({"episode": ep, "task_id": task_id, "error": repr(exc)})
-            # v9 F3: when an episode crashes mid-step (typical: CUDA OOM
+            # When an episode crashes mid-step (typical: CUDA OOM
             # or an UnboundLocalError after partial allocations), the
             # `if sync_every > 0 ...` empty_cache block above is skipped.
             # That leaves the failed step's activations in the allocator
             # cache, dramatically increasing the chance the NEXT episode
-            # also OOMs — exactly the cascading-OOM pattern observed in v6
+            # also OOMs — a cascading-OOM pattern previously observed
             # (UnboundLocalError eps left ~1-2 GiB pinned, and the next
             # ep's larger forward immediately OOM'd). Flush proactively in
             # the except branch so each crash starts the next ep clean.

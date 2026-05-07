@@ -6,7 +6,7 @@ WebShop required), runs `JudgeDecomposer.decompose(...)` against the real
 gpt-4o-mini backend with a temp JudgeCache, then re-runs and verifies the
 cache short-circuits (zero fresh API calls).
 
-Acceptance bullets validated (plan-doc Day 10):
+Acceptance bullets validated:
 - ≥10 trajectories scored end-to-end via OpenAI.
 - Σ-invariant `Σ_t r̂_t == R` per trajectory holds on real outputs.
 - Cache hits on rerun (`fresh_calls == 0`).

@@ -1,7 +1,6 @@
 """Unit tests for `src.turnrd.model` (TurnRD; Method B; M1 surface).
 
-Verification matrix per `MEDIUM_FIXES.md::M1` + the
-`~/.llms/plans/cs224r_hgpo_method_b_turnrd_m1.plan.md` plan:
+Verification matrix per `MEDIUM_FIXES.md::M1`:
 
 1. `test_turnrd_forward_output_shapes`
 2. `test_turnrd_mask_honored_padded_turns_zero_attention`
@@ -105,8 +104,8 @@ def test_turnrd_mode_1_loss_decreases_on_synthetic() -> None:
     Uses Adam(lr=1e-3) rather than the literal SGD-lr-1e-3 the M1 spec
     sketched: with a small Transformer + softmax pool, plain SGD at 1e-3 is
     too slow to clear the 30% bar in 50 steps; Adam reaches it comfortably
-    and is the realistic choice for the standalone TurnRD trainer that
-    Day 13 will land. The verification gate is the >=30% drop, not the
+    and is the realistic choice for the standalone TurnRD trainer.
+    The verification gate is the >=30% drop, not the
     optimizer choice.
     """
     _seed(123)
@@ -307,7 +306,7 @@ def test_loss_value_head_uses_per_row_T_not_batch_T_max():
     # Build a synthetic output where:
     # row 0 has T_i=5 (full length); row 1 has T_i=3 (padded to T=5).
     B, T = 2, 5
-    # V predicts EXACTLY the correct (post-fix) target; loss should be 0.
+    # V predicts EXACTLY the correct target; loss should be 0.
     R = torch.tensor([1.0, 1.0])
     gamma = 0.95
     # Per-row targets:
@@ -328,17 +327,17 @@ def test_loss_value_head_uses_per_row_T_not_batch_T_max():
         encoder_hidden=torch.zeros(B, T, 4),
     )
     loss = loss_value_head(out, R, mask, gamma=gamma)
-    # Post-fix: targets match exactly → loss == 0.
+    # Targets match exactly → loss == 0.
     assert loss.item() < 1e-6, (
         f"loss_value_head should compute per-row T_i targets; got loss={loss.item()}. "
-        "Pre-fix bug would compute target γ^(T_max-1-t)·R using global T_max=5, "
+        "An earlier bug computed target γ^(T_max-1-t)·R using global T_max=5, "
         "making row 1's last-turn target γ^(5-1-2)=γ^2 instead of γ^0=1."
     )
 
 
 def test_loss_value_head_pre_fix_would_have_failed():
     """Independent verification: with full-length rows ONLY (T_i==T_max),
-    the loss should also be 0 with pre-fix and post-fix code (sanity)."""
+    the loss should also be 0 (sanity)."""
     from src.turnrd.model import TurnRDOutput, loss_value_head
     B, T = 2, 4
     R = torch.tensor([1.0, 1.0])

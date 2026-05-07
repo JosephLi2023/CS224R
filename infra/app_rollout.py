@@ -1,4 +1,4 @@
-"""Modal A100 smoke for the Day-4 rollout collector + FakeWebShopEnv."""
+"""Modal A100 smoke for the rollout collector + FakeWebShopEnv."""
 from __future__ import annotations
 
 import modal  # type: ignore[import-not-found]

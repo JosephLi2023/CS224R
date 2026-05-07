@@ -13,8 +13,7 @@ nondeterministically fails.
 For every step we emit one JSONL row with:
   - prompt  — pre-rendered by `render_alfworld_turn_prompt` (the SAME
               renderer the runtime ReAct collector uses; this is the
-              critical anti-template-drift guarantee — see plan
-              `alfworld_sft_warm_start.plan.md` Risks section).
+              critical anti-template-drift guarantee).
   - action  — the expert plan action string just executed.
   - step_idx, trajectory_id, instruction, final_reward — bookkeeping.
 

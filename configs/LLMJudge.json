@@ -54,5 +54,5 @@
   "logging": {
     "print_every": 10
   },
-  "_notes": "LLMJudge = OpenAI judge-decomposer (GPT-4o-mini scoring per-turn rewards). Canonical-vocabulary copy of configs/method_hgpo_judge.json. Defaults to backend=openai per proposal \u00a73.2; the Modal Secret 'openai-secret' (key OPENAI_API_KEY) is mounted onto the trainer container by infra/app_train.py::train. Flip backend to 'vllm' to A/B against the self-hosted Qwen2.5-7B-Instruct judge served by infra/app_judge.py. Populates methods_comparison.json::LLMJudge \u2014 currently null, blocked on judge cache budget; expected fresh run cost ~$30-50."
+  "_notes": "LLMJudge = OpenAI judge-decomposer (GPT-4o-mini scoring per-turn rewards). Canonical-vocabulary copy of configs/method_hgpo_judge.json. Defaults to backend=openai; the Modal Secret 'openai-secret' (key OPENAI_API_KEY) is mounted onto the trainer container by infra/app_train.py::train. Flip backend to 'vllm' to A/B against the self-hosted Qwen2.5-7B-Instruct judge served by infra/app_judge.py. Populates methods_comparison.json::LLMJudge \u2014 currently null, blocked on judge cache budget; expected fresh run cost ~$30-50."
 }

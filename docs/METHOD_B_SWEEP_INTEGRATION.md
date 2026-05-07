@@ -12,9 +12,7 @@ methods currently share.
 > buffer + reads the latest TurnRD ckpt) and the standalone TurnRD
 > trainer (reads the buffer + writes the ckpt). They alternate per round,
 > and only the orchestration script (`scripts/run_turnrd_modal.py`)
-> handles that coordination correctly. See the Method-B completion
-> summary in `~/.llms/plans/cs224r_hgpo_execution.plan.md` for the
-> design rationale.
+> handles that coordination correctly.
 
 ---
 
@@ -267,4 +265,4 @@ changes.
 - **Loader**: `src/trainers/train_hgpo.py::build_trainer_from_config`.
 - **CPU smoke**: `tests/smoke/test_method_b_config_loader_smoke.py`.
 - **Modal setup**: `docs/MODAL_SETUP.md`.
-- **Design rationale**: `~/.llms/plans/cs224r_hgpo_execution.plan.md` "Method-B completion summary" section, plus `MEDIUM_FIXES.md::M1` and `MEDIUM_FIXES.md::C3`.
+- **Design rationale**: `MEDIUM_FIXES.md::M1` and `MEDIUM_FIXES.md::C3`.

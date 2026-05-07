@@ -15,8 +15,7 @@
 #        run_turnrd_modal.py); pattern mirrors run_method_c_alfworld.sh
 #        but is INLINED here so we can drop `set -euo pipefail` and
 #        use `|| true` on transient Modal CLI exit-1 (root cause of
-#        the previous Method C dying mid-sweep — see plan
-#        `alfworld_sft_warm_start.plan.md` Risks).
+#        the previous Method C dying mid-sweep).
 #
 # All three methods get the same `--sft-adapter` argument so they
 # train from a non-trivial init that knows AlfWorld's verb surface.

@@ -1,4 +1,4 @@
-"""Unit tests for H-GRPO advantage math (proposal §3.1).
+"""Unit tests for H-GRPO advantage math.
 
 Includes the verification-gate test from the plan: with α=1 and λ=0, the
 combined advantage and loss must reduce exactly to flat GRPO.
@@ -175,7 +175,7 @@ def test_alpha_one_lambda_zero_reduces_to_flat_grpo() -> None:
     """Verification gate #1 from the plan: with α=1 and λ=0, the H-GRPO
     combined advantage equals the trajectory-level advantage broadcast over
     all turns, and the consistency loss vanishes. This is the bit-exact
-    flat-GRPO recovery property required by proposal §3.1."""
+    flat-GRPO recovery property."""
     final_rewards = [0.1, 0.5, 0.9, 0.3]  # K=4
     per_turn = [
         [0.0, 0.05, 0.05],

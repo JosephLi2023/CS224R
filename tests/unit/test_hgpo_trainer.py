@@ -21,7 +21,7 @@ class _StubPolicy:
     class _M:
         def __init__(self):
             # Provide a real (1-element) parameter so AdamW can be built when
-            # tests exercise `train_step` (e.g. the Day-13 refresh-hook
+            # tests exercise `train_step` (e.g. the refresh-hook
             # tests). Lazy-imported torch keeps the module load torch-free
             # for the pure-Python tests above.
             try:
@@ -180,7 +180,7 @@ def test_snapshot_returns_count_for_stub_policy():
 
 
 # ---------------------------------------------------------------------------
-# Day 13: refresh hook + C3 reattach
+# Refresh hook + C3 reattach
 # ---------------------------------------------------------------------------
 
 
@@ -253,10 +253,11 @@ def test_decomposer_optimizer_only_built_for_learnable_decomposer():
 
 
 def test_v9_v_head_override_does_not_crash_and_actually_drives_ppo_loss():
-    """v9 F4 regression test for two structural bugs in v6's V-head wiring.
+    """Regression test for two structural bugs in an earlier V-head wiring.
 
-    Pre-v9, ``compute_loss`` had two bugs in the V-head override path that
-    were both observable simultaneously and individually catastrophic:
+    An earlier version of ``compute_loss`` had two bugs in the V-head
+    override path that were both observable simultaneously and individually
+    catastrophic:
 
     Bug A (UnboundLocalError):
         The override block at L807 referenced ``traj_adv[orig_i]`` (Python

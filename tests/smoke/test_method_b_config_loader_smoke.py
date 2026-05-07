@@ -1,4 +1,4 @@
-"""End-to-end smoke test for the Day-14 Method-B config-loader flow.
+"""End-to-end smoke test for the Method-B config-loader flow.
 
 Closes the full Method-B loop on CPU without any Modal/GPU/LLM:
 
@@ -116,7 +116,7 @@ class _StubPolicy:
 
 
 class TestConfigLoaderSmoke(unittest.TestCase):
-    """End-to-end smoke for the Day-14 wiring."""
+    """End-to-end smoke for the Method-B config-loader wiring."""
 
     def setUp(self) -> None:
         if torch is None:

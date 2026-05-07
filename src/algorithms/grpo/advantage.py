@@ -1,4 +1,4 @@
-"""H-GRPO advantage math (proposal §3.1).
+"""H-GRPO advantage math.
 
 All functions are pure-Python (operate on `list[float]` / `list[list[float]]`)
 so they're trivially unit-testable without torch and so the same code paths
@@ -7,14 +7,14 @@ run in numerical-correctness tests AND in the trainer (which adapts via
 bottleneck we'll add a torch-native path; until then clarity wins.
 
 Notation:
-- K = number of trajectories per task (proposal default: K=4).
+- K = number of trajectories per task (default: K=4).
 - For trajectory i ∈ {0..K-1}, R_i is the final scalar reward.
 - For turn t in trajectory i, r̂_t^i is the per-turn reward produced by a
   decomposer (Method A judge / Method B TurnRD / Method C progress).
 - σ_floor (=1e-8) is added inside std() to keep gradients finite when a
   group is degenerate (all rewards equal).
 
-Formulas (proposal §3.1):
+Formulas:
 
     Â_traj(τ_i)        = (R_i − R̄) / σ_R
     Â_turn(t, τ_i)     = (r̂_t^i − r̄_t) / σ_{r̂_t}        per position t
@@ -125,7 +125,7 @@ def combine(
     traj_advantages: list[float],
     turn_advantages: list[list[float]],
 ) -> list[list[float]]:
-    """Combine trajectory- and turn-level advantages per proposal §3.1.
+    """Combine trajectory- and turn-level advantages.
 
     Â_H(t, τ_i) = α · Â_traj(τ_i) + (1 − α) · Â_turn(t, τ_i)
 
@@ -195,7 +195,7 @@ def consistency_loss_tensor(
     turn_adv,
     attention_mask,
 ):
-    """Torch-tensor twin of `consistency_loss` (Day 13).
+    """Torch-tensor twin of `consistency_loss`.
 
     Mirrors the same math but returns a scalar `torch.Tensor` so the
     gradient can flow back into a learnable decomposer (Method B/TurnRD).

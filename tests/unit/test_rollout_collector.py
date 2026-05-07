@@ -200,7 +200,7 @@ def test_reuse_envs_off_builds_fresh_each_call():
 
 
 # ---------------------------------------------------------------------------
-# Defensive: empty-completion-list handling (post-mortem from the
+# Defensive: empty-completion-list handling (defends against the
 # `eval ep=32 task=10032 CRASHED: IndexError('list index out of range')`
 # Modal-side report). vLLM with greedy sampling can return [] for some
 # prompts; collect_group must NOT raise IndexError on this.

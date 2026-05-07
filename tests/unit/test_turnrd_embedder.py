@@ -1,4 +1,4 @@
-"""Unit tests for `src.turnrd.embedders.policy_hidden_state_embedder` (Day 13).
+"""Unit tests for `src.turnrd.embedders.policy_hidden_state_embedder`.
 
 Verification matrix:
 1. `test_embedder_returns_correct_shape_per_trajectory`

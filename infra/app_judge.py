@@ -1,4 +1,4 @@
-"""Modal vLLM judge app (A10G). Skeleton — deploy on Day 11.
+"""Modal vLLM judge app (A10G). Skeleton — not yet deployed.
 
 Will serve Qwen2.5-7B-Instruct via vLLM behind a `/score_turns` HTTP endpoint
 consumed by `src.judge.vllm_backend.VLLMJudge`.
@@ -30,7 +30,7 @@ def hello() -> str:
     return "judge app is reachable"
 
 
-# TODO Day 11: switch hello → @app.cls with gpu="A10G", concurrency_limit=8,
+# TODO: switch hello → @app.cls with gpu="A10G", concurrency_limit=8,
 # load qwen2.5-7b-instruct via vllm.LLM at startup, expose /score_turns via FastAPI.
 
 

@@ -575,13 +575,13 @@ def _train_loop_cmd(cfg: OrchestrationConfig, round_idx: int) -> list[str]:
       --sync-every / --run-name / --sft-adapter / --use-sft-as-ref /
       --kl-warmup-episodes / --gpu-mem-util / --config
 
-    We rely on the JSON config to set most of these (per the Day-14
-    `--config` switch); only `--n-episodes`, `--k`, `--task-id-offset`,
+    We rely on the JSON config to set most of these via the `--config`
+    switch; only `--n-episodes`, `--k`, `--task-id-offset`,
     and `--run-name` are overridden round-by-round (and seed-by-seed).
     `--k` is read from `cfg.config_path` JSON's
     `train.K_trajectories_per_task` so the protocol K matches what the
     user configured (the JSON-driven app no longer overrides this on
-    its own — see the post-mortem in the execution plan).
+    its own).
 
     `--config` is translated to its in-container `/workspace/...` path
     so `open(...)` inside the Modal function actually finds the file.
@@ -616,8 +616,7 @@ def _train_loop_cmd(cfg: OrchestrationConfig, round_idx: int) -> list[str]:
     ]
     # `gpu_mem_util` from the JSON's train block, when present. This
     # caps vLLM's KV cache so the trainer has enough activation room
-    # for grad-tracking forward passes — the OOM mitigation from the
-    # prior protocol post-mortem (see execution plan).
+    # for grad-tracking forward passes (OOM mitigation).
     gpu_mem_util_cfg = (cfg_json.get("train", {}) or {}).get("gpu_mem_util")
     if gpu_mem_util_cfg is not None:
         cmd.extend(["--gpu-mem-util", str(float(gpu_mem_util_cfg))])

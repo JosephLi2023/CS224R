@@ -1,7 +1,7 @@
 """Independent flat-GRPO loss reference implementation (M8 verification gate).
 
 This module deliberately does NOT import from `src.algorithms.grpo.*`. It is a
-fresh re-derivation from proposal §3.1 used as an independent oracle in
+fresh re-derivation used as an independent oracle in
 `tests/m8/test_flat_grpo_equivalence.py` to catch formula regressions in the
 trainer's pure-Python helpers.
 
@@ -42,7 +42,7 @@ def reference_flat_grpo_loss(
 ) -> float:
     """End-to-end flat-GRPO loss: -mean( min(ρ·Â, clip(ρ,1±ε)·Â) ).
 
-    Per proposal §3.1 with α=1, λ=0, kl_coef=0:
+    Flat-GRPO setting (α=1, λ=0, kl_coef=0):
       1. Â_i = (R_i − R̄)/σ_R
       2. broadcast Â_i to every token in trajectory i
       3. ρ_t = exp(new_lp_t − old_lp_t)

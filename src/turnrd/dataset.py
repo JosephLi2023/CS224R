@@ -1,4 +1,4 @@
-"""TurnRD replay-buffer reader (Method B; Day 13).
+"""TurnRD replay-buffer reader (Method B).
 
 Schema (one JSON object per line in the replay JSONL file):
 ```
@@ -13,8 +13,8 @@ Schema (one JSON object per line in the replay JSONL file):
 ```
 
 Why pre-compute embeddings on the producer side rather than ship raw text?
-The producer (a future PR — see plan "Deliberately NOT included") runs once
-during a parent H-GRPO rollout and already has the policy + tokenizer in
+The producer runs once during a parent H-GRPO rollout and already has the
+policy + tokenizer in
 memory; pushing the cost there means the standalone TurnRD trainer never
 re-tokenizes or re-forwards through the policy, and per-step train cost
 stays cheap (pure TurnRD-only forward + backward). A `text` variant can

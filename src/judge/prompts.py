@@ -2,7 +2,7 @@
 
 Templates ask the judge to assign each turn a 0-10 score reflecting that turn's
 contribution to the final outcome. We rescale so that the per-turn scores sum
-exactly to the trajectory's final reward, per proposal §3.2.
+exactly to the trajectory's final reward.
 """
 
 from __future__ import annotations
@@ -61,7 +61,7 @@ def system_prompt() -> str:
 
 
 def normalize_scores(raw_scores: list[float], final_reward: float) -> list[float]:
-    """Rescale `raw_scores` so they sum to `final_reward` (proposal §3.2 invariant).
+    """Rescale `raw_scores` so they sum to `final_reward` (Σ invariant).
 
     Edge cases:
     - All-zero raw scores: distribute final_reward uniformly.
