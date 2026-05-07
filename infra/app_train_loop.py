@@ -303,6 +303,18 @@ def _train_loop_impl(
     # Generic config snapshot for train_log.json — env-agnostic now that
     # `num_products` is just one possible env_kwarg among many.
     def _config_snapshot() -> dict:
+        # Tier-4 observability: surface the TurnRD ckpt-load outcome (set
+        # by train_hgpo._refresh) so the post-sweep manifest can verify
+        # the trained TurnRD ckpt from round N-1 actually reached round N
+        # (currently only visible in the Modal container's stdout, not in
+        # the persisted train_log).
+        _turnrd_refresh = None
+        try:
+            _decomposer = getattr(trainer, "decomposer", None)
+            if _decomposer is not None:
+                _turnrd_refresh = getattr(_decomposer, "_last_refresh_status", None)
+        except Exception:
+            _turnrd_refresh = None
         return {
             "env_name": env_name,
             "env_kwargs": cfg_env_kwargs,
@@ -310,6 +322,7 @@ def _train_loop_impl(
             "task_id_offset": task_id_offset,
             "sync_every": sync_every, "run_name": run_name,
             "sft_adapter": sft_adapter,
+            "turnrd_refresh": _turnrd_refresh,
         }
 
     log: list[dict] = []
@@ -356,6 +369,12 @@ def _train_loop_impl(
                 "alpha_max": round(stats.alpha_max, 6),
                 "alpha_entropy": round(stats.alpha_entropy, 6),
                 "alpha_progress_corr": round(stats.alpha_progress_corr, 6),
+                # ----- Tier-4 real-signal columns (see TrainStepStats) -----
+                "std_reward_group": round(stats.std_reward_group, 6),
+                "dead_K_group": int(stats.dead_K_group),
+                "mean_abs_traj_adv": round(stats.mean_abs_traj_adv, 6),
+                "std_traj_adv": round(stats.std_traj_adv, 6),
+                "mean_abs_adv_token": round(stats.mean_abs_adv_token, 6),
                 "elapsed_s": round(time.time() - ep_t0, 2),
             }
             log.append(row)
@@ -364,7 +383,9 @@ def _train_loop_impl(
                 f"R={row['mean_reward']:.3f}\u00b1{row['std_reward']:.3f} "
                 f"loss={row['policy_loss']:+.4f} "
                 f"kl={row['observed_kl']:+.4f} kl_coef={row['kl_coef']:.4f} "
-                f"gn={row['grad_norm']:.3f} t={row['elapsed_s']}s"
+                f"gn={row['grad_norm']:.3f} "
+                f"aT={row['mean_abs_adv_token']:.3f} dK={row['dead_K_group']} "
+                f"t={row['elapsed_s']}s"
             )
 
             if sync_every > 0 and (ep + 1) % sync_every == 0:

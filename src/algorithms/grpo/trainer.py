@@ -98,6 +98,15 @@ class TrainStepStats:
     alpha_max: float = 0.0           # max α weight in the group
     alpha_entropy: float = 0.0       # mean H(α); uniform on T turns ⇒ log(T); peaked ⇒ small
     alpha_progress_corr: float = 0.0 # mean Pearson corr(α, env raw_env_reward) over trajectories
+    # ----- Tier-4 real-signal columns -----
+    # The legacy `mean_traj_adv` / `mean_turn_adv` columns are mathematically
+    # zero by construction (mean over centered values within a K-group).
+    # The columns below carry the actual gradient-bearing signal magnitude.
+    std_reward_group: float = 0.0    # std over the K final rewards; 0 ⇒ degenerate K-group (all K rollouts gave same R)
+    dead_K_group: int = 0            # 1 if std_reward_group < 1e-12 (no policy gradient on this group); else 0
+    mean_abs_traj_adv: float = 0.0   # mean |Â_traj| over K; non-zero whenever std_reward_group > 0
+    std_traj_adv: float = 0.0        # std of Â_traj over K; ≈ 1 by construction whenever std_reward_group > 0
+    mean_abs_adv_token: float = 0.0  # mean |adv_t| over the action tokens fed to PPO surrogate — the scalar gating policy_loss magnitude
 
 
 PerTurnDecomposer = Callable[[TrajectoryGroup], list[list[float]]]
@@ -578,6 +587,33 @@ class HGPOTrainer:
         traj_adv: list[float] = adv["traj_adv"]
         flat_turn_adv: list[float] = [v for row in adv["turn_adv"] for v in row]
 
+        # ----- Tier-4 real-signal stats (computed alongside traj_adv) -----
+        # mean_traj_adv / mean_turn_adv are zero by construction (mean of
+        # centered values within a K-group). These columns instead capture
+        # whether the trainer is actually receiving gradient signal:
+        #   std_reward_group  = std of K final rewards (0 ⇒ dead K-group)
+        #   dead_K_group      = 1 if all K rollouts agree on R (no PG signal)
+        #   mean_abs_traj_adv = average per-trajectory advantage magnitude;
+        #                       non-zero whenever std_reward_group > 0
+        #   std_traj_adv      = sanity-check the σ-normalisation (should be ≈1)
+        _final_R = group.final_rewards()
+        if _final_R:
+            _R_mean = sum(_final_R) / len(_final_R)
+            _R_std = (sum((r - _R_mean) ** 2 for r in _final_R) / len(_final_R)) ** 0.5
+        else:
+            _R_std = 0.0
+        _std_reward_group: float = float(_R_std)
+        _dead_K_group: int = 1 if _std_reward_group < 1e-12 else 0
+        if traj_adv:
+            _mean_abs_traj_adv: float = sum(abs(a) for a in traj_adv) / len(traj_adv)
+            _traj_mean = sum(traj_adv) / len(traj_adv)
+            _std_traj_adv: float = (
+                sum((a - _traj_mean) ** 2 for a in traj_adv) / len(traj_adv)
+            ) ** 0.5
+        else:
+            _mean_abs_traj_adv = 0.0
+            _std_traj_adv = 0.0
+
         device = next(self.policy.model.parameters()).device
 
         all_new_lp: list[torch.Tensor] = []
@@ -820,6 +856,64 @@ class HGPOTrainer:
                     _alpha_corr_sum / _alpha_corr_n if _alpha_corr_n > 0 else 0.0
                 )
 
+        # ----- Tier-4: lift alpha_* logging out of the lambda_consistency gate -----
+        # When `lambda_consistency == 0.0` the gradient block above is skipped
+        # and the alpha_* locals stay at 0.0, even though TurnRD's eval-mode
+        # `decompose()` already ran and produced an α tensor (stashed on the
+        # decomposer as `_last_alpha` by the Tier-4 patch in turnrd.py).
+        # Recompute the same stats here from the eval-mode α so the train_log
+        # column is meaningful regardless of `lambda_consistency`. Only runs
+        # when the gated block did NOT already populate them (so we don't
+        # double-write under the lambda_consistency>0 codepath).
+        if (
+            self._decomposer_learnable
+            and _alpha_mean == 0.0
+            and _alpha_var == 0.0
+            and getattr(self.decomposer, "_last_alpha", None) is not None
+        ):
+            try:
+                _last_alpha = self.decomposer._last_alpha       # CPU [K_real, T_max]
+                _last_mask = self.decomposer._last_alpha_mask    # CPU [K_real, T_max]
+                _last_idx = self.decomposer._last_alpha_traj_indices  # list[int]
+                if _last_alpha is not None and _last_mask is not None and _last_alpha.numel() > 0:
+                    _denom2 = _last_mask.sum().clamp_min(1.0)
+                    _alpha_mean = float(((_last_alpha * _last_mask).sum() / _denom2).item())
+                    _alpha_var = float(
+                        (((_last_alpha - _alpha_mean) ** 2 * _last_mask).sum() / _denom2).item()
+                    )
+                    _masked2 = _last_alpha.masked_fill(_last_mask == 0, float("-inf"))
+                    _alpha_max = float(_masked2.max().item())
+                    _log_alpha2 = torch.log(_last_alpha.clamp_min(1e-12))
+                    _row_H2 = -(_last_alpha * _log_alpha2 * _last_mask).sum(dim=-1)
+                    _alpha_entropy = float(_row_H2.mean().item())
+                    # Pearson corr(α, raw_env_reward) per trajectory, then mean.
+                    _ac_sum = 0.0
+                    _ac_n = 0
+                    for _row, _orig_i in enumerate(_last_idx):
+                        traj_obj = group.trajectories[_orig_i]
+                        progress = [float(turn.raw_env_reward) for turn in traj_obj.turns]
+                        if not progress or sum(abs(p) for p in progress) < 1e-12:
+                            continue
+                        a_row = _last_alpha[_row, :len(progress)].tolist()
+                        if len(a_row) < 2:
+                            continue
+                        _n_t = len(progress)
+                        _m_a = sum(a_row) / _n_t
+                        _m_p = sum(progress) / _n_t
+                        _cov = sum((a_row[k] - _m_a) * (progress[k] - _m_p) for k in range(_n_t))
+                        _v_a = sum((a - _m_a) ** 2 for a in a_row)
+                        _v_p = sum((p - _m_p) ** 2 for p in progress)
+                        _den = (_v_a * _v_p) ** 0.5
+                        if _den < 1e-12:
+                            continue
+                        _ac_sum += _cov / _den
+                        _ac_n += 1
+                    _alpha_progress_corr = _ac_sum / _ac_n if _ac_n > 0 else 0.0
+            except Exception:
+                # Stats path must never break training. Leave alpha_* at 0
+                # if anything went wrong recovering them.
+                pass
+
         # ----- Phase 2: build advantage tensor AFTER override -----
         # The grad block above (when active) may have mutated `combined`
         # via the V-head override. We now build the advantage tensor that
@@ -833,6 +927,13 @@ class HGPOTrainer:
             )
             all_adv.append(adv_vec)
         adv_t = torch.cat(all_adv).to(torch.float32)
+
+        # Tier-4: scalar magnitude of the per-token advantage that actually
+        # gates policy_loss (= -E[adv_t * log_prob_ratio_clipped]). This is
+        # the column to watch when wondering "is RL receiving signal?".
+        _mean_abs_adv_token: float = (
+            float(adv_t.abs().mean().detach().item()) if adv_t.numel() > 0 else 0.0
+        )
 
         # PPO importance ratio uses (new vs old=rollout) — that's correct.
         ratio = torch.exp(new_lp_t - old_lp_t)
@@ -914,6 +1015,11 @@ class HGPOTrainer:
             alpha_max=_alpha_max,
             alpha_entropy=_alpha_entropy,
             alpha_progress_corr=_alpha_progress_corr,
+            std_reward_group=_std_reward_group,
+            dead_K_group=_dead_K_group,
+            mean_abs_traj_adv=_mean_abs_traj_adv,
+            std_traj_adv=_std_traj_adv,
+            mean_abs_adv_token=_mean_abs_adv_token,
         )
         return total, stats
 

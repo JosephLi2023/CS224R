@@ -215,6 +215,14 @@ def _build_turnrd_branch(
     # via the constructor null check).
     ckpt_path = turnrd_cfg.get("ckpt_path")
     refresh_fn: Callable[[], None] | None = None
+    # Tier-4 observability: stash the outcome of the most recent refresh
+    # attempt on the decomposer object so app_train_loop.py can include
+    # it in train_log.json's `config` block. Without this, there's no way
+    # to verify post-hoc whether the trained TurnRD ckpt from round N-1
+    # actually reached round N's container (the existing
+    # `logger.info("TurnRD refresh: loaded %s", ...)` lives only in the
+    # Modal container's stdout, not in the persisted train_log).
+    decomposer._last_refresh_status = None  # type: ignore[attr-defined]
     if ckpt_path:
         ckpt_path_resolved = Path(ckpt_path)
 
@@ -241,6 +249,11 @@ def _build_turnrd_branch(
                     "TurnRD refresh: ckpt %s not found yet; skipping load.",
                     ckpt_path_resolved,
                 )
+                decomposer._last_refresh_status = {  # type: ignore[attr-defined]
+                    "loaded": False,
+                    "path": str(ckpt_path_resolved),
+                    "reason": "ckpt_not_found",
+                }
                 return
             sd = torch.load(
                 ckpt_path_resolved,
@@ -248,7 +261,25 @@ def _build_turnrd_branch(
                 weights_only=True,
             )
             decomposer.load_state_dict(sd)
-            logger.info("TurnRD refresh: loaded %s", ckpt_path_resolved)
+            try:
+                _stat = ckpt_path_resolved.stat()
+                _size = int(_stat.st_size)
+                _mtime = float(_stat.st_mtime)
+            except OSError:
+                _size = -1
+                _mtime = -1.0
+            decomposer._last_refresh_status = {  # type: ignore[attr-defined]
+                "loaded": True,
+                "path": str(ckpt_path_resolved),
+                "size_bytes": _size,
+                "mtime": _mtime,
+            }
+            logger.info(
+                "TurnRD refresh: loaded %s (size=%d B, mtime=%.0f)",
+                ckpt_path_resolved,
+                _size,
+                _mtime,
+            )
 
         refresh_fn = _refresh
 
