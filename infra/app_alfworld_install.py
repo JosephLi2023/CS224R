@@ -204,12 +204,53 @@ def reset_smoke() -> dict:
             "domain": "$ALFWORLD_DATA/logic/alfred.pddl",
             "grammar": "$ALFWORLD_DATA/logic/alfred.twl2",
         },
+        "dagger": {
+            "training": {"max_nb_steps_per_episode": 50},
+            "fraction_assist": {
+                "fraction_assist_anneal_episodes": 0,
+                "fraction_assist_anneal_from": 1.0,
+                "fraction_assist_anneal_to": 0.01,
+            },
+            "fraction_random": {
+                "fraction_random_anneal_episodes": 0,
+                "fraction_random_anneal_from": 0.0,
+                "fraction_random_anneal_to": 0.0,
+            },
+            "replay": {
+                "replay_memory_capacity": 0,
+                "replay_memory_priority_fraction": 0.0,
+                "update_per_k_game_steps": 1,
+                "replay_batch_size": 1,
+                "multi_step": 1,
+                "replay_sample_history_length": 1,
+                "replay_sample_update_from": 1,
+            },
+        },
     }
 
     from alfworld.agents.environment.alfred_tw_env import AlfredTWEnv  # type: ignore[import-not-found]
 
     e = AlfredTWEnv(config, train_eval="train")
-    out = e.reset()
+    try:
+        wrapped = e.init_env(batch_size=1)
+    except Exception as exc:
+        import traceback
+        return {
+            "stage": "init_env",
+            "exception_type": type(exc).__name__,
+            "exception_repr": repr(exc),
+            "traceback": traceback.format_exc(),
+        }
+    try:
+        out = wrapped.reset()
+    except Exception as exc:
+        import traceback
+        return {
+            "stage": "reset",
+            "exception_type": type(exc).__name__,
+            "exception_repr": repr(exc),
+            "traceback": traceback.format_exc(),
+        }
     if isinstance(out, tuple) and len(out) == 2:
         obs, info = out
     else:

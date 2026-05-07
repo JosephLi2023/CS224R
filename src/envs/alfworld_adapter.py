@@ -71,6 +71,14 @@ class ALFWorldAdapter:
     def _build_alfworld_env(self):
         import_error: Exception | None = None
 
+        # AlfWorld's `AlfredTWEnv` is the META-env (loads game files,
+        # holds config) — it does NOT expose `.reset()` / `.step()`
+        # directly. To get a gym-style env we must call `.init_env(batch_size=1)`,
+        # which returns a `BatchEnv` (TextWorld-gym wrapped) that
+        # implements the standard env API. We do this once in the
+        # adapter constructor so the `self._env` returned here is
+        # immediately usable by `reset()` / `step()`.
+
         # Try the canonical ALFWorld text env path. Prefer to forward
         # `observation_mode` when the constructor accepts it (parallel to
         # WebShop); fall back to the kwargs-only construction for forks
@@ -83,12 +91,13 @@ class ALFWorldAdapter:
             if callable(get_env):
                 env_cls = get_env("alfred")
                 try:
-                    return env_cls(
+                    meta = env_cls(
                         observation_mode=self.observation_mode,
                         **self.env_kwargs,
                     )
                 except TypeError:
-                    return env_cls(**self.env_kwargs)
+                    meta = env_cls(**self.env_kwargs)
+                return self._wrap_batch_env(meta)
         except Exception as exc:  # pragma: no cover - depends on local install
             import_error = exc
 
@@ -99,20 +108,58 @@ class ALFWorldAdapter:
             module = import_module("alfworld.agents.environment.alfred_tw_env")
             env_cls = getattr(module, "AlfredTWEnv")
             try:
-                return env_cls(
+                meta = env_cls(
                     observation_mode=self.observation_mode,
                     **self.env_kwargs,
                 )
             except TypeError:
-                return env_cls(**self.env_kwargs)
+                meta = env_cls(**self.env_kwargs)
+            return self._wrap_batch_env(meta)
         except Exception as exc:  # pragma: no cover - depends on local install
             import_error = exc
 
         raise ImportError(
             "Failed to import ALFWorld environment. Install ALFWorld and ensure "
             "its environment modules are importable. "
-            f"Original error: {import_error}"
+            f"Original error type: {type(import_error).__name__}; "
+            f"Original error: {import_error!r}"
         )
+
+    def _wrap_batch_env(self, meta: Any) -> Any:
+        """Convert AlfWorld's `AlfredTWEnv` meta-env into a gym-style env.
+
+        The meta-env exposes `.init_env(batch_size: int)` which returns a
+        `BatchEnv` (TextWorld-gym wrapped) that implements `.reset()` /
+        `.step()`. Some forks return the meta-env itself if it already
+        looks gym-shaped — we only call `init_env(...)` when `.reset` is
+        missing, so the adapter degrades gracefully.
+
+        Also stashes the meta-env on the wrapper as `_alfred_meta` so
+        `_select_task` can read the meta's `game_files` list (the wrapper
+        typically doesn't expose it).
+        """
+        # Already a gym-style env? Skip the wrap (some test fakes do this).
+        if hasattr(meta, "reset") and hasattr(meta, "step"):
+            return meta
+        if not hasattr(meta, "init_env"):
+            raise AttributeError(
+                "ALFWorld env has neither `.reset()` nor `.init_env(batch_size=...)`; "
+                "incompatible upstream API. Open an issue with the alfworld version."
+            )
+        wrapped = meta.init_env(batch_size=1)
+        # Surface the meta-env's `game_files` for `_select_task`'s
+        # determinism check (the BatchEnv wrapper hides them).
+        if not hasattr(wrapped, "game_files") and hasattr(meta, "game_files"):
+            try:
+                setattr(wrapped, "game_files", meta.game_files)
+            except (AttributeError, TypeError):
+                pass
+        # Keep a back-pointer for callers that need the meta-env.
+        try:
+            setattr(wrapped, "_alfred_meta", meta)
+        except (AttributeError, TypeError):
+            pass
+        return wrapped
 
     def _to_text(self, observation: Any) -> str:
         if isinstance(observation, str):
@@ -143,24 +190,87 @@ class ALFWorldAdapter:
         return []
 
     def _normalize_reset(self, reset_out: Any) -> tuple[Any, dict[str, Any]]:
+        """Normalize reset output across legacy and batched API shapes.
+
+        TextWorld batch env returns `(obs_list, info_dict_with_list_values)`.
+        We unwrap for batch_size=1 so downstream code sees scalar obs +
+        flat info dict.
+        """
         if isinstance(reset_out, tuple):
             if len(reset_out) == 2 and isinstance(reset_out[1], dict):
-                return reset_out[0], reset_out[1]
+                obs, info = reset_out
+                if isinstance(obs, (list, tuple)) and obs:
+                    obs = obs[0]
+                if isinstance(info, dict):
+                    info = {
+                        k: (v[0] if isinstance(v, (list, tuple)) and len(v) == 1 else v)
+                        for k, v in info.items()
+                    }
+                return obs, info
             if len(reset_out) >= 1:
-                return reset_out[0], {}
+                obs = reset_out[0]
+                if isinstance(obs, (list, tuple)) and obs:
+                    obs = obs[0]
+                return obs, {}
         return reset_out, {}
 
     def _normalize_step(self, step_out: Any) -> tuple[Any, float, bool, dict[str, Any]]:
+        """Normalize the step output across legacy/gymnasium/batched API shapes.
+
+        TextWorld's batch env (returned by `AlfredTWEnv.init_env(batch_size=1)`)
+        emits per-field LISTS of length `batch_size` (e.g. `obs=[str]`,
+        `reward=[float]`, `done=[bool]`, `info={key: [val]}`). We unwrap
+        for batch_size=1 so downstream code sees scalar reward/done and a
+        flat info dict.
+        """
         # Handle legacy and gymnasium-like variants.
         if isinstance(step_out, tuple):
             if len(step_out) == 4:
                 obs, reward, done, info = step_out
+                obs, reward, done, info = self._unbatch(obs, reward, done, info)
                 return obs, float(reward), bool(done), info if isinstance(info, dict) else {"raw_info": info}
             if len(step_out) == 5:
                 obs, reward, terminated, truncated, info = step_out
+                obs, reward, terminated, info = self._unbatch(
+                    obs, reward, terminated, info
+                )
+                # truncated may also be batched.
+                if isinstance(truncated, (list, tuple)) and truncated:
+                    truncated = truncated[0]
                 done = bool(terminated) or bool(truncated)
                 return obs, float(reward), done, info if isinstance(info, dict) else {"raw_info": info}
         raise ValueError("Unexpected ALFWorld step output shape")
+
+    def _unbatch(
+        self,
+        obs: Any,
+        reward: Any,
+        done: Any,
+        info: Any,
+    ) -> tuple[Any, Any, Any, Any]:
+        """Unwrap batch-size-1 returns from TextWorld's batched API.
+
+        - `obs` = `[str]` → `str`
+        - `reward` = `[float]` → `float`
+        - `done` = `[bool]` → `bool`
+        - `info` = `{k: [v]}` → `{k: v}` (only for keys whose value is a
+          length-1 list/tuple; non-list fields pass through unchanged).
+        """
+        if isinstance(obs, (list, tuple)) and obs:
+            obs = obs[0]
+        if isinstance(reward, (list, tuple)) and reward:
+            reward = reward[0]
+        if isinstance(done, (list, tuple)) and done:
+            done = done[0]
+        if isinstance(info, dict):
+            unbatched: dict[str, Any] = {}
+            for k, v in info.items():
+                if isinstance(v, (list, tuple)) and len(v) == 1:
+                    unbatched[k] = v[0]
+                else:
+                    unbatched[k] = v
+            info = unbatched
+        return obs, reward, done, info
 
     def _make_state(self, observation: Any, info: dict[str, Any]) -> ALFWorldState:
         return ALFWorldState(
