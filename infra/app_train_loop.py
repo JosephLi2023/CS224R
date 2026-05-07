@@ -73,6 +73,7 @@ def _resolve_env_bindings(env_name: str):
 
 
 def _train_loop_impl(
+    *,
     env_name: str,
     n_episodes: int,
     k: int,
@@ -89,6 +90,7 @@ def _train_loop_impl(
     eval_episodes: int,
     eval_task_id_base: int,
     round_idx: int,
+    save_adapter_out: str = "",
 ) -> dict:
     """Env-agnostic training loop body. Both `train_loop_webshop` and
     `train_loop_alfworld` delegate here so the loop body lives in one
@@ -515,6 +517,17 @@ def _train_loop_impl(
         volume.commit()
     # -----------------------------------------------------------------
 
+    # Optional: save the trained LoRA adapter to a path on the volume so
+    # the next round of a multi-round protocol can load it instead of
+    # re-loading the SFT warm-start. The orchestrator passes this when
+    # `--carry-policy-across-rounds` is set; default `""` preserves the
+    # legacy behavior (each round resets to SFT).
+    if save_adapter_out:
+        print(f">>> Saving trained LoRA adapter to {save_adapter_out}")
+        os.makedirs(save_adapter_out, exist_ok=True)
+        policy.save_adapter(save_adapter_out)
+        volume.commit()
+
     summary = {
         "run_dir": run_dir,
         "env_name": env_name,
@@ -560,6 +573,7 @@ def train_loop_webshop(
     eval_episodes: int = 50,
     eval_task_id_base: int = 6500,
     round_idx: int = 0,
+    save_adapter_out: str = "",
 ) -> dict:
     return _train_loop_impl(
         env_name="webshop",
@@ -571,6 +585,7 @@ def train_loop_webshop(
         config=config,
         eval_episodes=eval_episodes, eval_task_id_base=eval_task_id_base,
         round_idx=round_idx,
+        save_adapter_out=save_adapter_out,
     )
 
 
@@ -596,6 +611,7 @@ def train_loop_alfworld(
     eval_episodes: int = 50,
     eval_task_id_base: int = 6500,
     round_idx: int = 0,
+    save_adapter_out: str = "",
 ) -> dict:
     return _train_loop_impl(
         env_name="alfworld",
@@ -607,6 +623,7 @@ def train_loop_alfworld(
         config=config,
         eval_episodes=eval_episodes, eval_task_id_base=eval_task_id_base,
         round_idx=round_idx,
+        save_adapter_out=save_adapter_out,
     )
 
 
@@ -634,6 +651,7 @@ def main(
     eval_episodes: int = 50,
     eval_task_id_base: int = 6500,
     round_idx: int = 0,
+    save_adapter_out: str = "",
 ) -> None:
     """Local entrypoint: dispatches to the right `@app.function` based
     on `--env-name`. Default `webshop` preserves backward compat with
@@ -663,6 +681,7 @@ def main(
             eval_episodes=eval_episodes,
             eval_task_id_base=eval_task_id_base,
             round_idx=round_idx,
+            save_adapter_out=save_adapter_out,
         ),
         indent=2, default=str,
     ))

@@ -127,6 +127,17 @@ class OrchestrationConfig:
     dry_run: bool = False
     skip_warmup_fit: bool = False
     extra_train_loop_args: list[str] = field(default_factory=list)
+    # Multi-round protocol with policy carry-across:
+    # - When False (default), every round loads `cfg.sft_adapter` so the
+    #   policy resets to the SFT warm-start each round (legacy behavior).
+    # - When True, round 0 loads `sft_adapter`, but rounds N>=1 load the
+    #   adapter saved by round N-1 (path = `<adapter_dir>/<run_prefix>_round{N-1:02d}_adapter`).
+    #   The corresponding `--save-adapter-out` is added to every round's
+    #   train_loop call so each round persists its trained LoRA adapter.
+    #   This makes 8x40 ep act like 1x320 ep (continuous training)
+    #   instead of 8 independent shots from SFT.
+    carry_policy_across_rounds: bool = False
+    adapter_dir: str = "/vol/checkpoints"
     extra_turnrd_args: list[str] = field(default_factory=list)
 
     @property
@@ -283,6 +294,27 @@ def _parse_args(argv: Sequence[str]) -> OrchestrationConfig:
              "have a pre-fit ckpt staged at --ckpt-path).",
     )
     parser.add_argument(
+        "--carry-policy-across-rounds",
+        action="store_true",
+        help="When set, round 0 loads --sft-adapter; rounds N>=1 load the "
+             "LoRA adapter saved by round N-1 (path = "
+             "<adapter-dir>/<run-prefix>_round<N-1:02d>_adapter). Each "
+             "round's train_loop also gets a --save-adapter-out flag so it "
+             "persists its trained adapter for the next round to pick up. "
+             "This makes the multi-round protocol behave like one long "
+             "continuous training run instead of N independent shots from "
+             "SFT (which is the legacy behavior, preserved by default).",
+    )
+    parser.add_argument(
+        "--adapter-dir",
+        default="/vol/checkpoints",
+        help="Directory on the Modal volume where per-round saved LoRA "
+             "adapters are written (only used when --carry-policy-across-rounds "
+             "is set). Each round writes "
+             "<adapter-dir>/<run-prefix>_round<N:02d>_adapter/. "
+             "Default '/vol/checkpoints'.",
+    )
+    parser.add_argument(
         "--extra-train-loop-args",
         nargs=argparse.REMAINDER,
         default=[],
@@ -309,6 +341,8 @@ def _parse_args(argv: Sequence[str]) -> OrchestrationConfig:
         dry_run=args.dry_run,
         skip_warmup_fit=args.skip_warmup_fit,
         extra_train_loop_args=list(args.extra_train_loop_args or []),
+        carry_policy_across_rounds=bool(args.carry_policy_across_rounds),
+        adapter_dir=str(args.adapter_dir),
     )
 
 
@@ -587,7 +621,30 @@ def _train_loop_cmd(cfg: OrchestrationConfig, round_idx: int) -> list[str]:
     gpu_mem_util_cfg = (cfg_json.get("train", {}) or {}).get("gpu_mem_util")
     if gpu_mem_util_cfg is not None:
         cmd.extend(["--gpu-mem-util", str(float(gpu_mem_util_cfg))])
-    if cfg.sft_adapter:
+    # Adapter routing:
+    # - Legacy (carry_policy_across_rounds=False): every round loads the
+    #   same `cfg.sft_adapter`, resetting the policy to SFT each round.
+    # - Carry-policy mode (carry_policy_across_rounds=True): round 0
+    #   loads `cfg.sft_adapter`; rounds N>=1 load the previous round's
+    #   saved adapter so training accumulates across rounds. Each round
+    #   also writes its trained adapter to `--save-adapter-out` for the
+    #   NEXT round to consume.
+    if cfg.carry_policy_across_rounds:
+        if round_idx == 0:
+            load_adapter = cfg.sft_adapter
+        else:
+            load_adapter = (
+                f"{cfg.adapter_dir.rstrip('/')}/"
+                f"{cfg.effective_run_name_prefix}_round{round_idx - 1:02d}_adapter"
+            )
+        save_adapter_out = (
+            f"{cfg.adapter_dir.rstrip('/')}/"
+            f"{cfg.effective_run_name_prefix}_round{round_idx:02d}_adapter"
+        )
+        if load_adapter:
+            cmd.extend(["--sft-adapter", load_adapter])
+        cmd.extend(["--save-adapter-out", save_adapter_out])
+    elif cfg.sft_adapter:
         cmd.extend(["--sft-adapter", cfg.sft_adapter])
     cmd.extend(["--eval-episodes", str(cfg.eval_episodes)])
     cmd.extend(["--eval-task-id-base", str(cfg.eval_task_id_base)])
