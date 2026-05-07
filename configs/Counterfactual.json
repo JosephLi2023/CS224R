@@ -1,0 +1,48 @@
+{
+  "run": {
+    "name": "Counterfactual",
+    "output_dir": "experiments/manifests",
+    "seed": 11
+  },
+  "train": {
+    "algorithm": "hgpo",
+    "total_episodes": 200,
+    "batch_size": 4,
+    "learning_rate": 1e-6,
+    "checkpoint_every": 50,
+    "eval_every": 25,
+    "K_trajectories_per_task": 8,
+    "kl_coeff": 0.04,
+    "clip_eps": 0.2,
+    "grad_accum_steps": 2,
+    "max_tokens_per_microbatch": 1024,
+    "gpu_mem_util": 0.20
+  },
+  "policy": {
+    "backbone": "Qwen2.5-1.5B-Instruct",
+    "lora": true,
+    "lora_target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+    "lora_rank": 16
+  },
+  "hgpo": {
+    "alpha": 0.5,
+    "lambda_consistency": 0.0,
+    "decomposer": "counterfactual"
+  },
+  "counterfactual": {
+    "n_alt_actions": 2,
+    "max_completion_turns": 3,
+    "cf_temperature": 1.0,
+    "completion_temperature": 0.0,
+    "cf_max_tokens": 48,
+    "n_turns_per_traj": 0,
+    "skip_if_zero_R": true,
+    "output_mode": "raw_delta",
+    "seed": 11,
+    "max_env_pool_size": 40
+  },
+  "logging": {
+    "print_every": 10
+  },
+  "_notes": "Counterfactual = replay-based CF rollouts decomposer. Canonical-vocabulary copy of configs/method_hgpo_counterfactual.json (post-fix v5 settings). For each (i, t) we sample N=2 alt actions from the policy at state_t, complete a 3-turn greedy rollout, and emit r_t = R - mean(R_alt). n_turns_per_traj=0 (all turns) per the post-mortem of seed11_round00 \u2014 subsampling injects structured zeros that pollute compute_turn_advantages's per-position normalization. Cost = K*N*T_bar = 4*2*5 = 40 alt rollouts/group. lambda_consistency=0 because the CF deltas don't satisfy the \u00a73.2 sum-to-R invariant. skip_if_zero_R=true halves wall-clock on early training. Populates methods_comparison.json::Counterfactual."
+}

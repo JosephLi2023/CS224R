@@ -1,0 +1,34 @@
+{
+  "run": {
+    "name": "flatGRPO",
+    "output_dir": "experiments/manifests",
+    "seed": 11
+  },
+  "train": {
+    "algorithm": "flat_grpo",
+    "total_episodes": 200,
+    "batch_size": 4,
+    "learning_rate": 1e-6,
+    "checkpoint_every": 50,
+    "eval_every": 25,
+    "K_trajectories_per_task": 4,
+    "kl_coeff": 0.04,
+    "clip_eps": 0.2,
+    "grad_accum_steps": 2
+  },
+  "policy": {
+    "backbone": "Qwen2.5-1.5B-Instruct",
+    "lora": true,
+    "lora_target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+    "lora_rank": 16
+  },
+  "hgpo": {
+    "alpha": 1.0,
+    "lambda_consistency": 0.0,
+    "decomposer": "progress"
+  },
+  "logging": {
+    "print_every": 10
+  },
+  "_notes": "flatGRPO = H-GRPO with alpha=1.0 (drops per-turn signal), trivial-decomposer baseline. Canonical-vocabulary copy of configs/method_flat_grpo.json. With alpha=1.0 the choice of decomposer is mathematically inert (only the trajectory advantage survives); progress is used because it is parameter-free. Bit-exact regression target for the HGPO alpha=1 recovery test. Populates methods_comparison.json::flatGRPO."
+}

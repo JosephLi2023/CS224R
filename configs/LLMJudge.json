@@ -1,0 +1,58 @@
+{
+  "run": {
+    "name": "LLMJudge",
+    "output_dir": "experiments/manifests",
+    "seed": 11
+  },
+  "train": {
+    "algorithm": "hgpo",
+    "total_episodes": 200,
+    "batch_size": 4,
+    "learning_rate": 1e-6,
+    "checkpoint_every": 50,
+    "eval_every": 25,
+    "K_trajectories_per_task": 4,
+    "kl_coeff": 0.04,
+    "clip_eps": 0.2,
+    "grad_accum_steps": 2
+  },
+  "policy": {
+    "backbone": "Qwen2.5-1.5B-Instruct",
+    "lora": true,
+    "lora_target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+    "lora_rank": 16
+  },
+  "hgpo": {
+    "alpha": 0.5,
+    "lambda_consistency": 0.1,
+    "decomposer": "judge"
+  },
+  "judge": {
+    "backend": "openai",
+    "vllm": {
+      "endpoint": "https://REPLACE-WITH-MODAL-URL/score_turns",
+      "model": "qwen2.5-7b-instruct",
+      "timeout_s": 60.0,
+      "max_concurrency": 4,
+      "api_token": ""
+    },
+    "openai": {
+      "model": "gpt-4o-mini",
+      "max_retries": 3,
+      "temperature": 0.0,
+      "timeout_s": 30.0,
+      "max_concurrency": 8
+    },
+    "cache": {
+      "path": "/vol/cache/judge.sqlite"
+    },
+    "limits": {
+      "max_judge_calls_per_run": 5000,
+      "warn_at_calls": 4000
+    }
+  },
+  "logging": {
+    "print_every": 10
+  },
+  "_notes": "LLMJudge = OpenAI judge-decomposer (GPT-4o-mini scoring per-turn rewards). Canonical-vocabulary copy of configs/method_hgpo_judge.json. Defaults to backend=openai per proposal \u00a73.2; the Modal Secret 'openai-secret' (key OPENAI_API_KEY) is mounted onto the trainer container by infra/app_train.py::train. Flip backend to 'vllm' to A/B against the self-hosted Qwen2.5-7B-Instruct judge served by infra/app_judge.py. Populates methods_comparison.json::LLMJudge \u2014 currently null, blocked on judge cache budget; expected fresh run cost ~$30-50."
+}
