@@ -120,7 +120,7 @@
     "layers": 6,
     "hidden_size": 384,
     "n_heads": 4,
-    "max_turns": 16,
+    "max_turns": 50,
     "dropout": 0.1,
     "causal": true,
     "value_head": false,

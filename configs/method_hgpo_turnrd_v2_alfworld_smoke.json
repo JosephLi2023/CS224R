@@ -121,7 +121,7 @@
     "layers": 2,
     "hidden_size": 128,
     "n_heads": 4,
-    "max_turns": 16,
+    "max_turns": 50,
     "dropout": 0.1,
     "causal": false,
     "progress_prior_strength": 1.0,
