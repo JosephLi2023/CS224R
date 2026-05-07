@@ -66,6 +66,11 @@ class ALFWorldAdapter:
         # Records the most recent task_id-derived game index so callers
         # (and tests) can verify deterministic selection.
         self._last_task_idx: int | None = None
+        # Whether `_env` is TextWorld's batched gym wrapper (set True in
+        # `_wrap_batch_env` when we call `init_env(batch_size=1)`). Test
+        # fakes that override `_build_alfworld_env` skip the wrap so this
+        # default keeps unbatch behavior off for them.
+        self._is_batched: bool = False
         self._env = self._build_alfworld_env()
 
     def _build_alfworld_env(self):
@@ -136,10 +141,13 @@ class ALFWorldAdapter:
 
         Also stashes the meta-env on the wrapper as `_alfred_meta` so
         `_select_task` can read the meta's `game_files` list (the wrapper
-        typically doesn't expose it).
+        typically doesn't expose it). Sets `self._is_batched = True` to
+        flag downstream `_normalize_*` helpers to unwrap the per-batch
+        list shape that TextWorld's batch env emits.
         """
         # Already a gym-style env? Skip the wrap (some test fakes do this).
         if hasattr(meta, "reset") and hasattr(meta, "step"):
+            self._is_batched = False
             return meta
         if not hasattr(meta, "init_env"):
             raise AttributeError(
@@ -147,6 +155,7 @@ class ALFWorldAdapter:
                 "incompatible upstream API. Open an issue with the alfworld version."
             )
         wrapped = meta.init_env(batch_size=1)
+        self._is_batched = True
         # Surface the meta-env's `game_files` for `_select_task`'s
         # determinism check (the BatchEnv wrapper hides them).
         if not hasattr(wrapped, "game_files") and hasattr(meta, "game_files"):
@@ -194,22 +203,21 @@ class ALFWorldAdapter:
 
         TextWorld batch env returns `(obs_list, info_dict_with_list_values)`.
         We unwrap for batch_size=1 so downstream code sees scalar obs +
-        flat info dict.
+        flat info dict. Only fires when `self._is_batched` (set in
+        `_wrap_batch_env`) — for non-batched test fakes the raw shape
+        passes through unchanged.
         """
         if isinstance(reset_out, tuple):
             if len(reset_out) == 2 and isinstance(reset_out[1], dict):
                 obs, info = reset_out
-                if isinstance(obs, (list, tuple)) and obs:
-                    obs = obs[0]
-                if isinstance(info, dict):
-                    info = {
-                        k: (v[0] if isinstance(v, (list, tuple)) and len(v) == 1 else v)
-                        for k, v in info.items()
-                    }
+                if self._is_batched:
+                    if isinstance(obs, (list, tuple)) and obs:
+                        obs = obs[0]
+                    info = self._unbatch_info(info)
                 return obs, info
             if len(reset_out) >= 1:
                 obs = reset_out[0]
-                if isinstance(obs, (list, tuple)) and obs:
+                if self._is_batched and isinstance(obs, (list, tuple)) and obs:
                     obs = obs[0]
                 return obs, {}
         return reset_out, {}
@@ -219,24 +227,26 @@ class ALFWorldAdapter:
 
         TextWorld's batch env (returned by `AlfredTWEnv.init_env(batch_size=1)`)
         emits per-field LISTS of length `batch_size` (e.g. `obs=[str]`,
-        `reward=[float]`, `done=[bool]`, `info={key: [val]}`). We unwrap
-        for batch_size=1 so downstream code sees scalar reward/done and a
-        flat info dict.
+        `reward=[float]`, `done=[bool]`, `info={key: [val_per_batch]}`).
+        We unwrap for batch_size=1 so downstream code sees scalar
+        reward/done and a flat info dict. Only fires when
+        `self._is_batched`.
         """
         # Handle legacy and gymnasium-like variants.
         if isinstance(step_out, tuple):
             if len(step_out) == 4:
                 obs, reward, done, info = step_out
-                obs, reward, done, info = self._unbatch(obs, reward, done, info)
+                if self._is_batched:
+                    obs, reward, done, info = self._unbatch(obs, reward, done, info)
                 return obs, float(reward), bool(done), info if isinstance(info, dict) else {"raw_info": info}
             if len(step_out) == 5:
                 obs, reward, terminated, truncated, info = step_out
-                obs, reward, terminated, info = self._unbatch(
-                    obs, reward, terminated, info
-                )
-                # truncated may also be batched.
-                if isinstance(truncated, (list, tuple)) and truncated:
-                    truncated = truncated[0]
+                if self._is_batched:
+                    obs, reward, terminated, info = self._unbatch(
+                        obs, reward, terminated, info
+                    )
+                    if isinstance(truncated, (list, tuple)) and truncated:
+                        truncated = truncated[0]
                 done = bool(terminated) or bool(truncated)
                 return obs, float(reward), done, info if isinstance(info, dict) else {"raw_info": info}
         raise ValueError("Unexpected ALFWorld step output shape")
@@ -253,8 +263,11 @@ class ALFWorldAdapter:
         - `obs` = `[str]` → `str`
         - `reward` = `[float]` → `float`
         - `done` = `[bool]` → `bool`
-        - `info` = `{k: [v]}` → `{k: v}` (only for keys whose value is a
-          length-1 list/tuple; non-list fields pass through unchanged).
+        - `info` = `{k: [v_per_batch]}` → `{k: v_per_batch}`. For each
+          info key, only unwrap when the value is a length-1 list/tuple
+          AND the contained element is itself a list/tuple/dict (the
+          TextWorld batch shape: outer batch list of inner per-batch
+          structures). Plain scalar info values pass through unchanged.
         """
         if isinstance(obs, (list, tuple)) and obs:
             obs = obs[0]
@@ -262,15 +275,24 @@ class ALFWorldAdapter:
             reward = reward[0]
         if isinstance(done, (list, tuple)) and done:
             done = done[0]
-        if isinstance(info, dict):
-            unbatched: dict[str, Any] = {}
-            for k, v in info.items():
-                if isinstance(v, (list, tuple)) and len(v) == 1:
-                    unbatched[k] = v[0]
-                else:
-                    unbatched[k] = v
-            info = unbatched
+        info = self._unbatch_info(info)
         return obs, reward, done, info
+
+    def _unbatch_info(self, info: Any) -> Any:
+        """Unwrap batched info dicts. See `_unbatch` for the unwrap policy."""
+        if not isinstance(info, dict):
+            return info
+        unbatched: dict[str, Any] = {}
+        for k, v in info.items():
+            if (
+                isinstance(v, (list, tuple))
+                and len(v) == 1
+                and isinstance(v[0], (list, tuple, dict))
+            ):
+                unbatched[k] = v[0]
+            else:
+                unbatched[k] = v
+        return unbatched
 
     def _make_state(self, observation: Any, info: dict[str, Any]) -> ALFWorldState:
         return ALFWorldState(
@@ -357,7 +379,21 @@ class ALFWorldAdapter:
 
     def step(self, action: str | int) -> tuple[ALFWorldState, float, bool, dict[str, Any]]:
         action_cmd = self._resolve_action(action)
-        raw_obs, reward, done, info = self._normalize_step(self._env.step(action_cmd))
+        # TextWorld's batch env (the AlfredTWEnv.init_env(batch_size=1)
+        # wrapper) expects a LIST of commands of length=batch_size. With
+        # batch_size=1 we send a single-element list; `_normalize_step`
+        # unwraps the per-field batch lists on the way back.
+        if hasattr(self._env, "_alfred_meta"):
+            step_arg: Any = [action_cmd]
+        else:
+            step_arg = action_cmd
+        try:
+            raw_step_out = self._env.step(step_arg)
+        except (AssertionError, TypeError):
+            # Defensive: if the env actually wants a scalar (e.g. test
+            # fakes), retry without the wrap.
+            raw_step_out = self._env.step(action_cmd)
+        raw_obs, reward, done, info = self._normalize_step(raw_step_out)
 
         self._steps += 1
         timeout = self._steps >= self.max_steps
