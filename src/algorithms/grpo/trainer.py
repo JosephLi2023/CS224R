@@ -209,6 +209,17 @@ class HGPOTrainer:
         self.kl_controller = AdaptiveKLController(self.cfg.kl_cfg)
         self._optimizer: Any = None  # lazy-init in train_step
         self._step: int = 0
+        # Counts the number of `scaled_loss.backward()` calls made since the
+        # last optimizer.step() flush. This is what the grad-accum boundary
+        # check keys off — independent of `self._step` so dead-K early
+        # returns (which skip backward) cannot shift the boundary parity
+        # relative to the actual number of accumulated gradient
+        # contributions. Without this decoupling, with `grad_accum_steps=2`
+        # a dead-K landing between two live-K calls would let the next
+        # boundary fire on a step that has 1 or 3 contributions instead of
+        # the expected 2 (the prior live-K's grads sit in `.grad` until the
+        # next non-dead boundary).
+        self._pending_backwards: int = 0
         # Optional snapshot of LoRA weights to use as KL reference. When set,
         # `_ref_logprobs_for_turn` / batched ref forwards swap these tensors
         # in for the duration of the forward (no_grad) and restore the live
@@ -615,6 +626,130 @@ class HGPOTrainer:
             _std_traj_adv = 0.0
 
         device = next(self.policy.model.parameters()).device
+
+        # ----- Tier-2 skip-dead-K guard -----
+        # When all K final rewards in the group are equal, the trajectory
+        # advantages are identically zero and the policy gradient on this
+        # group is zero by construction (regardless of α). Short-circuit
+        # BEFORE the 3 expensive padded forwards in `_batched_logprobs`
+        # (one new + one ref pass dominates per-step wallclock at K=8).
+        # Per the Tier-2 plan we only skip the OPTIMIZER STEP — the
+        # decomposer's `__call__` (above, via `build_advantages`) already
+        # ran so the per-turn rewards are computed and the rollout's
+        # external replay-buffer emission (in app_train_loop.py, after
+        # train_step returns) sees identical inputs to the non-dead path.
+        # The Tier-4 alpha_*/cls_query_norm logging path is preserved so
+        # downstream train_log columns stay meaningful for dead groups too.
+        if _dead_K_group:
+            # Recover alpha_* from the eval-mode α tensor stashed by
+            # turnrd's `decompose()` (Tier-4 path). Only meaningful when
+            # the decomposer is learnable and stashed `_last_alpha`.
+            _alpha_mean = 0.0
+            _alpha_var = 0.0
+            _alpha_max = 0.0
+            _alpha_entropy = 0.0
+            _alpha_progress_corr = 0.0
+            if (
+                self._decomposer_learnable
+                and getattr(self.decomposer, "_last_alpha", None) is not None
+            ):
+                try:
+                    _last_alpha = self.decomposer._last_alpha
+                    _last_mask = self.decomposer._last_alpha_mask
+                    _last_idx = self.decomposer._last_alpha_traj_indices
+                    if (
+                        _last_alpha is not None
+                        and _last_mask is not None
+                        and _last_alpha.numel() > 0
+                    ):
+                        _denom2 = _last_mask.sum().clamp_min(1.0)
+                        _alpha_mean = float(((_last_alpha * _last_mask).sum() / _denom2).item())
+                        _alpha_var = float(
+                            (((_last_alpha - _alpha_mean) ** 2 * _last_mask).sum() / _denom2).item()
+                        )
+                        # Guard the masked_fill+max against the all-padded
+                        # edge case (`_last_mask.sum() == 0`): without this
+                        # the masked tensor is all `-inf` and `.max()`
+                        # returns `-inf`, which would propagate into
+                        # TrainStepStats and the train_log JSON. Keep the
+                        # default 0.0 sentinel instead.
+                        if float(_last_mask.sum().item()) > 0.0:
+                            _masked2 = _last_alpha.masked_fill(_last_mask == 0, float("-inf"))
+                            _alpha_max = float(_masked2.max().item())
+                        _log_alpha2 = torch.log(_last_alpha.clamp_min(1e-12))
+                        _row_H2 = -(_last_alpha * _log_alpha2 * _last_mask).sum(dim=-1)
+                        _alpha_entropy = float(_row_H2.mean().item())
+                        _ac_sum = 0.0
+                        _ac_n = 0
+                        for _row, _orig_i in enumerate(_last_idx):
+                            traj_obj = group.trajectories[_orig_i]
+                            progress = [float(turn.raw_env_reward) for turn in traj_obj.turns]
+                            if not progress or sum(abs(p) for p in progress) < 1e-12:
+                                continue
+                            a_row = _last_alpha[_row, :len(progress)].tolist()
+                            if len(a_row) < 2:
+                                continue
+                            _n_t = len(progress)
+                            _m_a = sum(a_row) / _n_t
+                            _m_p = sum(progress) / _n_t
+                            _cov = sum(
+                                (a_row[k] - _m_a) * (progress[k] - _m_p) for k in range(_n_t)
+                            )
+                            _v_a = sum((a - _m_a) ** 2 for a in a_row)
+                            _v_p = sum((p - _m_p) ** 2 for p in progress)
+                            _den = (_v_a * _v_p) ** 0.5
+                            if _den < 1e-12:
+                                continue
+                            _ac_sum += _cov / _den
+                            _ac_n += 1
+                        _alpha_progress_corr = (
+                            _ac_sum / _ac_n if _ac_n > 0 else 0.0
+                        )
+                except Exception:
+                    # Stats path must never break training.
+                    pass
+            # cls_query_norm — same normalization as the live-grad path
+            # (divide by sqrt(hidden_size) for cross-arch comparability).
+            _cls_query_norm = 0.0
+            if self._decomposer_learnable:
+                try:
+                    _raw = float(
+                        self.decomposer.model.cls_query.detach().norm().item()
+                    )
+                    _hidden = int(self.decomposer.model.cfg.hidden_size)
+                    _cls_query_norm = _raw / max(1.0, _hidden ** 0.5)
+                except AttributeError:  # pragma: no cover
+                    _cls_query_norm = 0.0
+            # Build a zero loss WITHOUT requires_grad so train_step can
+            # detect via `stats.dead_K_group == 1` and skip backward()
+            # entirely (cleaner than backward()ing through a no-grad zero).
+            zero = torch.zeros((), device=device, dtype=torch.float32)
+            stats = TrainStepStats(
+                policy_loss=0.0,
+                kl_term=0.0,
+                consistency=float(adv["consistency"]),
+                consistency_t=0.0,
+                total_loss=0.0,
+                observed_kl=0.0,
+                kl_coef=self.kl_controller.coef,
+                grad_norm=0.0,
+                turnrd_grad_norm=0.0,
+                n_action_tokens=0,
+                mean_traj_adv=(sum(traj_adv) / max(1, len(traj_adv))),
+                mean_turn_adv=(sum(flat_turn_adv) / max(1, len(flat_turn_adv))),
+                cls_query_norm=_cls_query_norm,
+                alpha_mean=_alpha_mean,
+                alpha_var=_alpha_var,
+                alpha_max=_alpha_max,
+                alpha_entropy=_alpha_entropy,
+                alpha_progress_corr=_alpha_progress_corr,
+                std_reward_group=_std_reward_group,
+                dead_K_group=1,
+                mean_abs_traj_adv=_mean_abs_traj_adv,
+                std_traj_adv=_std_traj_adv,
+                mean_abs_adv_token=0.0,
+            )
+            return zero, stats
 
         all_new_lp: list[torch.Tensor] = []
         all_old_lp: list[torch.Tensor] = []
@@ -1090,6 +1225,26 @@ class HGPOTrainer:
         self.policy.model.train()
 
         loss, stats = self.compute_loss(group)
+        if stats.dead_K_group:
+            # Tier-2 skip-dead-K: zero policy gradient by construction.
+            # `compute_loss` already short-circuited before _batched_logprobs;
+            # here we just refuse to backward through the no-grad zero loss
+            # and skip the optimizer step. Per-turn rewards from
+            # `build_advantages` were still computed, so the rollout's
+            # external replay-buffer emission is unaffected.
+            #
+            # Do NOT feed the controller a synthetic `observed_kl=0` either:
+            # `AdaptiveKLController.update` treats `0 < low_threshold·target_kl`
+            # as "policy is way under target → divide coef by decrease_factor",
+            # so a long stretch of dead groups (the failure mode this guard is
+            # built for) would otherwise collapse `kl_coef` to its `min_coef`
+            # floor over a handful of calls. The dead group has no real KL
+            # signal — leaving the controller untouched mirrors how we leave
+            # the optimizer untouched. `_step` still advances so refresh-fn
+            # cadence + KL warmup counts stay aligned.
+            stats.kl_coef = self.kl_controller.coef
+            self._step += 1
+            return stats
         if stats.n_action_tokens == 0:
             # No live action tokens this group; nothing to learn from.
             new_coef = self.kl_controller.update(stats.observed_kl)
@@ -1100,10 +1255,14 @@ class HGPOTrainer:
         accum = max(1, int(self.cfg.grad_accum_steps))
         scaled_loss = loss / accum
         scaled_loss.backward()
+        self._pending_backwards += 1
 
-        # Only step the optimizer every `accum` train_step calls; otherwise
-        # accumulate grads silently.
-        is_step_boundary = ((self._step + 1) % accum) == 0
+        # Step the optimizer once we've actually accumulated `accum`
+        # gradient contributions. Keying off `self._pending_backwards`
+        # (NOT `self._step`) means dead-K early returns — which skip
+        # backward — cannot misalign the boundary parity from the real
+        # number of accumulated gradients in `.grad`.
+        is_step_boundary = self._pending_backwards >= accum
         if is_step_boundary:
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 self._trainable_params, self.cfg.max_grad_norm
@@ -1119,6 +1278,7 @@ class HGPOTrainer:
                 stats.turnrd_grad_norm = float(turnrd_grad_norm)
                 self._decomposer_optimizer.step()
                 self._decomposer_optimizer.zero_grad(set_to_none=True)
+            self._pending_backwards = 0
         else:
             stats.grad_norm = 0.0  # not yet a step boundary
 
