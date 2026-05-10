@@ -19,6 +19,81 @@ decomposer changes (or the algorithm wrapper in flatGRPO's case).
 
 ---
 
+## Headline results — AlfWorld Tier-2 SOTA (`pct_success`, n=100 held-out eval)
+
+The Tier-2 sweep (TurnRDV2 with `lr=5e-6`, `K=8`, skip-dead-K guard, α
+ablation) **improves the prior best by +12 pp absolute** (0.46 → 0.58)
+and beats the SFT-warm-start anchor by **+18 pp**. All 3 α-variants
+escape the prior 46% noise-floor plateau by ≥10 pp.
+
+| Rank | Method | best | last | mean | n_rounds | total eval eps |
+|---|---|---:|---:|---:|---:|---:|
+| 1 | **TurnRDV2_a050** (Tier-2, α=0.50) | **0.580** | 0.580 | **0.540** | 5 | 500 |
+| 2 | TurnRDV2_a075 (Tier-2, α=0.75) | 0.580 | 0.580 | 0.518 | 5 | 500 |
+| 3 | TurnRDV2_a025 (Tier-2, α=0.25) | 0.560 | 0.560 | 0.514 | 5 | 500 |
+| 4 | TurnRDV1 (prior K=4/lr=1e-6) | 0.460 | 0.460 | 0.435 | 4 | 200 |
+| 5 | flatGRPO (prior K=4/lr=1e-6) | 0.460 | 0.420 | 0.436 | 5 | 250 |
+| 6 | TurnRDV2 (prior, same α=0.50 at K=4/lr=1e-6) | 0.440 | 0.440 | 0.430 | 4 | 200 |
+| 7 | Progressive (prior) | 0.420 | 0.400 | 0.410 | 2 | 100 |
+| 8 | SFTOnly (RL-free anchor) | 0.400 | 0.400 | 0.400 | 1 | 50 |
+
+**Recommended config:** `α=0.50` — top-ranked on both `best` (tied at
+0.58) and the more decision-relevant `mean` aggregate (0.540). The α
+distribution is unimodal (mean: 0.514 → 0.540 → 0.518), arguing against
+further sweeping.
+
+**The Tier-2 fix package is the dominant lever** — same α=0.50 blend at
+K=4/lr=1e-6 only achieved 0.44; the lr/K/skip-dead-K combo at K=8/lr=5e-6
+takes it to 0.58 (+14 pp from the same blend coefficient alone).
+
+### What's in the Tier-2 fix package
+
+| Knob | Tier-2 sweep | Prior K=4/lr=1e-6 sweep |
+|---|---|---|
+| α (H-GRPO blend) | {0.25, 0.50, 0.75} | 0.5 / 1.0 |
+| Learning rate | 5e-6 (5×) | 1e-6 |
+| K (trajectories per task) | 8 (2×) | 4 |
+| Skip-dead-K guard | enabled | not present |
+| Eval episodes | 100 (n=100, σ ≈ 5pp) | 50 (n=50, σ ≈ 7pp) |
+
+The skip-dead-K guard short-circuits the heavy 3-forward-pass policy
+update on K-groups where all final rewards are equal (zero PG signal by
+construction). This was firing on 44-57% of K-groups in the prior
+sweep — the guard recovers ~12 min of wallclock per round at K=8 while
+preserving the rollout's per-turn rewards for TurnRD's standalone
+trainer.
+
+### Reproduction
+
+```bash
+# Wave 1 (smoke test, ~50 min): launches α=0.5 only at K=8 to verify no OOM
+bash scripts/run_alfworld_alpha_sweep.sh \
+    /vol/checkpoints/sft_alfworld_v1_20260507_165617 --smoke-only
+
+# Wave 2 (~50 min wallclock for both in parallel): launch α=0.25 + α=0.75
+bash scripts/run_alfworld_alpha_sweep.sh \
+    /vol/checkpoints/sft_alfworld_v1_20260507_165617 --rest
+
+# Monitor live
+python3 scripts/monitor_alfworld_alpha_sweep.py --watch 60
+
+# Aggregate to manifest + pull locally
+modal run infra/app_aggregate_alfworld.py
+modal volume get cs224r-hgpo-vol /manifests/4method_comparison_alfworld.json \
+    experiments/manifests/4method_comparison_alfworld.json --force
+
+# Regenerate plots + analysis report
+.venv/bin/python scripts/analyze_alfworld_alpha_sweep.py
+```
+
+Full ablation analysis (mechanistic explanation of why α=0.5 wins, plus
+the 4-panel headline figure and Tier-4 diagnostics): see
+[`reports/alfworld_alpha_sweep_README.md`](reports/alfworld_alpha_sweep_README.md).
+
+Aggregated manifest: [`experiments/manifests/4method_comparison_alfworld.json`](experiments/manifests/4method_comparison_alfworld.json) (8 keys).
+
+---
+
 ## Structure
 
 ```

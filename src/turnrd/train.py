@@ -146,7 +146,10 @@ def train_turnrd(
     if batch_size <= 0:
         raise ValueError(f"train_turnrd: batch_size must be positive; got {batch_size}.")
 
-    dataset = TurnRDReplayDataset(replay_path, mode=mode, max_records=max_records)
+    dataset = TurnRDReplayDataset(
+        replay_path, mode=mode,
+        max_records=max_records,
+    )
     if len(dataset) == 0:
         raise ValueError(
             f"train_turnrd: dataset at {replay_path} has 0 usable records "
@@ -191,10 +194,11 @@ def train_turnrd(
             v2_progress_v = 0.0
             if version_norm == "v2":
                 # v2 loss mix: identifiable R-prediction + within-batch
-                # ranking hinge + KL pull toward the progress prior.
-                # `lambda_value` reuses the existing kwarg; its target slot
-                # (sibling-CF / counterfactual per-turn deltas) hasn't
-                # landed yet, so the recommended sweep value is 0.0.
+                # ranking hinge + KL pull toward the progress prior +
+                # (when lambda_value > 0) per-turn value-head MSE against
+                # the env-side progress signal (Tier-3 Phase A: collector
+                # emits `progress` per turn; pad_collate forwards; this
+                # loop prefers it over the legacy R/T_i fallback target).
                 pred_loss = loss_v2_pred(out, final_reward)
                 rank_loss = loss_v2_rank(out, final_reward, margin=float(rank_margin))
                 progress_loss = loss_v2_progress_prior(out, attention_mask)
@@ -204,13 +208,38 @@ def train_turnrd(
                     + float(lambda_progress) * progress_loss
                 )
                 if float(lambda_value) != 0.0:
-                    # Until the per-turn target is wired (see plan),
-                    # supervise v_t against `final_reward / T_i` per row
-                    # as a sane fallback target. Callers passing
-                    # lambda_value=0 (the default sweep) skip this entirely.
+                    # Per-turn value-head target. Prefer the env-side
+                    # progress signal when present (collector now emits
+                    # `progress` as the per-turn raw_env_reward list);
+                    # fall back to the legacy R/T_i uniform target only
+                    # for legacy replays without progress fields.
                     fmask = attention_mask.to(dtype=final_reward.dtype)
-                    T_i = fmask.sum(dim=-1, keepdim=True).clamp_min(1.0)
-                    target_v = (final_reward.unsqueeze(-1) / T_i) * fmask
+                    if "progress" in collated:
+                        target_v = collated["progress"].to(target_device).to(
+                            dtype=final_reward.dtype
+                        ) * fmask
+                        # One-time activation log (the silent-fallback
+                        # mode is the riskiest failure — make it
+                        # impossible to miss in stdout).
+                        if not getattr(train_turnrd, "_progress_seen", False):
+                            train_turnrd._progress_seen = True  # type: ignore[attr-defined]
+                            print(
+                                "[turnrd train] v2 value-head target = "
+                                "per-turn progress signal (progress field "
+                                "present in batch).",
+                                flush=True,
+                            )
+                    else:
+                        T_i = fmask.sum(dim=-1, keepdim=True).clamp_min(1.0)
+                        target_v = (final_reward.unsqueeze(-1) / T_i) * fmask
+                        if not getattr(train_turnrd, "_fallback_seen", False):
+                            train_turnrd._fallback_seen = True  # type: ignore[attr-defined]
+                            print(
+                                "[turnrd train] v2 value-head target = "
+                                "R/T_i fallback (no `progress` field in "
+                                "batch — legacy replay buffer).",
+                                flush=True,
+                            )
                     value_loss = loss_v2_value(out, target_v, attention_mask)
                     loss = loss + float(lambda_value) * value_loss
                     value_loss_v = float(value_loss.detach().item())

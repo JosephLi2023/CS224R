@@ -514,5 +514,6 @@ def build_trainer_from_config(
         )
     raise ValueError(
         f"build_trainer_from_config: unknown hgpo.decomposer "
-        f"{name!r}; expected 'progress' | 'judge' | 'turnrd' | 'counterfactual'."
+        f"{name!r}; expected 'progress' | 'judge' | 'turnrd' | "
+        "'counterfactual'."
     )

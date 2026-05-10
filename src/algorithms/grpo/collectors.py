@@ -335,6 +335,12 @@ class RolloutCollector:
                         f"{len(traj.turns)} turns (task_id={traj.task_id})."
                     )
                 turn_embeds = embed_t.detach().to(device="cpu").tolist()
+                # Per-turn env signal: AlfWorld + WebShop step rewards are
+                # already deltas (env.step returns the per-step reward,
+                # not cumulative), so we forward them as-is. Used by the
+                # v2 trainer as the per-turn value-head target (replaces
+                # the placeholder R/T_i target).
+                progress: list[float] = [float(t.raw_env_reward) for t in traj.turns]
                 judge_labels: list[float] | None
                 if per_traj_judge_labels is not None:
                     raw = per_traj_judge_labels[i]
@@ -354,6 +360,7 @@ class RolloutCollector:
                     turn_embeds=turn_embeds,
                     final_reward=float(traj.final_reward),
                     judge_labels=judge_labels,
+                    progress=progress,
                 )
                 fh.write(json.dumps(asdict(rec)) + "\n")
                 fh.flush()

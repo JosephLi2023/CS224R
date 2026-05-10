@@ -9,6 +9,15 @@ Schema (one JSON object per line in the replay JSONL file):
   "final_reward": float,
   "judge_labels": float[T_i] | null # cached normalized judge scores per turn
                                     # (Mode 2 only; null when not available)
+  "progress":     float[T_i] | null # OPTIONAL per-turn environment progress
+                                    # signal (e.g., AlfWorld per-step reward).
+                                    # When present and ALL records in a batch
+                                    # carry it, `pad_collate` exposes it as
+                                    # `progress` and the v2 trainer uses it
+                                    # as the per-turn value-head target
+                                    # (replaces the placeholder R/T_i target).
+                                    # JSONL alias `raw_env_rewards` is also
+                                    # accepted for legacy producers.
 }
 ```
 
@@ -56,6 +65,7 @@ class TurnRDRecord:
     turn_embeds: list[list[float]]  # [T_i][D]
     final_reward: float
     judge_labels: Optional[list[float]] = None  # [T_i] or None
+    progress: Optional[list[float]] = None  # [T_i] or None — per-turn env signal
 
     def __post_init__(self) -> None:
         if not isinstance(self.task_id, str) or not self.task_id:
@@ -94,6 +104,17 @@ class TurnRDRecord:
                     f"TurnRDRecord.judge_labels has length {len(self.judge_labels)}; "
                     f"expected T={T} (must match turn_embeds)."
                 )
+        if self.progress is not None:
+            if not isinstance(self.progress, list):
+                raise ValueError(
+                    f"TurnRDRecord.progress must be list[float] or None; "
+                    f"got {type(self.progress).__name__}."
+                )
+            if len(self.progress) != T:
+                raise ValueError(
+                    f"TurnRDRecord.progress has length {len(self.progress)}; "
+                    f"expected T={T} (must match turn_embeds)."
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -114,8 +135,8 @@ class TurnRDReplayDataset:
         mode: 1 (predict R) or 2 (distill judge labels). For Mode 2 the
               dataset additionally filters out rows whose `judge_labels`
               are `None`.
-        max_records: optional cap on the number of records to load
-              (useful for unit tests + smoke runs).
+        max_records: optional cap on the number of records to load FROM
+              THE START (useful for unit tests + smoke runs).
     """
 
     def __init__(
@@ -158,11 +179,21 @@ class TurnRDReplayDataset:
                     self.skipped_empty += 1
                     continue
                 try:
+                    # Backward-compat: legacy producers wrote
+                    # `raw_env_rewards`; new producers write `progress`
+                    # (the per-turn env signal — already a delta in
+                    # AlfWorld where env.step returns step-rewards).
+                    raw_progress = obj.get("progress", obj.get("raw_env_rewards", None))
                     rec = TurnRDRecord(
                         task_id=str(obj["task_id"]),
                         turn_embeds=turn_embeds,
                         final_reward=float(obj["final_reward"]),
                         judge_labels=obj.get("judge_labels", None),
+                        progress=(
+                            [float(x) for x in raw_progress]
+                            if raw_progress is not None
+                            else None
+                        ),
                     )
                 except (KeyError, TypeError, ValueError) as e:
                     raise ValueError(
@@ -214,6 +245,11 @@ def pad_collate(batch: list[TurnRDRecord]) -> dict[str, torch.Tensor]:
                         the batch has non-None `judge_labels`. Padded
                         positions are 0.0; the trainer's `loss_mode_2`
                         masks them via `attention_mask`.
+    - `progress`:       `[B, T_max]` float32 — present iff EVERY record in
+                        the batch has non-None `progress`. Same all-or-
+                        nothing semantics as `judge_labels` so the
+                        trainer's progress-target path can fire safely
+                        without zero-padding looking like real env signal.
 
     Pure-torch — no `torch.nn.utils.rnn.pad_sequence` dep. Matches the
     style of `TurnRDDecomposer.decompose` which also pads inline.
@@ -237,6 +273,10 @@ def pad_collate(batch: list[TurnRDRecord]) -> dict[str, torch.Tensor]:
     judge_labels: torch.Tensor | None = (
         torch.zeros(B, T_max, dtype=torch.float32) if have_all_judge else None
     )
+    have_all_progress = all(rec.progress is not None for rec in batch)
+    progress: torch.Tensor | None = (
+        torch.zeros(B, T_max, dtype=torch.float32) if have_all_progress else None
+    )
 
     for i, rec in enumerate(batch):
         T_i = len(rec.turn_embeds)
@@ -246,6 +286,9 @@ def pad_collate(batch: list[TurnRDRecord]) -> dict[str, torch.Tensor]:
         if judge_labels is not None:
             assert rec.judge_labels is not None
             judge_labels[i, :T_i] = torch.tensor(rec.judge_labels, dtype=torch.float32)
+        if progress is not None:
+            assert rec.progress is not None
+            progress[i, :T_i] = torch.tensor(rec.progress, dtype=torch.float32)
 
     out: dict[str, torch.Tensor] = {
         "turn_embeds": turn_embeds,
@@ -254,4 +297,6 @@ def pad_collate(batch: list[TurnRDRecord]) -> dict[str, torch.Tensor]:
     }
     if judge_labels is not None:
         out["judge_labels"] = judge_labels
+    if progress is not None:
+        out["progress"] = progress
     return out
