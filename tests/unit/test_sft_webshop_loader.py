@@ -114,20 +114,28 @@ def test_synthetic_trajectory_preserves_instruction_and_reward():
 def test_prompt_accumulates_history_across_steps():
     rows = _make_synthetic_trajectory()
     ex = trajectory_to_sft_examples(rows, trajectory_id="T01")
-    # The system-prompt format-hint contains the literal `Action: search[<query>]`
-    # so we count actual prior-action lines instead by counting Thought: lines
-    # (system prompt has 1 Thought:, each prior history turn adds 1, current
-    # observation adds 1 more = 2 + n_history).
+    # Count "Thought:" occurrences in each step's prompt.
+    # The runtime renderer (which `default_render_prompt` now delegates to)
+    # emits exactly TWO Thought references per prompt regardless of history
+    # length: one in the system-prompt format-hint
+    # (`  Thought: <one short reasoning sentence>`) and one trailing
+    # `Thought:` token that conditions the model. Past turns are replayed
+    # as `Observation:` + `Action:` ONLY (no synthesized Thought lines)
+    # because the runtime collector parses Thoughts away after generation,
+    # so the model never sees Thoughts in history at rollout time. Pinning
+    # this count to 2 catches any future re-introduction of the v3-era
+    # template drift that put synthesized Thoughts back in history.
     n_thought_step0 = ex[0].prompt.count("Thought:")
     n_thought_step1 = ex[1].prompt.count("Thought:")
     n_thought_step2 = ex[2].prompt.count("Thought:")
-    assert n_thought_step0 == 2  # system hint + final
-    assert n_thought_step1 == 3  # + 1 history turn
-    assert n_thought_step2 == 4  # + 2 history turns
-    # History entries replay both the synthesized thought and the action.
+    assert n_thought_step0 == 2
+    assert n_thought_step1 == 2
+    assert n_thought_step2 == 2
+    # History DOES still accumulate as (Observation, Action) pairs.
     assert "Action: search[red dress]" in ex[1].prompt
-    assert "Thought: I'll search for red dress." in ex[1].prompt
     assert "Action: click[B07AAAAAA]" in ex[2].prompt
+    # And critically must NOT replay synthesized Thoughts in history.
+    assert "Thought: I'll search for red dress." not in ex[1].prompt
     # All step prompts end with "Thought:" (matches runtime ReAct prefix).
     assert ex[0].prompt.rstrip().endswith("Thought:")
     assert ex[1].prompt.rstrip().endswith("Thought:")
@@ -259,6 +267,81 @@ def test_default_prompt_matches_runtime_template_structure():
     assert "ReAct" in p
     assert "Action: search[" in p
     assert "Action: click[" in p
+
+
+def test_default_prompt_byte_identical_to_runtime_renderer():
+    """`default_render_prompt` must produce a BYTE-IDENTICAL string to
+    `render_webshop_turn_prompt` for the same inputs. This pins the
+    SFT-↔-rollout prompt-parity contract and would catch any future
+    re-introduction of template drift (e.g. someone tweaking the SFT
+    system prompt without touching the runtime one).
+    """
+    from types import SimpleNamespace
+
+    from src.envs.prompts.react_webshop import render_webshop_turn_prompt
+
+    instruction = "buy a red dress under $30"
+    history_pairs = [
+        ("Welcome to Amazon Shopping.", "search[red dress]"),
+        ("[Result 1] B0123ABCDE Red Maxi Dress $25", "click[B0123ABCDE]"),
+    ]
+    current_obs = "Red Maxi Dress page. Options: size [S, M, L]. Color: red."
+
+    sft = default_render_prompt(
+        instruction=instruction,
+        history=history_pairs,
+        current_observation=current_obs,
+    )
+    state = SimpleNamespace(
+        observation_text=current_obs,
+        instruction=instruction,
+        valid_actions=[],
+    )
+    runtime_history = [
+        SimpleNamespace(observation_text=o, action_text=a)
+        for o, a in history_pairs
+    ]
+    runtime = render_webshop_turn_prompt(state, runtime_history)
+    assert sft == runtime, (
+        "SFT prompt drifted from runtime renderer.\n"
+        f"SFT:\n{sft!r}\n\nRUNTIME:\n{runtime!r}"
+    )
+
+
+def test_default_prompt_truncates_long_history_like_runtime():
+    """5-turn history must be truncated to the last 3 turns with the
+    `... (N earlier turns omitted) ...` marker, matching the runtime
+    renderer's `max_history_turns=3` default."""
+    from types import SimpleNamespace
+
+    from src.envs.prompts.react_webshop import render_webshop_turn_prompt
+
+    history_pairs = [
+        (f"obs_{i}", f"click[stub_{i}]") for i in range(5)
+    ]
+    p = default_render_prompt(
+        instruction="buy stuff",
+        history=history_pairs,
+        current_observation="cur",
+    )
+    state = SimpleNamespace(
+        observation_text="cur",
+        instruction="buy stuff",
+        valid_actions=[],
+    )
+    runtime_history = [
+        SimpleNamespace(observation_text=o, action_text=a)
+        for o, a in history_pairs
+    ]
+    rt = render_webshop_turn_prompt(state, runtime_history)
+    assert p == rt
+    assert "earlier turns omitted" in p, (
+        "Long-history truncation marker missing; prompt parity broken."
+    )
+    # The two oldest turns must be dropped (only obs_2..obs_4 remain).
+    assert "obs_0" not in p
+    assert "obs_1" not in p
+    assert "obs_4" in p
 
 
 def test_synthesize_sft_target_emits_react_block():

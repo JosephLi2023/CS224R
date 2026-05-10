@@ -187,8 +187,8 @@ def _diff_options(prev_encoded: str, next_encoded: str) -> str | None:
 def _action_to_thought(action: str) -> str:
     """Heuristic: synthesize a one-sentence ReAct 'Thought' from an action.
 
-    Used by `default_render_prompt` so the SFT target is a full
-    `Thought: <reason>\\nAction: <body>` block — matching the runtime ReAct
+    Used by `synthesize_sft_target` so the SFT label is a full
+    `Thought: <reason>\nAction: <body>` block — matching the runtime ReAct
     template exactly. The original WebShop human-trajectory JSONL does not
     record human thoughts, so we synthesize one consistent with each action
     type.
@@ -220,37 +220,53 @@ def default_render_prompt(
     history: list[tuple[str, str]],   # list of (observation, action) for past turns
     current_observation: str,
 ) -> str:
-    """SFT prompt template that MATCHES the runtime ReAct template
-    (`src.envs.prompts.react_webshop.render_webshop_turn_prompt`) so the
-    model trained at SFT time is conditioned on the SAME prefix it will see
-    during GRPO rollouts. Diverging templates here was the root cause of
-    SFT-warm GRPO returning R=0 on the v3 run.
+    """SFT prompt renderer that delegates to the runtime ReAct renderer.
 
-    Prompt ends with `Thought:` so the SFT target is the full ReAct block
-    `<synthesized thought>\\nAction: <body>` (see `synthesize_sft_target`).
+    Adapts the SFT-side `(instruction, [(obs, act), ...], current_obs)`
+    shape into the runtime renderer's `(state, history)` shape via
+    lightweight `SimpleNamespace` shims, then calls
+    `src.envs.prompts.react_webshop.render_webshop_turn_prompt` so the
+    SFT prompt is byte-identical to the prompt the model sees during
+    GRPO rollouts.
+
+    The runtime renderer is the single source of truth for:
+      * the system prompt (including the `Action: think[...]` action),
+      * the per-turn history format (`Observation:` + `Action:` only,
+        no synthesized `Thought:` lines — the runtime collector parses
+        Thoughts away after generation, so the model never sees them in
+        history at rollout time),
+      * history truncation (`max_history_turns=3`) with the
+        `... (N earlier turns omitted) ...` marker, and
+      * the trailing `Thought:` token that conditions the model to emit
+        the next ReAct block.
+
+    Diverging templates here was the root cause of the v3 SFT-warm GRPO
+    run returning R=0; this thin shim guarantees zero drift going
+    forward (matches the AlfWorld pattern in `sft_alfworld.py` which
+    imports `render_alfworld_turn_prompt` directly).
     """
-    parts: list[str] = [
-        "You are an online shopping agent. Your goal is to find and buy a "
-        "product matching the user's instruction. On every turn you must "
-        "respond in the ReAct format with exactly one of:",
-        "  Thought: <one short reasoning sentence>",
-        "  Action: search[<query>]",
-        "  Action: click[<item or button>]",
-        "Pick a single Action per turn; do not output more than one Action.",
-        "",
-        f"User instruction: {instruction}",
-        "",
+    from types import SimpleNamespace
+
+    from src.envs.prompts.react_webshop import render_webshop_turn_prompt
+
+    state = SimpleNamespace(
+        observation_text=current_observation,
+        instruction=instruction,
+        # SFT data (downloaded human trajectories) does not record the env's
+        # `valid_actions` whitelist, so we pass an empty list — matching the
+        # runtime renderer's behavior of omitting the `Valid actions:` line
+        # when the whitelist is unavailable. The model thus sees identical
+        # prompts at SFT and rollout time when valid_actions is unset; when
+        # rollout supplies a valid_actions list, the extra line is treated
+        # as additional context the SFT model handles via its base-model
+        # generalization.
+        valid_actions=[],
+    )
+    history_objs = [
+        SimpleNamespace(observation_text=obs, action_text=act)
+        for obs, act in history
     ]
-    for obs, act in history:
-        parts.append(f"Observation: {obs.strip()}")
-        # During SFT we replay both the synthesized thought and the action
-        # so the in-context history matches what the model itself will emit
-        # at runtime.
-        parts.append(f"Thought: {_action_to_thought(act)}")
-        parts.append(f"Action: {act}")
-    parts.append(f"Observation: {current_observation.strip()}")
-    parts.append("Thought:")
-    return "\n".join(parts)
+    return render_webshop_turn_prompt(state, history_objs)
 
 
 def synthesize_sft_target(action: str) -> str:
