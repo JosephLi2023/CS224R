@@ -764,3 +764,104 @@ After your method finishes:
 2. **Aggregate** if it's a TurnRD method (`scripts/merge_turnrd_round_logs.py`)
 3. **Run the comparison plot** once everyone's logs are local (Section 4 final command) — this needs all 6 methods' artifacts to overlay
 4. **Append a `<Method>` entry** to `experiments/manifests/methods_comparison.json` with the per-round eval block
+
+---
+
+## 10. Deprecated experiment: counterfactual α-supervision (2026-05-12)
+
+**Status:** ❌ reverted. Wiring proven, but reward effect undetectable in
+our K=8 × 50ep budget.
+
+### What was tried
+
+The plan (`~/.llms/plans/turnrd_cf_supervision_alfworld.plan.md`) wired
+offline counterfactual deltas from `CounterFactualDecomposer` (Method
+D) as a per-trajectory supervision target for TurnRDv2's α via a new
+forward-KL loss `loss_v2_alpha_cf(out, cf_target, R, mask)`. The
+producer ran CF rollouts once per group inside the rollout collector
+and persisted the deltas to a new `cf_target` field in the replay
+JSONL; the standalone TurnRD trainer consumed them with a
+`lambda_alpha_cf=1.0` weight on top of the existing v2 loss mix.
+
+### What we measured
+
+**Mechanism check (positive)** — α–CF Pearson correlation rises across
+standalone-trainer epochs on a fixed replay snapshot:
+
+```
+epoch 0: ρ = +0.064  (random init)
+epoch 1: ρ = +0.415
+epoch 5: ρ = +0.519
+epoch 9: ρ = +0.584
+```
+
+The trainer **does** internalize CF labels — α concentrates on
+CF-flagged turns, ρ grows monotonically over 10 epochs.
+
+**Reward bake-off (inconclusive, leaning marginally negative)** —
+ALFWorld eval `pct_success`, K=8, 50 episodes/seed, greedy 50-task
+held-out eval, 3 seeds × 3 methods:
+
+| Method | seed 0 | seed 1 | seed 2 | mean | Δ vs no-CF |
+|---|---|---|---|---|---|
+| TurnRDV2 + CF α-target | 0.40 | 0.40 | died @ r2 | 0.40 (n=2) | **−0.7pp** |
+| TurnRDV2 (no CF, control) | 0.44 | 0.38 | 0.40 | 0.407 (n=3) | — |
+| flatGRPO (baseline) | 0.38 | 0.38 | 0.38 | 0.380 (n=3) | — |
+| SFT-only anchor | — | — | — | 0.40 | — |
+
+All three methods are within 4pp of the SFT baseline — the dominant
+signal is **none of these methods moved measurably off SFT in this
+budget**. CF–no-CF Δ is well inside the 1σ noise envelope.
+
+### Why we reverted
+
+1. **CF rollouts are expensive.** At K=8 with `n_alt_actions=2`,
+   `n_turns_per_traj=2`, `max_completion_turns=3`, each producer round
+   costs ~7× more vLLM calls than no-CF. CF rounds at this scale ran
+   ~50 min vs no-CF's ~10 min, which kept hitting per-job time caps
+   on Modal — 1/3 seeds in the final bake-off died at round 2-3
+   before producing an eval block. Even halving CF cost (n_turns=1,
+   max_completion=2) didn't fully resolve this.
+2. **No reward signal at the budgets we ran.** The CF–no-CF Δ at
+   3-seed K=8 × 50ep was −0.7pp (well within seed noise, where the
+   no-CF method's own std was 3.1pp). The mechanism check proved α
+   internalizes CF, but α only enters the H-GRPO loss via
+   `r̂_t = α_t · R` with bounded influence; on this short horizon the
+   policy gradient effect is dominated by other v2 loss components
+   (progress prior + R-prediction).
+3. **The bake-off couldn't differentiate any of the methods.**
+   flatGRPO 0.380 vs no-CF 0.407 vs CF 0.400 all sit in the noise
+   floor around the SFT baseline. The K=8 production references
+   in §1 above (TurnRDV2=0.580, flatGRPO=0.460) used a different
+   config or a longer training horizon than what we could afford
+   here, so the experiment lacked the dynamic range to show even
+   a no-CF improvement, let alone a CF marginal.
+
+### What would be needed to revisit
+
+- A training horizon where TurnRDV2 (no CF) demonstrably beats
+  flatGRPO by ≥10 pp on the same env (matching the §1 K=8 references).
+  Without that gap, there's no headroom for CF to detect.
+- A **cheaper CF estimate**: either fewer alt actions, an off-policy
+  surrogate (e.g. importance-weighted action-replacement on a tiny
+  pre-computed pool), or amortizing CF across multiple rounds rather
+  than every round.
+- A way to gate CF supervision by sample utility — a row's
+  `cf_target` is informative only when CF positively identifies a
+  critical turn (~30% of rows in our gating run); the other ~70%
+  contribute zero gradient through `loss_v2_alpha_cf` already, but
+  still cost full CF compute on the producer side.
+
+### What was reverted
+
+12 modified files restored (`sl revert`); 6 new files removed
+(`configs/method_hgpo_turnrd_v2_cf_alfworld.json`,
+`scripts/cf_dryrun_alfworld.py`, `scripts/run_cf_bakeoff.sh`,
+`scripts/parse_cf_bakeoff.py`, `tests/unit/test_turnrd_cf_supervision.py`,
+plus 18 per-seed bakeoff config artifacts). 69 unit tests pass at the
+restored state — same as the pre-CF baseline.
+
+The original plan file remains at
+`~/.llms/plans/turnrd_cf_supervision_alfworld.plan.md` for reference;
+the bake-off train_logs are still on the Modal volume under
+`/vol/manifests/bakeoff{,2,3,4,5}_*` if anyone wants to re-inspect.
