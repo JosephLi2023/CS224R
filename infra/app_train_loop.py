@@ -221,15 +221,36 @@ def _train_loop_impl(
     adapter_max_steps = int(env_block.get("max_steps", max_turns + 2))
     adapter_obs_mode = str(env_block.get("observation_mode", "text"))
     adapter_task_split = str(env_block.get("task_split", "train"))
+    # Phase 2 (ALFWorld only): opt-in to TextWorld's native
+    # `info["intermediate_reward"]` (PDDL-fluent flips) as the V-head
+    # supervision source. Default False ⇒ Phase 1 byte-for-byte
+    # preserved. WebShop's adapter doesn't accept this kwarg, so we
+    # only thread it on the alfworld branch below.
+    adapter_use_tw_ir = bool(env_block.get("use_textworld_intermediate_reward", False))
+    # Phase 3 (ALFWorld only): opt-in to PDDL-facts-diff per-turn signal
+    # as the V-head supervision source. Higher priority than the
+    # (broken-in-prod) Phase 1 plan-length delta but still lower than
+    # the (preferred) TextWorld upstream when both flags are on.
+    # Default False ⇒ Phase 1 byte-for-byte preserved.
+    adapter_use_facts_diff_ir = bool(
+        env_block.get("use_facts_diff_intermediate_reward", False)
+    )
 
     def env_factory():
         # Both adapters share the same constructor signature shape
-        # (max_steps, observation_mode, task_split, env_kwargs).
+        # (max_steps, observation_mode, task_split, env_kwargs). The
+        # ALFWorld adapter additionally accepts the Phase 2 opt-in
+        # `use_textworld_intermediate_reward` kwarg; WebShop does not.
+        extra_kwargs: dict = {}
+        if env_name == "alfworld":
+            extra_kwargs["use_textworld_intermediate_reward"] = adapter_use_tw_ir
+            extra_kwargs["use_facts_diff_intermediate_reward"] = adapter_use_facts_diff_ir
         return adapter_cls(
             max_steps=adapter_max_steps,
             observation_mode=adapter_obs_mode,
             task_split=adapter_task_split,
             env_kwargs=dict(cfg_env_kwargs),
+            **extra_kwargs,
         )
 
     # Choose between the legacy flag-driven trainer/collector
@@ -610,7 +631,7 @@ def train_loop_webshop(
     )
 
 
-@app.function(image=alfworld_image, gpu="A100-80GB", volumes={VOLUME_MOUNT: volume}, secrets=maybe_openai_secret(), timeout=120 * 60)
+@app.function(image=alfworld_image, gpu="A100-80GB", volumes={VOLUME_MOUNT: volume}, secrets=maybe_openai_secret(), timeout=240 * 60)
 def train_loop_alfworld(
     n_episodes: int = 50,
     k: int = 4,

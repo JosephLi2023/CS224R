@@ -75,6 +75,18 @@ class HGPOTrainerConfig:
     # The orchestrator sets `v_baseline_round_idx` per Modal call.
     v_baseline_round_idx: int = 0
     v_baseline_warmup_rounds: int = 2
+    # Proposal-A "drop α, project V_t to sum-to-R" credit-assignment fix.
+    # Replaces the α·R per-turn formula with a direct V_t projection
+    # that preserves V_t's per-turn shape while enforcing ∑per_turn = R:
+    #   per_turn_t = (V_t_clamped - (∑V_t_clamped - R) / T_active) · mask
+    # → ∑per_turn = R (sum-to-R constraint preserved)
+    # → individual per_turn CAN be negative (V_t allowed negative)
+    # → individual per_turn CAN exceed R (no [0,R] softmax-α constraint)
+    # This is strictly more expressive than α·R (which forces
+    # per_turn ∈ [0, R] via softmax). Default False ⇒ legacy α·R
+    # preserved for back-compat.
+    use_v_projection_for_decomposition: bool = False
+    v_projection_clamp: float = 2.0
 
 
 @dataclass
@@ -843,15 +855,52 @@ class HGPOTrainer:
                 _log_alpha = torch.log(alpha_t.clamp_min(1e-12))
                 _row_H = -(alpha_t * _log_alpha * _mask_for_stats).sum(dim=-1)  # [K_real]
                 _alpha_entropy = float(_row_H.mean().detach().item())
-                # Per-turn rewards = α * R. Then group-normalize per
-                # turn position (matches `compute_turn_advantages`) AND
-                # group-normalize final_R per group (matches
-                # `compute_traj_advantages`). Both norms operate on the
-                # K_real subset (empty trajectories are dropped from the
-                # tensor stack), which mirrors the pure-Python path's
-                # behavior — empty trajectories contribute nothing to
-                # either advantage's mean/std.
-                per_turn_rewards = alpha_t * final_R_t.unsqueeze(-1)  # [K_real, T_max]
+                # Per-turn rewards = α · R (legacy default). The Proposal-A
+                # v-projection mode below can REPLACE this with a direct
+                # V_t projection onto the sum-to-R constraint. Then
+                # group-normalize per turn position (matches
+                # `compute_turn_advantages`) AND group-normalize final_R
+                # per group (matches `compute_traj_advantages`). Both
+                # norms operate on the K_real subset (empty trajectories
+                # are dropped from the tensor stack), which mirrors the
+                # pure-Python path's behavior — empty trajectories
+                # contribute nothing to either advantage's mean/std.
+                R_for_decomp = final_R_t
+
+                # Proposal-A v-projection mode: REPLACE the α·R framing
+                # with a direct V_t projection onto the sum-to-R constraint.
+                # When `cfg.use_v_projection_for_decomposition=True`:
+                #   per_turn_t = (V_t_clamped - (∑V_t_clamped - R) / T_active) · mask
+                # Properties:
+                #   - ∑per_turn_t = R per trajectory (sum-to-R preserved)
+                #   - per_turn_t can be NEGATIVE (V_t allowed negative)
+                #   - per_turn_t can EXCEED R for high-V turns
+                #   - α is computed but UNUSED in per_turn (still drives
+                #     diagnostic stats above + R-prediction loss)
+                if (
+                    self.cfg.use_v_projection_for_decomposition
+                    and grad_out.get("value_per_turn") is not None
+                ):
+                    v_t_raw = grad_out["value_per_turn"].detach()
+                    if v_t_raw.shape == alpha_t.shape:
+                        proj_mask = attn_t.to(dtype=v_t_raw.dtype)
+                        v_t_clamped = v_t_raw.clamp(
+                            -self.cfg.v_projection_clamp,
+                            self.cfg.v_projection_clamp,
+                        ) * proj_mask
+                        # T_active = number of unmasked turns per row.
+                        T_active = proj_mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
+                        v_sum = v_t_clamped.sum(dim=-1, keepdim=True)
+                        # Lagrangian projection: shift each turn by
+                        # (∑V_t - R)/T_active so the new sum equals R.
+                        adjustment = (v_sum - final_R_t.unsqueeze(-1)) / T_active
+                        # Apply adjustment ONLY to active (unmasked) turns;
+                        # padded turns stay at 0.
+                        per_turn_rewards = (v_t_clamped - adjustment) * proj_mask
+                    else:
+                        per_turn_rewards = alpha_t * R_for_decomp.unsqueeze(-1)
+                else:
+                    per_turn_rewards = alpha_t * R_for_decomp.unsqueeze(-1)  # [K_real, T_max]
                 # Per-position turn advantage normalization, mask-aware.
                 # mask_f: [K_real, T_max] of {0.0, 1.0}.
                 mask_f = attn_t.to(dtype=per_turn_rewards.dtype)

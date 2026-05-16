@@ -1,6 +1,6 @@
 {
   "run": {
-    "name": "TurnRDV2_alfworld_a050",
+    "name": "TurnRDV2_alfworld_a050_vProjection",
     "output_dir": "experiments/manifests",
     "seed": 11
   },
@@ -115,7 +115,9 @@
   "hgpo": {
     "alpha": 0.5,
     "lambda_consistency": 0.0,
-    "decomposer": "turnrd"
+    "decomposer": "turnrd",
+    "use_v_projection_for_decomposition": true,
+    "v_projection_clamp": 2.0
   },
   "turnrd": {
     "version": "v2",
@@ -133,11 +135,11 @@
     "lambda_rank": 0.1,
     "lambda_progress": 0.01,
     "rank_margin": 0.1,
-    "replay_buffer_path": "/vol/cache/TurnRDV2_alfworld_a050/replay.jsonl",
-    "ckpt_path": "/vol/cache/TurnRDV2_alfworld_a050/ckpt.pt"
+    "replay_buffer_path": "/vol/cache/TurnRDV2_alfworld_a050_vProjection/replay.jsonl",
+    "ckpt_path": "/vol/cache/TurnRDV2_alfworld_a050_vProjection/ckpt.pt"
   },
   "logging": {
     "print_every": 10
   },
-  "_notes": "Tier-2 follow-up to 4method_comparison_alfworld.json \u2014 TurnRDV2 with \u03b1=0.50 (equal trajectory/per-turn blend), lr=5e-6, K=8, skip-dead-K guard. Re-uses /vol/checkpoints/sft_alfworld_v1_20260507_165617 SFT warm-start. Direct re-run of the prior method_hgpo_turnrd_v2_alfworld.json knobs but with 5\u00d7 LR + 2\u00d7 K + skip-dead-K \u2014 isolates whether the original \u03b1=0.5 result is bottlenecked by training signal volume rather than by the blend coefficient. Architecture knobs identical to the other two Tier-2 \u03b1 configs."
+  "_notes": "Proposal-A v-projection ablation: drops the \u03b1\u00b7R per-turn formula entirely and replaces with V_t projected onto sum-to-R constraint. per_turn = (V_t.clamp(\u00b12.0) - (\u03a3V_t - R)/T_active) \u00b7 mask. \u03a3per_turn = R per trajectory (preserved). per_turn CAN be negative (softmax-\u03b1 forbade this) and CAN exceed R for high-V turns. Tests the strongest 'drop-\u03b1' hypothesis: maybe \u03b1's softmax constraint was the wrong inductive bias. Isolated /vol/cache/TurnRDV2_alfworld_a050_vProjection/ paths. Same seed=11, same SFT warm-start, same 5 rounds \u00d7 40 episodes, same 100-eval setup as v2/centerR/additiveV bake-offs so the eval curves are directly comparable."
 }

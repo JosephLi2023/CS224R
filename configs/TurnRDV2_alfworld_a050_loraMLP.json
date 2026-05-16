@@ -1,6 +1,6 @@
 {
   "run": {
-    "name": "TurnRDV2_alfworld_a050",
+    "name": "TurnRDV2_alfworld_a050_loraMLP",
     "output_dir": "experiments/manifests",
     "seed": 11
   },
@@ -91,7 +91,7 @@
     "algorithm": "hgpo",
     "total_episodes": 200,
     "batch_size": 4,
-    "learning_rate": 5e-06,
+    "learning_rate": 2.5e-06,
     "checkpoint_every": 50,
     "eval_every": 25,
     "K_trajectories_per_task": 8,
@@ -108,7 +108,10 @@
       "q_proj",
       "k_proj",
       "v_proj",
-      "o_proj"
+      "o_proj",
+      "gate_proj",
+      "up_proj",
+      "down_proj"
     ],
     "lora_rank": 16
   },
@@ -133,11 +136,11 @@
     "lambda_rank": 0.1,
     "lambda_progress": 0.01,
     "rank_margin": 0.1,
-    "replay_buffer_path": "/vol/cache/TurnRDV2_alfworld_a050/replay.jsonl",
-    "ckpt_path": "/vol/cache/TurnRDV2_alfworld_a050/ckpt.pt"
+    "replay_buffer_path": "/vol/cache/TurnRDV2_alfworld_a050_loraMLP/replay.jsonl",
+    "ckpt_path": "/vol/cache/TurnRDV2_alfworld_a050_loraMLP/ckpt.pt"
   },
   "logging": {
     "print_every": 10
   },
-  "_notes": "Tier-2 follow-up to 4method_comparison_alfworld.json \u2014 TurnRDV2 with \u03b1=0.50 (equal trajectory/per-turn blend), lr=5e-6, K=8, skip-dead-K guard. Re-uses /vol/checkpoints/sft_alfworld_v1_20260507_165617 SFT warm-start. Direct re-run of the prior method_hgpo_turnrd_v2_alfworld.json knobs but with 5\u00d7 LR + 2\u00d7 K + skip-dead-K \u2014 isolates whether the original \u03b1=0.5 result is bottlenecked by training signal volume rather than by the blend coefficient. Architecture knobs identical to the other two Tier-2 \u03b1 configs."
+  "_notes": "loraMLP ablation: extends LoRA target_modules from attention-only (q/k/v/o_proj) to attention+MLP (q/k/v/o_proj + gate/up/down_proj). For Qwen2.5-1.5B-Instruct this is ~4\u00d7 more trainable params (~4.4M \u2192 ~18M LoRA params, ~0.27% \u2192 1.13% of model). MLP is ~7.5\u00d7 larger per layer than attention (intermediate_size=8960) and stores most of the model's compositional knowledge \u2014 attention-only LoRA could only re-route existing knowledge, not learn new behaviors. Learning rate HALVED (5e-6 \u2192 2.5e-6) to compensate for 4\u00d7 more parameters and reduce overfitting risk on small 200-episode replay. Tests the policy-capacity hypothesis directly: the convergent ~0.55 ceiling across centerR/additiveV/vProjection suggests credit-signal formulation isn't the bottleneck, capacity might be. All other v2 SOTA knobs preserved (K=8, alpha=0.5, decomposer=turnrd, kl_coeff=0.04, lora_rank=16). Isolated /vol/cache/TurnRDV2_alfworld_a050_loraMLP/ paths. Same seed=11, same SFT warm-start, same 5 rounds \u00d7 40 episodes, same 100-eval setup so eval curves are directly comparable to v2 baseline."
 }

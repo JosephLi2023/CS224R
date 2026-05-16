@@ -258,3 +258,258 @@ def test_emit_validates_embedder_required_when_path_set(tmp_path: Path) -> None:
             turnrd_emit_path=str(tmp_path / "x.jsonl"),
             turnrd_embedder=None,
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase 1B: producer surfaces `progress_signal` from env's
+# `info["intermediate_reward"]`.
+# ---------------------------------------------------------------------------
+
+
+class _IntermediateRewardEnv:
+    """Fake env that injects a known per-step `intermediate_reward` into
+    info on each `step()`. Drives the producer's `progress_signal`
+    emission gate so we can assert the JSONL row carries the signal
+    end-to-end."""
+
+    def __init__(self, max_steps: int = 4, deltas: list[float] | None = None) -> None:
+        self.max_steps = max_steps
+        # Default: monotonically-shrinking expert plan would yield
+        # +1 per step (5 → 4 → 3 → 2 …).
+        self._deltas = list(deltas) if deltas is not None else [1.0, 1.0, 1.0, 1.0]
+        self._t = 0
+        self._inner = FakeWebShopEnv(max_steps=max_steps)
+
+    def reset(self, **kwargs):
+        self._t = 0
+        return self._inner.reset(**kwargs)
+
+    def step(self, action):
+        delta = self._deltas[min(self._t, len(self._deltas) - 1)]
+        self._t += 1
+        next_state, reward, done, info = self._inner.step(action)
+        info = dict(info)
+        info["intermediate_reward"] = float(delta)
+        return next_state, reward, done, info
+
+
+def test_emit_writes_progress_signal_when_env_injects_intermediate_reward(
+    tmp_path: Path,
+) -> None:
+    """When the env adapter sets `info["intermediate_reward"]` on every
+    step, the producer's `_emit_turnrd_records` must surface it as the
+    `progress_signal` JSONL field. Round-trips through `TurnRDRecord`'s
+    schema validation."""
+    runner = _FakeRunner(
+        ["Action: search[bag]", "Action: click[item-0]", "Action: click[buy]"]
+    )
+    emit_path = tmp_path / "replay.jsonl"
+    deltas = [1.0, 0.0, 2.0]
+    collector = RolloutCollector(
+        runner=runner,
+        env_factory=lambda: _IntermediateRewardEnv(max_steps=8, deltas=deltas),
+        prompt_renderer=render_webshop_turn_prompt,
+        action_parser=parse_react_action,
+        cfg=RolloutCollectorConfig(max_turns=3),
+        turnrd_emit_path=str(emit_path),
+        turnrd_embedder=_embedder,
+    )
+
+    group, _ = collector.collect_group(task_id=1, env_name="webshop", K=2, sampling=_S())
+
+    rows = [
+        json.loads(line) for line in emit_path.read_text().splitlines() if line.strip()
+    ]
+    assert len(rows) == len(group.trajectories)
+    for i, row in enumerate(rows):
+        T_i = len(group.trajectories[i].turns)
+        # `progress_signal` must be present (every turn carried a non-None
+        # `intermediate_reward`) and equal-length to T_i.
+        assert "progress_signal" in row
+        assert row["progress_signal"] is not None
+        assert len(row["progress_signal"]) == T_i
+        # Values must match the per-turn deltas the fake env emitted
+        # (truncated to T_i since the trajectory may end before all
+        # `deltas` are consumed).
+        expected = [
+            float(turn.intermediate_reward) for turn in group.trajectories[i].turns
+        ]
+        assert row["progress_signal"] == pytest.approx(expected, abs=1e-6)
+        # The legacy `progress` (raw_env_reward) field is also still
+        # present — both signals are emitted in parallel; the trainer's
+        # preference chain picks `progress_signal` first.
+        assert "progress" in row
+
+
+def test_emit_omits_progress_signal_when_env_lacks_intermediate_reward(
+    tmp_path: Path,
+) -> None:
+    """When the env DOESN'T inject `intermediate_reward` (vanilla
+    FakeWebShopEnv), the producer must NOT emit `progress_signal`
+    (writes None). The dataset's all-or-nothing collator gate then
+    correctly omits the tensor at batch time."""
+    runner = _FakeRunner(["Action: search[bag]", "Action: click[buy]"])
+    emit_path = tmp_path / "replay.jsonl"
+    collector = _make_collector(tmp_path, runner=runner, emit_path=str(emit_path))
+
+    collector.collect_group(task_id=2, env_name="webshop", K=2, sampling=_S())
+
+    rows = [
+        json.loads(line) for line in emit_path.read_text().splitlines() if line.strip()
+    ]
+    assert len(rows) > 0
+    for row in rows:
+        # Either the field is absent OR explicitly null — both are
+        # round-trip-safe through the dataset reader.
+        assert row.get("progress_signal") is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 follow-up: partial-coverage zero-fill (any-turn-has-signal gate)
+# ---------------------------------------------------------------------------
+
+
+class _PartialIntermediateRewardEnv:
+    """Fake env that injects `intermediate_reward` only on a subset of
+    turns. Drives the new "any-turn-has-signal → zero-fill missing" gate
+    so we can assert producer-side recovery of trajectories that would
+    have been dropped under the old all-or-nothing rule.
+    """
+
+    def __init__(self, max_steps: int = 4, deltas: list[float | None] | None = None) -> None:
+        self.max_steps = max_steps
+        # Mixed pattern: some turns have signal, some have None
+        # (simulating the production failure mode where the very first
+        # turn doesn't carry intermediate_reward).
+        self._deltas: list[float | None] = (
+            list(deltas) if deltas is not None else [None, 1.0, 2.0, 0.0]
+        )
+        self._t = 0
+        self._inner = FakeWebShopEnv(max_steps=max_steps)
+
+    def reset(self, **kwargs):
+        self._t = 0
+        return self._inner.reset(**kwargs)
+
+    def step(self, action):
+        delta = self._deltas[min(self._t, len(self._deltas) - 1)]
+        self._t += 1
+        next_state, reward, done, info = self._inner.step(action)
+        info = dict(info)
+        if delta is not None:
+            info["intermediate_reward"] = float(delta)
+        # else: leave field absent — this is the "missing turn" case.
+        return next_state, reward, done, info
+
+
+def test_emit_zero_fills_missing_turns_when_any_turn_has_signal(
+    tmp_path: Path,
+) -> None:
+    """Phase-3 follow-up: producer recovers trajectories with partial
+    intermediate_reward coverage by zero-filling the missing turns.
+
+    Before this fix, a single None turn dropped the entire trajectory's
+    progress_signal. Production telemetry showed ~33% of ALFWorld
+    trajectories had at least one None turn (likely a stale Modal image
+    or transient env exception path), so the V-head was missing 1/3 of
+    its supervision data.
+
+    New rule: any-turn-has-signal → zero-fill the missing turns. This:
+      - Preserves WebShop semantics (all-None → still emits None)
+      - Recovers ALFWorld trajectories with single missing turns
+      - Treats missing as "no PDDL fact change observed" (a valid V-head
+        target).
+    """
+    runner = _FakeRunner(
+        ["Action: search[bag]", "Action: click[item-0]", "Action: click[buy]"]
+    )
+    emit_path = tmp_path / "replay.jsonl"
+    # First turn missing; turns 1, 2 carry signal. Old rule would have
+    # dropped the whole trajectory; new rule emits with first turn = 0.
+    collector = RolloutCollector(
+        runner=runner,
+        env_factory=lambda: _PartialIntermediateRewardEnv(
+            max_steps=8, deltas=[None, 1.0, 2.0]
+        ),
+        prompt_renderer=render_webshop_turn_prompt,
+        action_parser=parse_react_action,
+        cfg=RolloutCollectorConfig(max_turns=3),
+        turnrd_emit_path=str(emit_path),
+        turnrd_embedder=_embedder,
+    )
+
+    group, _ = collector.collect_group(task_id=1, env_name="webshop", K=2, sampling=_S())
+
+    rows = [
+        json.loads(line) for line in emit_path.read_text().splitlines() if line.strip()
+    ]
+    assert len(rows) == len(group.trajectories)
+    for i, row in enumerate(rows):
+        T_i = len(group.trajectories[i].turns)
+        # Trajectory should be EMITTED (not dropped) since at least one
+        # turn carried a non-None intermediate_reward.
+        assert "progress_signal" in row
+        assert row["progress_signal"] is not None
+        assert len(row["progress_signal"]) == T_i
+        # First turn was None → must be zero-filled.
+        if T_i >= 1:
+            assert row["progress_signal"][0] == 0.0
+
+
+def test_emit_zero_fills_when_only_one_turn_has_signal(tmp_path: Path) -> None:
+    """Edge case: only the LAST turn has signal, all earlier turns
+    None. Should still emit, with leading zeros."""
+    runner = _FakeRunner(
+        ["Action: search[bag]", "Action: click[item-0]", "Action: click[buy]"]
+    )
+    emit_path = tmp_path / "replay.jsonl"
+    collector = RolloutCollector(
+        runner=runner,
+        env_factory=lambda: _PartialIntermediateRewardEnv(
+            max_steps=8, deltas=[None, None, 5.0]
+        ),
+        prompt_renderer=render_webshop_turn_prompt,
+        action_parser=parse_react_action,
+        cfg=RolloutCollectorConfig(max_turns=3),
+        turnrd_emit_path=str(emit_path),
+        turnrd_embedder=_embedder,
+    )
+    group, _ = collector.collect_group(task_id=1, env_name="webshop", K=1, sampling=_S())
+    rows = [
+        json.loads(line) for line in emit_path.read_text().splitlines() if line.strip()
+    ]
+    assert len(rows) == 1
+    sig = rows[0]["progress_signal"]
+    assert sig is not None
+    # All but last turn should be 0.0; last turn = 5.0.
+    assert sig[-1] == 5.0
+    assert all(v == 0.0 for v in sig[:-1])
+
+
+def test_emit_still_omits_when_all_turns_have_no_signal(tmp_path: Path) -> None:
+    """WebShop-style regression guard: when EVERY turn lacks
+    intermediate_reward (the env doesn't support it at all), keep the
+    legacy "emit None" behavior so non-ALFWorld trainers see no
+    progress_signal field at all."""
+    runner = _FakeRunner(
+        ["Action: search[bag]", "Action: click[item-0]", "Action: click[buy]"]
+    )
+    emit_path = tmp_path / "replay.jsonl"
+    collector = RolloutCollector(
+        runner=runner,
+        env_factory=lambda: _PartialIntermediateRewardEnv(
+            max_steps=8, deltas=[None, None, None]
+        ),
+        prompt_renderer=render_webshop_turn_prompt,
+        action_parser=parse_react_action,
+        cfg=RolloutCollectorConfig(max_turns=3),
+        turnrd_emit_path=str(emit_path),
+        turnrd_embedder=_embedder,
+    )
+    collector.collect_group(task_id=1, env_name="webshop", K=2, sampling=_S())
+    rows = [
+        json.loads(line) for line in emit_path.read_text().splitlines() if line.strip()
+    ]
+    assert len(rows) > 0
+    for row in rows:
+        assert row.get("progress_signal") is None

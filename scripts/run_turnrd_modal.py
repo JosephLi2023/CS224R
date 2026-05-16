@@ -82,6 +82,7 @@ class OrchestrationConfig:
 
     config_path: Path = DEFAULT_CONFIG
     rounds: int = 5
+    start_round: int = 0
     episodes_per_round: int = 40
     turnrd_epochs: int = 3
     turnrd_mode: int = 1
@@ -216,6 +217,17 @@ def _parse_args(argv: Sequence[str]) -> OrchestrationConfig:
         help="Number of producer↔trainer alternations (default: 5).",
     )
     parser.add_argument(
+        "--start-round",
+        type=int,
+        default=0,
+        help="Round index to START from (default: 0). Use to resume a "
+             "partial run after a Modal timeout. Round adapter chain "
+             "expects /vol/checkpoints/<run-prefix>_round{start-round-1:02d}_adapter "
+             "to exist when --carry-policy-across-rounds is set and "
+             "start-round >= 1; use that path as --sft-adapter to "
+             "preserve adapter continuity from the prior run.",
+    )
+    parser.add_argument(
         "--episodes-per-round",
         type=int,
         default=40,
@@ -325,6 +337,7 @@ def _parse_args(argv: Sequence[str]) -> OrchestrationConfig:
     return OrchestrationConfig(
         config_path=args.config,
         rounds=args.rounds,
+        start_round=args.start_round,
         episodes_per_round=args.episodes_per_round,
         turnrd_epochs=args.turnrd_epochs,
         turnrd_mode=args.turnrd_mode,
@@ -807,7 +820,7 @@ def _orchestrate(cfg: OrchestrationConfig) -> int:
     print(f"  dry-run            : {cfg.dry_run}")
     print(f"  skip warmup fit    : {cfg.skip_warmup_fit}")
 
-    for round_idx in range(cfg.rounds):
+    for round_idx in range(cfg.start_round, cfg.rounds):
         # ---- (a) Parent H-GRPO loop: trains policy + emits replay rows.
         rc = _run(
             _train_loop_cmd(cfg, round_idx),

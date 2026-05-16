@@ -43,6 +43,19 @@ class TurnRecord:
     # Token ids of the prompt the policy was conditioned on at this turn.
     # Required by `HGPOTrainer.compute_loss` to recompute new-policy logprobs.
     prompt_token_ids: tuple[int, ...] = ()
+    # Optional dense per-turn shaping signal sourced from the env adapter
+    # via `info["intermediate_reward"]`. On ALFWorld this is the
+    # expert-plan-length reduction `\u0394 = max(0, prev_plan_len -
+    # curr_plan_len)` \u2014 "did this action move strictly closer to the
+    # goal?" \u2014 the dense V-head supervision target consumed by the
+    # standalone TurnRDv2 trainer (preferred over the near-degenerate
+    # `raw_env_reward` signal). Defaults to None so trajectories from
+    # envs without an adapter-side shaping signal (WebShop, FakeWebShop,
+    # legacy fixtures) round-trip unchanged. The collector emits a
+    # parallel `progress_signal` JSONL field only when EVERY turn in a
+    # trajectory carries a non-None value (mirrors the dataset's
+    # all-or-nothing semantics for the existing `progress` field).
+    intermediate_reward: float | None = None
 
 
 @dataclass(frozen=True)

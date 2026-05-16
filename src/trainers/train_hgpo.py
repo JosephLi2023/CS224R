@@ -492,6 +492,18 @@ def build_trainer_from_config(
         turnrd_lr=float(
             turnrd_cfg.get("turnrd_lr", HGPOTrainerConfig().turnrd_lr)
         ),
+        use_v_projection_for_decomposition=bool(
+            hgpo_cfg.get(
+                "use_v_projection_for_decomposition",
+                HGPOTrainerConfig().use_v_projection_for_decomposition,
+            )
+        ),
+        v_projection_clamp=float(
+            hgpo_cfg.get(
+                "v_projection_clamp",
+                HGPOTrainerConfig().v_projection_clamp,
+            )
+        ),
     )
 
     name = str(hgpo_cfg.get("decomposer", "progress")).lower()

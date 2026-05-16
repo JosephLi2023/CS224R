@@ -316,3 +316,112 @@ def test_record_post_init_rejects_progress_length_mismatch() -> None:
             final_reward=0.0,
             progress=[0.1],
         )
+
+
+# ---------------------------------------------------------------------------
+# `progress_signal` field tests (Phase 1C — ALFWorld dense expert-plan deltas)
+# ---------------------------------------------------------------------------
+
+
+def test_pad_collate_pads_progress_signal_to_T_max() -> None:
+    """When all records have `progress_signal`, pad_collate emits a
+    [B, T_max] `progress_signal` tensor padded with 0.0 at masked
+    positions."""
+    rec_a = TurnRDRecord(
+        task_id="a",
+        turn_embeds=[[1.0, 2.0]],
+        final_reward=0.0,
+        progress_signal=[1.0],
+    )
+    rec_b = TurnRDRecord(
+        task_id="b",
+        turn_embeds=[[3.0, 4.0], [5.0, 6.0], [7.0, 8.0]],
+        final_reward=1.0,
+        progress_signal=[0.0, 1.0, 2.0],
+    )
+    out = pad_collate([rec_a, rec_b])
+    assert "progress_signal" in out
+    assert out["progress_signal"].shape == (2, 3)
+    assert pytest.approx(out["progress_signal"][0].tolist()) == [1.0, 0.0, 0.0]
+    assert pytest.approx(out["progress_signal"][1].tolist()) == [0.0, 1.0, 2.0]
+
+
+def test_pad_collate_omits_progress_signal_when_any_record_lacks_it() -> None:
+    """All-or-nothing semantics: if any record has progress_signal=None,
+    pad_collate must NOT emit the key (zeros would look like real
+    expert-plan-delta signal at masked positions)."""
+    rec_a = TurnRDRecord(
+        task_id="a",
+        turn_embeds=[[1.0, 2.0]],
+        final_reward=0.5,
+        progress_signal=[1.0],
+    )
+    rec_b = TurnRDRecord(
+        task_id="b",
+        turn_embeds=[[3.0, 4.0]],
+        final_reward=0.6,
+        progress_signal=None,  # WebShop / legacy rows
+    )
+    out = pad_collate([rec_a, rec_b])
+    assert "progress_signal" not in out
+
+
+def test_pad_collate_progress_and_progress_signal_coexist() -> None:
+    """Both signals can be present simultaneously — the trainer's
+    preference chain picks `progress_signal` first."""
+    rec_a = TurnRDRecord(
+        task_id="a",
+        turn_embeds=[[1.0, 2.0], [3.0, 4.0]],
+        final_reward=1.0,
+        progress=[0.0, 1.0],          # legacy raw_env_reward
+        progress_signal=[1.0, 1.0],   # dense expert-plan deltas
+    )
+    rec_b = TurnRDRecord(
+        task_id="b",
+        turn_embeds=[[5.0, 6.0]],
+        final_reward=0.0,
+        progress=[0.0],
+        progress_signal=[0.0],
+    )
+    out = pad_collate([rec_a, rec_b])
+    assert "progress" in out
+    assert "progress_signal" in out
+
+
+def test_dataset_round_trips_progress_signal_via_jsonl(tmp_path: Path) -> None:
+    """Producer-shaped JSONL with `progress_signal` round-trips through
+    `TurnRDReplayDataset` → `TurnRDRecord.progress_signal` populated."""
+    rows = [
+        {
+            "task_id": "alfworld-1",
+            "turn_embeds": _embedding(3, 4, seed=21),
+            "final_reward": 1.0,
+            "progress": [0.0, 0.0, 1.0],
+            "progress_signal": [1.0, 0.0, 1.0],
+        },
+        {
+            "task_id": "webshop-2",
+            "turn_embeds": _embedding(2, 4, seed=22),
+            "final_reward": 0.5,
+            "progress": [0.0, 0.5],
+            # No progress_signal — this is a non-ALFWorld trajectory.
+        },
+    ]
+    path = tmp_path / "mixed.jsonl"
+    _write_jsonl(path, rows)
+    ds = TurnRDReplayDataset(path, mode=1)
+    assert len(ds) == 2
+    recs = list(ds)
+    assert recs[0].progress_signal == [1.0, 0.0, 1.0]
+    assert recs[1].progress_signal is None
+
+
+def test_record_post_init_rejects_progress_signal_length_mismatch() -> None:
+    """progress_signal length must match T."""
+    with pytest.raises(ValueError, match=r"length"):
+        TurnRDRecord(
+            task_id="bad",
+            turn_embeds=[[1.0, 2.0], [3.0, 4.0]],  # T=2
+            final_reward=0.0,
+            progress_signal=[0.1],  # T=1 → mismatch
+        )

@@ -212,12 +212,23 @@ class RolloutCollector:
                     gen = gen_list[0]
                 action_text = self.parse(getattr(gen, "text", "") or "")
 
-                next_state, reward, done, _info = envs[i].step(action_text)
+                next_state, reward, done, info = envs[i].step(action_text)
 
                 token_ids = tuple(getattr(gen, "token_ids", ()) or ())
                 token_logprobs = tuple(getattr(gen, "token_logprobs", ()) or ())
                 prompt_token_count = int(getattr(gen, "prompt_token_count", 0) or 0)
                 prompt_token_ids = tuple(getattr(gen, "prompt_token_ids", ()) or ())
+
+                # Optional dense per-turn shaping signal sourced from
+                # the env adapter via `info["intermediate_reward"]`. On
+                # ALFWorld this is the expert-plan-length reduction
+                # ("did this action move strictly closer to the goal?").
+                # Other envs (WebShop, FakeWebShop) don't surface the
+                # field → stays None → the producer's `progress_signal`
+                # all-or-nothing emission gate keeps them on the legacy
+                # `progress` (raw_env_reward) path.
+                inter_raw = info.get("intermediate_reward") if isinstance(info, dict) else None
+                intermediate_reward = float(inter_raw) if inter_raw is not None else None
 
                 obs_text = getattr(states[i], "observation_text", "") or ""
                 turn = TurnRecord(
@@ -229,6 +240,7 @@ class RolloutCollector:
                     action_token_logprobs=token_logprobs,
                     prompt_token_count=prompt_token_count,
                     prompt_token_ids=prompt_token_ids,
+                    intermediate_reward=intermediate_reward,
                 )
                 traj_turns[i].append(turn)
                 rewards_so_far[i] += float(reward)
@@ -341,6 +353,49 @@ class RolloutCollector:
                 # v2 trainer as the per-turn value-head target (replaces
                 # the placeholder R/T_i target).
                 progress: list[float] = [float(t.raw_env_reward) for t in traj.turns]
+                # Optional dense progress signal sourced from the env
+                # adapter (e.g. ALFWorld expert-plan-length deltas). All-
+                # or-nothing per-trajectory emission so the dataset
+                # collator's per-batch all-or-nothing gate stays
+                # well-defined: a trajectory either has a complete
+                # signal or none at all (no partial coverage that would
+                # masquerade as zeros at masked-out positions).
+                progress_signal: list[float] | None
+                # Per-trajectory coverage gate. Originally "all turns must
+                # have intermediate_reward" — too strict in production:
+                # ALFWorld trajectories occasionally have a single turn
+                # with `info["intermediate_reward"]=None` (e.g., recovered
+                # mid-rollout from a transient env exception, or from a
+                # turn that ran on a stale image where the adapter didn't
+                # populate the field). The all-or-nothing gate dropped the
+                # ENTIRE trajectory's V-head supervision signal in those
+                # cases — observed ~33% trajectory dropout in the
+                # facts-diff bake-off (2026-05-13 telemetry).
+                #
+                # New rule: emit if ANY turn has a non-None
+                # intermediate_reward, zero-filling the missing turns.
+                # Rationale:
+                #   - "ANY turn has signal" cleanly distinguishes envs
+                #     that SUPPORT the field (ALFWorld) from envs that
+                #     don't (WebShop — produces None every turn → still
+                #     emits progress_signal=None, preserving legacy gate
+                #     behavior for non-ALFWorld envs).
+                #   - Missing-turn → 0.0 is a semantically valid V-head
+                #     target ("no PDDL fact change observed for this
+                #     step"). The downstream V-head loss is regression
+                #     against this scalar, so a zero-filled position is
+                #     just a "no progress" supervised example, not a
+                #     masked-out artifact.
+                #   - Empty trajectories still produce None (the absence
+                #     sentinel) — see the empty-trajectory regression
+                #     test.
+                if traj.turns and any(t.intermediate_reward is not None for t in traj.turns):
+                    progress_signal = [
+                        float(t.intermediate_reward) if t.intermediate_reward is not None else 0.0
+                        for t in traj.turns
+                    ]
+                else:
+                    progress_signal = None
                 judge_labels: list[float] | None
                 if per_traj_judge_labels is not None:
                     raw = per_traj_judge_labels[i]
@@ -361,6 +416,7 @@ class RolloutCollector:
                     final_reward=float(traj.final_reward),
                     judge_labels=judge_labels,
                     progress=progress,
+                    progress_signal=progress_signal,
                 )
                 fh.write(json.dumps(asdict(rec)) + "\n")
                 fh.flush()

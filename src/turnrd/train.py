@@ -208,18 +208,40 @@ def train_turnrd(
                     + float(lambda_progress) * progress_loss
                 )
                 if float(lambda_value) != 0.0:
-                    # Per-turn value-head target. Prefer the env-side
-                    # progress signal when present (collector now emits
-                    # `progress` as the per-turn raw_env_reward list);
-                    # fall back to the legacy R/T_i uniform target only
-                    # for legacy replays without progress fields.
+                    # Per-turn value-head target. Preference chain
+                    # (highest priority first):
+                    #   1. `progress_signal` \u2014 dense per-turn shaping
+                    #      signal sourced from the env adapter (e.g.
+                    #      ALFWorld's expert-plan-length reduction \u2014
+                    #      "did this turn move strictly closer to the
+                    #      goal?"). Strictly more informative than the
+                    #      raw env reward on sparse-terminal envs.
+                    #   2. `progress` \u2014 legacy per-turn raw_env_reward
+                    #      list. On ALFWorld this is near-degenerate
+                    #      (zero everywhere except the terminal turn);
+                    #      preserved for WebShop where step rewards are
+                    #      already meaningful deltas.
+                    #   3. R/T_i \u2014 uniform fallback for legacy replays
+                    #      that carry neither field.
                     fmask = attention_mask.to(dtype=final_reward.dtype)
-                    if "progress" in collated:
+                    if "progress_signal" in collated:
+                        target_v = collated["progress_signal"].to(target_device).to(
+                            dtype=final_reward.dtype
+                        ) * fmask
+                        if not getattr(train_turnrd, "_progress_signal_seen", False):
+                            train_turnrd._progress_signal_seen = True  # type: ignore[attr-defined]
+                            print(
+                                "[turnrd train] v2 value-head target = "
+                                "expert-plan progress signal "
+                                "(progress_signal field present in batch).",
+                                flush=True,
+                            )
+                    elif "progress" in collated:
                         target_v = collated["progress"].to(target_device).to(
                             dtype=final_reward.dtype
                         ) * fmask
                         # One-time activation log (the silent-fallback
-                        # mode is the riskiest failure — make it
+                        # mode is the riskiest failure \u2014 make it
                         # impossible to miss in stdout).
                         if not getattr(train_turnrd, "_progress_seen", False):
                             train_turnrd._progress_seen = True  # type: ignore[attr-defined]
@@ -237,7 +259,7 @@ def train_turnrd(
                             print(
                                 "[turnrd train] v2 value-head target = "
                                 "R/T_i fallback (no `progress` field in "
-                                "batch — legacy replay buffer).",
+                                "batch \u2014 legacy replay buffer).",
                                 flush=True,
                             )
                     value_loss = loss_v2_value(out, target_v, attention_mask)

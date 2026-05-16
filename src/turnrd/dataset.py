@@ -18,6 +18,16 @@ Schema (one JSON object per line in the replay JSONL file):
                                     # (replaces the placeholder R/T_i target).
                                     # JSONL alias `raw_env_rewards` is also
                                     # accepted for legacy producers.
+  "progress_signal": float[T_i] | null # OPTIONAL dense per-turn shaping
+                                    # signal sourced from the env adapter
+                                    # (e.g., ALFWorld expert-plan-length
+                                    # reduction). When present and ALL
+                                    # records in a batch carry it, the v2
+                                    # trainer prefers it over `progress`
+                                    # for the V-head target — captures
+                                    # "did this turn move closer to the
+                                    # goal?" rather than the near-degenerate
+                                    # terminal-only `raw_env_reward`.
 }
 ```
 
@@ -66,6 +76,14 @@ class TurnRDRecord:
     final_reward: float
     judge_labels: Optional[list[float]] = None  # [T_i] or None
     progress: Optional[list[float]] = None  # [T_i] or None — per-turn env signal
+    # Optional dense per-turn shaping signal sourced from the env adapter
+    # (e.g., ALFWorld's `info["intermediate_reward"]` = expert-plan-length
+    # reduction). When present and ALL records in a batch carry it, the
+    # v2 trainer's V-head target preference chain prefers it over the
+    # legacy `progress` (raw_env_reward) field. None on non-ALFWorld
+    # envs (no expert plan available) keeps backward compat for legacy
+    # replay buffers.
+    progress_signal: Optional[list[float]] = None  # [T_i] or None
 
     def __post_init__(self) -> None:
         if not isinstance(self.task_id, str) or not self.task_id:
@@ -113,6 +131,17 @@ class TurnRDRecord:
             if len(self.progress) != T:
                 raise ValueError(
                     f"TurnRDRecord.progress has length {len(self.progress)}; "
+                    f"expected T={T} (must match turn_embeds)."
+                )
+        if self.progress_signal is not None:
+            if not isinstance(self.progress_signal, list):
+                raise ValueError(
+                    f"TurnRDRecord.progress_signal must be list[float] or None; "
+                    f"got {type(self.progress_signal).__name__}."
+                )
+            if len(self.progress_signal) != T:
+                raise ValueError(
+                    f"TurnRDRecord.progress_signal has length {len(self.progress_signal)}; "
                     f"expected T={T} (must match turn_embeds)."
                 )
 
@@ -184,6 +213,7 @@ class TurnRDReplayDataset:
                     # (the per-turn env signal — already a delta in
                     # AlfWorld where env.step returns step-rewards).
                     raw_progress = obj.get("progress", obj.get("raw_env_rewards", None))
+                    raw_progress_signal = obj.get("progress_signal", None)
                     rec = TurnRDRecord(
                         task_id=str(obj["task_id"]),
                         turn_embeds=turn_embeds,
@@ -192,6 +222,11 @@ class TurnRDReplayDataset:
                         progress=(
                             [float(x) for x in raw_progress]
                             if raw_progress is not None
+                            else None
+                        ),
+                        progress_signal=(
+                            [float(x) for x in raw_progress_signal]
+                            if raw_progress_signal is not None
                             else None
                         ),
                     )
@@ -250,6 +285,13 @@ def pad_collate(batch: list[TurnRDRecord]) -> dict[str, torch.Tensor]:
                         nothing semantics as `judge_labels` so the
                         trainer's progress-target path can fire safely
                         without zero-padding looking like real env signal.
+    - `progress_signal`:`[B, T_max]` float32 — present iff EVERY record in
+                        the batch has non-None `progress_signal`. Same
+                        all-or-nothing gate as `progress`. The v2
+                        trainer prefers this over `progress` when both
+                        are present (ALFWorld dense expert-plan deltas
+                        are denser than the near-degenerate raw env
+                        reward).
 
     Pure-torch — no `torch.nn.utils.rnn.pad_sequence` dep. Matches the
     style of `TurnRDDecomposer.decompose` which also pads inline.
@@ -277,6 +319,10 @@ def pad_collate(batch: list[TurnRDRecord]) -> dict[str, torch.Tensor]:
     progress: torch.Tensor | None = (
         torch.zeros(B, T_max, dtype=torch.float32) if have_all_progress else None
     )
+    have_all_progress_signal = all(rec.progress_signal is not None for rec in batch)
+    progress_signal: torch.Tensor | None = (
+        torch.zeros(B, T_max, dtype=torch.float32) if have_all_progress_signal else None
+    )
 
     for i, rec in enumerate(batch):
         T_i = len(rec.turn_embeds)
@@ -289,6 +335,11 @@ def pad_collate(batch: list[TurnRDRecord]) -> dict[str, torch.Tensor]:
         if progress is not None:
             assert rec.progress is not None
             progress[i, :T_i] = torch.tensor(rec.progress, dtype=torch.float32)
+        if progress_signal is not None:
+            assert rec.progress_signal is not None
+            progress_signal[i, :T_i] = torch.tensor(
+                rec.progress_signal, dtype=torch.float32
+            )
 
     out: dict[str, torch.Tensor] = {
         "turn_embeds": turn_embeds,
@@ -299,4 +350,6 @@ def pad_collate(batch: list[TurnRDRecord]) -> dict[str, torch.Tensor]:
         out["judge_labels"] = judge_labels
     if progress is not None:
         out["progress"] = progress
+    if progress_signal is not None:
+        out["progress_signal"] = progress_signal
     return out

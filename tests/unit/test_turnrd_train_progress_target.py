@@ -42,7 +42,8 @@ def _make_v2(seed: int = 0) -> TurnRDv2:
     return TurnRDv2(cfg, input_dim=INPUT_DIM)
 
 
-def _write_replay(path: Path, *, with_progress: bool, n: int = 4, seed: int = 0) -> None:
+def _write_replay(path: Path, *, with_progress: bool, n: int = 4, seed: int = 0,
+                  with_progress_signal: bool = False) -> None:
     g = torch.Generator().manual_seed(seed)
     rows = []
     for i in range(n):
@@ -62,6 +63,11 @@ def _write_replay(path: Path, *, with_progress: bool, n: int = 4, seed: int = 0)
         }
         if with_progress:
             row["progress"] = per_turn
+        if with_progress_signal:
+            # Dense signal: 1.0 at every turn (pretends every turn shrank
+            # the expert plan). Easy to distinguish from `progress`'s
+            # sparse-terminal pattern.
+            row["progress_signal"] = [1.0] * T
         rows.append(row)
     with open(path, "w") as fh:
         for r in rows:
@@ -205,3 +211,105 @@ def test_record_post_init_rejects_progress_length_mismatch() -> None:
             final_reward=0.0,
             progress=[0.1],  # T=1 → mismatch
         )
+
+
+# ---------------------------------------------------------------------------
+# Test 5: 3-way preference chain (Phase 1D — progress_signal > progress > R/T_i).
+# ---------------------------------------------------------------------------
+
+
+def test_train_v2_prefers_progress_signal_over_progress(tmp_path: Path) -> None:
+    """When BOTH `progress_signal` and `progress` are present the v2
+    trainer's V-head target = `progress_signal` (the dense ALFWorld
+    expert-plan signal). Verified by recomputing the reference MSE
+    against `progress_signal` and asserting the trainer's reported
+    `value_loss` matches that — NOT the value computed against
+    `progress`."""
+    replay = tmp_path / "replay.jsonl"
+    _write_replay(
+        replay,
+        with_progress=True,
+        with_progress_signal=True,
+        n=4,
+        seed=11,
+    )
+
+    ds = TurnRDReplayDataset(replay, mode=1)
+    batch = pad_collate([ds[0], ds[1], ds[2], ds[3]])
+    assert "progress" in batch
+    assert "progress_signal" in batch
+
+    model = _make_v2(seed=11)
+    model.eval()
+    with torch.no_grad():
+        out = model(batch["turn_embeds"], batch["attention_mask"])
+        fmask = batch["attention_mask"].to(dtype=batch["progress_signal"].dtype)
+        target_signal = batch["progress_signal"] * fmask
+        target_progress = batch["progress"] * fmask
+        ref_mse_signal = loss_v2_value(out, target_signal, batch["attention_mask"])
+        ref_mse_progress = loss_v2_value(out, target_progress, batch["attention_mask"])
+    # Sanity: the two targets are different so the assertion below is
+    # actually meaningful (not "both happen to equal zero").
+    assert float(ref_mse_signal.item()) != pytest.approx(
+        float(ref_mse_progress.item()), abs=1e-6
+    )
+
+    # One micro-step at lambda_value=1.0 (rank/progress-prior off so the
+    # value_loss slot is the entire MSE term).
+    model = _make_v2(seed=11)
+    summary = train_turnrd(
+        replay,
+        mode=1,
+        model=model,
+        n_epochs=1,
+        batch_size=4,
+        lr=0.0,  # no parameter update — preserves the loss snapshot
+        log_every=0,
+        version="v2",
+        lambda_value=1.0,
+        lambda_rank=0.0,
+        lambda_progress=0.0,
+    )
+    # The breakdown's `value_loss` slot must match the `progress_signal`
+    # ref MSE (NOT the `progress` ref MSE).
+    assert summary["final_loss_breakdown"]["value_loss"] == pytest.approx(
+        float(ref_mse_signal.item()), rel=1e-4, abs=1e-5
+    )
+
+
+def test_train_v2_diagnostic_print_for_progress_signal(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """The trainer emits a one-time `progress_signal` diagnostic line when
+    the field is present in the batch. Smoke runs grep for this string
+    to verify the dense-signal path is firing rather than silently
+    falling back to `progress` or R/T_i."""
+    replay = tmp_path / "replay.jsonl"
+    _write_replay(
+        replay,
+        with_progress=True,
+        with_progress_signal=True,
+        n=4,
+        seed=12,
+    )
+    # Reset the once-only print latch so this test sees the diagnostic
+    # regardless of the order with the other tests in this module.
+    if hasattr(train_turnrd, "_progress_signal_seen"):
+        delattr(train_turnrd, "_progress_signal_seen")
+
+    model = _make_v2(seed=12)
+    train_turnrd(
+        replay,
+        mode=1,
+        model=model,
+        n_epochs=1,
+        batch_size=4,
+        lr=0.0,
+        log_every=0,
+        version="v2",
+        lambda_value=1.0,
+        lambda_rank=0.0,
+        lambda_progress=0.0,
+    )
+    captured = capsys.readouterr()
+    assert "progress_signal field present" in captured.out
