@@ -118,7 +118,9 @@
   "hgpo": {
     "alpha": 0.5,
     "lambda_consistency": 0.0,
-    "decomposer": "turnrd"
+    "decomposer": "turnrd",
+    "use_v_projection_for_decomposition": true,
+    "v_projection_clamp": 2.0
   },
   "turnrd": {
     "version": "v2",
@@ -142,5 +144,5 @@
   "logging": {
     "print_every": 10
   },
-  "_notes": "loraMLPv2 ablation (FIXED VERSION). Extends LoRA target_modules from attention-only (q/k/v/o_proj) to attention+MLP (q/k/v/o_proj + gate/up/down_proj). For Qwen2.5-1.5B-Instruct: ~4\u00d7 more trainable params per attention module, but ALSO bumps lora_rank 16 \u2192 32 to give MLP enough capacity (MLP intermediate_size=8960; rank-16 was a 560:1 compression ratio, rank-32 is 280:1). Keeps learning_rate=5e-6 (same as v2 SOTA) \u2014 the prior loraMLP attempt halved LR which over-corrected and regressed eval to 0.510 (vs v2's 0.570). Hypothesis under test: with properly-sized rank AND original LR, MLP-LoRA unlocks additional eval headroom. All other v2 SOTA knobs preserved (K=8, alpha=0.5, decomposer=turnrd, kl_coeff=0.04). Isolated /vol/cache/TurnRDV2_alfworld_a050_loraMLPv2/ paths. Same seed=11, same SFT warm-start, same 5 rounds \u00d7 40 episodes, same 100-eval setup so eval curves are directly comparable to v2/vProjection baselines."
+  "_notes": "loraMLPv2 ablation (FIXED VERSION) STACKED ON vProjection SOTA. Two changes vs vProjection baseline: (a) lora_target_modules extends from attention-only to attention+MLP (q/k/v/o_proj + gate/up/down_proj), and (b) lora_rank 16 \u2192 32 to give MLP enough capacity (intermediate_size=8960; rank-16 was 560:1 compression, rank-32 is 280:1). learning_rate=5e-6 preserved (same as vProjection SOTA) \u2014 the prior loraMLP attempt halved LR which over-corrected and regressed eval to 0.510 (vs v2's 0.570). use_v_projection_for_decomposition=true stacks the SOTA Layer-1 fix so this experiment tests 'does MLP capacity add value on TOP of the new SOTA?' rather than just 'does MLP help v2 baseline?'. Hypothesis: vProjection (0.590) + MLP-LoRA (extra capacity) could push to 0.61-0.65. All other v2 SOTA knobs preserved (K=8, alpha=0.5, decomposer=turnrd, kl_coeff=0.04). Isolated /vol/cache/TurnRDV2_alfworld_a050_loraMLPv2/ paths. Same seed=11, same SFT warm-start, same 5 rounds \u00d7 40 episodes, same 100-eval setup so eval curves are directly comparable to vProjection baseline."
 }
