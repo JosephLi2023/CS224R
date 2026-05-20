@@ -178,7 +178,7 @@ def _train_loop_impl(
     runner = VLLMRunner(
         VLLMRunnerConfig(
             gpu_memory_utilization=gpu_mem_util,
-            max_model_len=2048,
+            max_model_len=4096,
             download_dir="/vol/hf_cache",
             enforce_eager=True,
             seed=0,
