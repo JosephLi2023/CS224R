@@ -27,11 +27,11 @@ volume: modal.Volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=Tru
 # Mount point inside containers.
 VOLUME_MOUNT = "/vol"
 
-# Env var to opt OUT of attaching the OpenAI Secret. Set to "1" when you
-# haven't created `openai-secret` yet but still want to deploy the
-# baseline / vLLM-judge path. Default behavior includes the secret so
-# Method A (judge.backend=openai) just works.
+# Env vars controlling whether we attach the OpenAI Secret. For the current
+# Max milestone pipeline we do not use the OpenAI judge backend, so the stable
+# default is to SKIP attaching the secret unless a caller explicitly opts in.
 OPENAI_SECRET_OPT_OUT_ENV = "CS224R_SKIP_OPENAI_SECRET"
+OPENAI_SECRET_OPT_IN_ENV = "CS224R_USE_OPENAI_SECRET"
 
 # The Modal Secret name and the env-var key it injects into the container.
 OPENAI_SECRET_NAME = "openai-secret"
@@ -39,7 +39,7 @@ OPENAI_SECRET_REQUIRED_KEYS = ["OPENAI_API_KEY"]
 
 
 def maybe_openai_secret() -> list[modal.Secret]:
-    """Return `[Secret]` referencing `openai-secret`, or `[]` if opted out.
+    """Return `[Secret]` referencing `openai-secret`, or `[]` by default.
 
     Important: `modal.Secret.from_name(...)` is **lazy** — it returns a
     reference and never raises here even if the secret is missing on the
@@ -53,15 +53,22 @@ def maybe_openai_secret() -> list[modal.Secret]:
     secret (e.g. user typed `OPENAI_KEY` instead of `OPENAI_API_KEY`)
     fails fast at deploy with a clear error.
 
-    To deploy WITHOUT attaching the secret (e.g. for the baseline path
-    or while the key isn't provisioned yet), set the env var
-    `CS224R_SKIP_OPENAI_SECRET=1` before invoking `modal run`/`modal deploy`.
+    The current default is to SKIP attaching the secret so local submit and
+    remote container import stay consistent for non-OpenAI training paths.
+    To opt in explicitly, set `CS224R_USE_OPENAI_SECRET=1` before invoking
+    `modal run`/`modal deploy`. `CS224R_SKIP_OPENAI_SECRET=1` still forces
+    the secret off even if the opt-in env var is present.
     """
-    if os.getenv(OPENAI_SECRET_OPT_OUT_ENV, "0") == "1":
+    opt_in = os.getenv(OPENAI_SECRET_OPT_IN_ENV, "0") == "1"
+    opt_out = os.getenv(OPENAI_SECRET_OPT_OUT_ENV, "0") == "1"
+    if (not opt_in) or opt_out:
         _logger.warning(
-            "[infra.common] %s=1 set; skipping openai-secret attachment. "
-            "judge.backend=openai will fail at runtime if reached.",
+            "[infra.common] skipping openai-secret attachment "
+            "(%s=%s, %s=%s). judge.backend=openai will fail at runtime if reached.",
+            OPENAI_SECRET_OPT_IN_ENV,
+            int(opt_in),
             OPENAI_SECRET_OPT_OUT_ENV,
+            int(opt_out),
         )
         return []
     return [

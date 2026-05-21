@@ -1,7 +1,7 @@
 """Unit tests for HGPOTrainer's pure-Python advantage-construction stage.
 
 The torch training path runs on Modal only; here we verify `build_advantages`
-produces correctly-shaped outputs and that `alpha=1, lambda=0` reduces to
+produces correctly-shaped outputs and that `alpha=0, lambda=0` reduces to
 flat GRPO (verification gate #1 from the plan)."""
 from __future__ import annotations
 
@@ -85,9 +85,9 @@ def test_build_advantages_shapes():
     assert isinstance(out["consistency"], float)
 
 
-def test_alpha_one_lambda_zero_reduces_to_flat_grpo():
-    """The verification gate: α=1, λ=0 must broadcast traj advantages over turns."""
-    cfg = HGPOTrainerConfig(alpha=1.0, lambda_consistency=0.0)
+def test_alpha_zero_lambda_zero_reduces_to_flat_grpo():
+    """The verification gate: alpha=0, lambda=0 must broadcast traj advantages over turns."""
+    cfg = HGPOTrainerConfig(alpha=0.0, lambda_consistency=0.0)
     trainer = HGPOTrainer(_StubPolicy(), progress_decomposer, cfg)
     g = _group(K=4)
     out = trainer.build_advantages(g)

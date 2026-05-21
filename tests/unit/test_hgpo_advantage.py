@@ -1,6 +1,6 @@
 """Unit tests for H-GRPO advantage math.
 
-Includes the verification-gate test from the plan: with α=1 and λ=0, the
+Includes the verification-gate test from the plan: with alpha=0 and lambda=0, the
 combined advantage and loss must reduce exactly to flat GRPO.
 """
 
@@ -102,20 +102,20 @@ def test_turn_advantages_degenerate_position_no_nan() -> None:
 # ---------- combine ----------
 
 
-def test_combine_alpha_one_drops_turn_signal() -> None:
-    """α=1 ⇒ combined = Â_traj broadcast across all turns of the trajectory."""
+def test_combine_alpha_zero_drops_turn_signal() -> None:
+    """alpha=0 => combined = A_traj broadcast across all turns."""
     traj_a = [0.7, -0.7]
     turn_a = [[1.0, -2.0, 3.0], [-1.0, 2.0]]
-    out = combine(alpha=1.0, traj_advantages=traj_a, turn_advantages=turn_a)
+    out = combine(alpha=0.0, traj_advantages=traj_a, turn_advantages=turn_a)
     assert out[0] == [pytest.approx(0.7)] * 3
     assert out[1] == [pytest.approx(-0.7)] * 2
 
 
-def test_combine_alpha_zero_drops_traj_signal() -> None:
-    """α=0 ⇒ combined = Â_turn unchanged."""
+def test_combine_alpha_one_drops_traj_signal() -> None:
+    """alpha=1 => combined = A_turn unchanged."""
     traj_a = [99.0, -99.0]
     turn_a = [[0.5, -0.5], [1.0, -1.0]]
-    out = combine(alpha=0.0, traj_advantages=traj_a, turn_advantages=turn_a)
+    out = combine(alpha=1.0, traj_advantages=traj_a, turn_advantages=turn_a)
     for row, expected in zip(out, turn_a):
         assert row == pytest.approx(expected)
 
@@ -168,11 +168,11 @@ def test_consistency_loss_length_mismatch_raises() -> None:
         consistency_loss(1.0, [0.0, 0.0], [[0.0]])
 
 
-# ---------- alpha=1, lambda=0 reduces to flat GRPO (verification gate #1) ----------
+# ---------- alpha=0, lambda=0 reduces to flat GRPO (verification gate #1) ----------
 
 
-def test_alpha_one_lambda_zero_reduces_to_flat_grpo() -> None:
-    """Verification gate #1 from the plan: with α=1 and λ=0, the H-GRPO
+def test_alpha_zero_lambda_zero_reduces_to_flat_grpo() -> None:
+    """Verification gate #1 from the plan: with alpha=0 and lambda=0, the H-GRPO
     combined advantage equals the trajectory-level advantage broadcast over
     all turns, and the consistency loss vanishes. This is the bit-exact
     flat-GRPO recovery property."""
@@ -187,7 +187,7 @@ def test_alpha_one_lambda_zero_reduces_to_flat_grpo() -> None:
     traj_a = compute_traj_advantages(final_rewards)
     turn_a = compute_turn_advantages(per_turn)
 
-    combined_hgpo = combine(alpha=1.0, traj_advantages=traj_a, turn_advantages=turn_a)
+    combined_hgpo = combine(alpha=0.0, traj_advantages=traj_a, turn_advantages=turn_a)
     cons = consistency_loss(lam=0.0, traj_advantages=traj_a, turn_advantages=turn_a)
 
     # Flat GRPO uses traj_a broadcast to every turn.

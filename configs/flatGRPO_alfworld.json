@@ -110,12 +110,12 @@
     "lora_rank": 16
   },
   "hgpo": {
-    "alpha": 1.0,
+    "alpha": 0.0,
     "lambda_consistency": 0.0,
     "decomposer": "progress"
   },
   "logging": {
     "print_every": 10
   },
-  "_notes": "flatGRPO_alfworld = H-GRPO with alpha=1.0 (drops per-turn signal), trivial-decomposer baseline on AlfWorld. AlfWorld twin of configs/flatGRPO.json. With alpha=1.0 the choice of decomposer is mathematically inert (only the trajectory advantage survives); progress is used because it is parameter-free. Apples-to-apples no-decomposer baseline vs TurnRDV1/V2/Progressive on the AlfWorld 5-method sweep — same lr=1e-6, kl_coeff=0.04, K=4, gpu_mem_util=0.20 as the existing alfworld method configs. Populates 4method_comparison_alfworld.json::flatGRPO."
+  "_notes": "flatGRPO_alfworld = H-GRPO with alpha=0.0 (drops per-turn signal under proposal semantics where alpha weights A_turn), trivial-decomposer baseline on AlfWorld. AlfWorld twin of configs/flatGRPO.json. With alpha=0.0 the choice of decomposer is mathematically inert (only the trajectory advantage survives); progress is used because it is parameter-free. Apples-to-apples no-decomposer baseline vs TurnRDV1/V2/Progressive on the AlfWorld 5-method sweep — same lr=1e-6, kl_coeff=0.04, K=4, gpu_mem_util=0.20 as the existing alfworld method configs. Populates 4method_comparison_alfworld.json::flatGRPO."
 }

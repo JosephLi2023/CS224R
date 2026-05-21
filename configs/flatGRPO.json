@@ -23,12 +23,12 @@
     "lora_rank": 16
   },
   "hgpo": {
-    "alpha": 1.0,
+    "alpha": 0.0,
     "lambda_consistency": 0.0,
     "decomposer": "progress"
   },
   "logging": {
     "print_every": 10
   },
-  "_notes": "flatGRPO = H-GRPO with alpha=1.0 (drops per-turn signal), trivial-decomposer baseline. Canonical-vocabulary copy of configs/method_flat_grpo.json. With alpha=1.0 the choice of decomposer is mathematically inert (only the trajectory advantage survives); progress is used because it is parameter-free. Bit-exact regression target for the HGPO alpha=1 recovery test. Populates methods_comparison.json::flatGRPO."
+  "_notes": "flatGRPO = H-GRPO with alpha=0.0 (drops per-turn signal under proposal semantics where alpha weights A_turn), trivial-decomposer baseline. Canonical-vocabulary copy of configs/method_flat_grpo.json. With alpha=0.0 the choice of decomposer is mathematically inert (only the trajectory advantage survives); progress is used because it is parameter-free. Bit-exact regression target for the HGPO alpha=0 recovery test. Populates methods_comparison.json::flatGRPO."
 }

@@ -165,18 +165,43 @@ def _train_loop_impl(
     run_dir = f"/vol/manifests/{run_name}_{timestamp}"
     os.makedirs(run_dir, exist_ok=True)
 
-    print(">>> Loading LoRAPolicy")
-    policy = LoRAPolicy(LoRAPolicyConfig(cache_dir="/vol/hf_cache"))
+    def _is_local_peft_adapter(path: str) -> bool:
+        return bool(path) and os.path.isdir(path) and os.path.exists(
+            os.path.join(path, "adapter_config.json")
+        )
 
+    def _is_local_full_checkpoint(path: str) -> bool:
+        return bool(path) and os.path.isdir(path) and os.path.exists(
+            os.path.join(path, "config.json")
+        ) and not _is_local_peft_adapter(path)
+
+    policy_model_name = "Qwen/Qwen2.5-1.5B-Instruct"
     sft_loaded = False
-    if sft_adapter:
+    sft_is_full_checkpoint = False
+    if sft_adapter and _is_local_full_checkpoint(sft_adapter):
+        policy_model_name = sft_adapter
+        sft_loaded = True
+        sft_is_full_checkpoint = True
+
+    print(">>> Loading LoRAPolicy")
+    policy = LoRAPolicy(
+        LoRAPolicyConfig(
+            model_name=policy_model_name,
+            cache_dir="/vol/hf_cache",
+        )
+    )
+
+    if sft_adapter and not sft_is_full_checkpoint:
         print(">>> Loading SFT-warm-started LoRA adapter from", sft_adapter)
         policy.load_adapter(sft_adapter)
         sft_loaded = True
+    elif sft_is_full_checkpoint:
+        print(">>> Using full SFT checkpoint as the GRPO backbone from", sft_adapter)
 
     print(">>> Booting VLLMRunner")
     runner = VLLMRunner(
         VLLMRunnerConfig(
+            model_name=policy_model_name,
             gpu_memory_utilization=gpu_mem_util,
             max_model_len=4096,
             download_dir="/vol/hf_cache",
@@ -303,7 +328,7 @@ def _train_loop_impl(
             policy=policy,
             decomposer=progress_decomposer,
             cfg=HGPOTrainerConfig(
-                alpha=1.0,                 # flat GRPO: drop turn-level signal
+                alpha=0.0,                 # flat GRPO: drop turn-level signal
                 lambda_consistency=0.0,
                 clip_eps=0.2,
                 learning_rate=1e-6,

@@ -235,6 +235,7 @@ class RolloutCollector:
                     turn_idx=turn_idx,
                     observation_text=obs_text,
                     action_text=action_text,
+                    valid_actions=tuple(getattr(states[i], "valid_actions", ()) or ()),
                     raw_env_reward=float(reward),
                     action_token_ids=token_ids,
                     action_token_logprobs=token_logprobs,

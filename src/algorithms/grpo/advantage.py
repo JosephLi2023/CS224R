@@ -18,10 +18,10 @@ Formulas:
 
     Â_traj(τ_i)        = (R_i − R̄) / σ_R
     Â_turn(t, τ_i)     = (r̂_t^i − r̄_t) / σ_{r̂_t}        per position t
-    Â_H(t, τ_i)        = α · Â_traj(τ_i) + (1 − α) · Â_turn(t, τ_i)
+    A_H(t, tau_i)        = alpha * A_turn(t, tau_i) + (1 - alpha) * A_traj(tau_i)
     L_consistency(τ_i) = λ · ‖ Σ_t Â_turn(t, τ_i) − Â_traj(τ_i) ‖²
 
-Setting α=1 and λ=0 reduces H-GRPO exactly to flat GRPO; this is unit-tested.
+Setting alpha=0 and lambda=0 reduces H-GRPO exactly to flat GRPO; this is unit-tested.
 """
 
 from __future__ import annotations
@@ -127,12 +127,12 @@ def combine(
 ) -> list[list[float]]:
     """Combine trajectory- and turn-level advantages.
 
-    Â_H(t, τ_i) = α · Â_traj(τ_i) + (1 − α) · Â_turn(t, τ_i)
+    A_H(t, tau_i) = alpha * A_turn(t, tau_i) + (1 - alpha) * A_traj(tau_i)
 
     Args:
-        alpha: weight on trajectory-level advantage in [0, 1].
-               α=1 ⇒ flat GRPO (turn signal dropped).
-               α=0 ⇒ pure turn-level signal (no group baseline).
+        alpha: weight on turn-level advantage in [0, 1].
+               alpha=0 => flat GRPO (turn signal dropped).
+               alpha=1 => pure turn-level signal (no trajectory baseline).
         traj_advantages: length-K list of `Â_traj(τ_i)`.
         turn_advantages: list[K] of list[T_i] of `Â_turn(t, τ_i)`.
 
@@ -150,7 +150,7 @@ def combine(
 
     out: list[list[float]] = []
     for traj_a, turn_row in zip(traj_advantages, turn_advantages):
-        out.append([alpha * traj_a + (1.0 - alpha) * t for t in turn_row])
+        out.append([alpha * t + (1.0 - alpha) * traj_a for t in turn_row])
     return out
 
 

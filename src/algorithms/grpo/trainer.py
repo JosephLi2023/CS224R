@@ -560,7 +560,7 @@ class HGPOTrainer:
             L_PPO    = -mean( min(rho * A_H, clip(rho, 1±eps) * A_H) )
             r        = pi_ref / pi_theta = exp(ref_logp - new_logp)
             KL_k3    = mean( (r - 1) - log r )           # autograd → theta
-            A_H      = alpha * A_traj + (1 - alpha) * A_turn
+            A_H      = alpha * A_turn + (1 - alpha) * A_traj
 
         Gradient destinations:
 
@@ -636,15 +636,20 @@ class HGPOTrainer:
         else:
             _mean_abs_traj_adv = 0.0
             _std_traj_adv = 0.0
+        _flat_combined_adv = [v for row in combined for v in row]
+        _mean_abs_combined_adv: float = (
+            sum(abs(a) for a in _flat_combined_adv) / len(_flat_combined_adv)
+            if _flat_combined_adv
+            else 0.0
+        )
 
         device = next(self.policy.model.parameters()).device
 
         # ----- Tier-2 skip-dead-K guard -----
         # When all K final rewards in the group are equal, the trajectory
-        # advantages are identically zero and the policy gradient on this
-        # group is zero by construction (regardless of α). Short-circuit
-        # BEFORE the 3 expensive padded forwards in `_batched_logprobs`
-        # (one new + one ref pass dominates per-step wallclock at K=8).
+        # advantages are identically zero. A turn-level decomposer may still
+        # emit nonzero A_turn; only skip when the combined advantage is zero.
+        # This preserves the cheap skip only for truly zero-signal groups.
         # Per the Tier-2 plan we only skip the OPTIMIZER STEP — the
         # decomposer's `__call__` (above, via `build_advantages`) already
         # ran so the per-turn rewards are computed and the rollout's
@@ -652,7 +657,7 @@ class HGPOTrainer:
         # train_step returns) sees identical inputs to the non-dead path.
         # The Tier-4 alpha_*/cls_query_norm logging path is preserved so
         # downstream train_log columns stay meaningful for dead groups too.
-        if _dead_K_group:
+        if _dead_K_group and _mean_abs_combined_adv < 1e-12:
             # Recover alpha_* from the eval-mode α tensor stashed by
             # turnrd's `decompose()` (Tier-4 path). Only meaningful when
             # the decomposer is learnable and stashed `_last_alpha`.
@@ -1007,8 +1012,8 @@ class HGPOTrainer:
                                     continue
                                 new_turn_adv = v6_detached[row][t]
                                 combined[orig_i][t] = (
-                                    alpha_w * traj_adv[orig_i] +
-                                    (1.0 - alpha_w) * new_turn_adv
+                                    alpha_w * new_turn_adv +
+                                    (1.0 - alpha_w) * traj_adv[orig_i]
                                 )
                 # v6 diagnostic: correlation between learned α and the
                 # env's normalized progress signal (Method C's signal).
@@ -1200,7 +1205,7 @@ class HGPOTrainer:
             alpha_entropy=_alpha_entropy,
             alpha_progress_corr=_alpha_progress_corr,
             std_reward_group=_std_reward_group,
-            dead_K_group=_dead_K_group,
+            dead_K_group=0,
             mean_abs_traj_adv=_mean_abs_traj_adv,
             std_traj_adv=_std_traj_adv,
             mean_abs_adv_token=_mean_abs_adv_token,

@@ -186,7 +186,23 @@ class ALFWorldAdapter:
         self._env = self._build_alfworld_env()
 
     def _build_alfworld_env(self):
-        import_error: Exception | None = None
+        import_errors: list[str] = []
+
+        def _instantiate_meta_env(env_cls: Any) -> Any:
+            config = self.env_kwargs.get("config")
+            train_eval = self.env_kwargs.get("train_eval", self.task_split)
+            if isinstance(config, dict):
+                try:
+                    return env_cls(config, train_eval=train_eval)
+                except TypeError:
+                    pass
+            try:
+                return env_cls(
+                    observation_mode=self.observation_mode,
+                    **self.env_kwargs,
+                )
+            except TypeError:
+                return env_cls(**self.env_kwargs)
 
         # AlfWorld's `AlfredTWEnv` is the META-env (loads game files,
         # holds config) — it does NOT expose `.reset()` / `.step()`
@@ -196,50 +212,41 @@ class ALFWorldAdapter:
         # adapter constructor so the `self._env` returned here is
         # immediately usable by `reset()` / `step()`.
 
-        # Try the canonical ALFWorld text env path. Prefer to forward
-        # `observation_mode` when the constructor accepts it (parallel to
-        # WebShop); fall back to the kwargs-only construction for forks
-        # that don't take it.
+        # Prefer the explicit AlfredTWEnv path first. This is the same path
+        # used by the verified Modal smoke install function and has proven
+        # more reliable than the generic `get_environment("alfred")`
+        # dispatcher for repeated collector-side env construction.
         try:
+            import traceback
+            from importlib import import_module
+
+            module = import_module("alfworld.agents.environment.alfred_tw_env")
+            env_cls = getattr(module, "AlfredTWEnv")
+            meta = _instantiate_meta_env(env_cls)
+            return self._wrap_batch_env(meta)
+        except Exception:  # pragma: no cover - depends on local install
+            import_errors.append("direct AlfredTWEnv path failed:\n" + traceback.format_exc())
+
+        # Fallback: some forks only expose a generic environment registry.
+        try:
+            import traceback
             from importlib import import_module
 
             module = import_module("alfworld.agents.environment")
             get_env = getattr(module, "get_environment", None)
             if callable(get_env):
                 env_cls = get_env("alfred")
-                try:
-                    meta = env_cls(
-                        observation_mode=self.observation_mode,
-                        **self.env_kwargs,
-                    )
-                except TypeError:
-                    meta = env_cls(**self.env_kwargs)
+                meta = _instantiate_meta_env(env_cls)
                 return self._wrap_batch_env(meta)
-        except Exception as exc:  # pragma: no cover - depends on local install
-            import_error = exc
-
-        # Fallback: some forks expose environment class directly.
-        try:
-            from importlib import import_module
-
-            module = import_module("alfworld.agents.environment.alfred_tw_env")
-            env_cls = getattr(module, "AlfredTWEnv")
-            try:
-                meta = env_cls(
-                    observation_mode=self.observation_mode,
-                    **self.env_kwargs,
-                )
-            except TypeError:
-                meta = env_cls(**self.env_kwargs)
-            return self._wrap_batch_env(meta)
-        except Exception as exc:  # pragma: no cover - depends on local install
-            import_error = exc
+        except Exception:  # pragma: no cover - depends on local install
+            import_errors.append(
+                "registry get_environment('alfred') path failed:\n" + traceback.format_exc()
+            )
 
         raise ImportError(
             "Failed to import ALFWorld environment. Install ALFWorld and ensure "
-            "its environment modules are importable. "
-            f"Original error type: {type(import_error).__name__}; "
-            f"Original error: {import_error!r}"
+            "its environment modules are importable.\n\n"
+            + "\n\n".join(import_errors)
         )
 
     def _build_request_infos(self) -> Any | None:
@@ -315,6 +322,42 @@ class ALFWorldAdapter:
                 "ALFWorld env has neither `.reset()` nor `.init_env(batch_size=...)`; "
                 "incompatible upstream API. Open an issue with the alfworld version."
             )
+
+        # The known-good production path is a plain
+        # `meta.init_env(batch_size=1)`, which matches the install smoke.
+        # Some forks also accept `request_infos=...`; try that once, then
+        # fall back to the plain path instead of mutating `meta.request_infos`,
+        # which has proven fragile in live ALFWorld GRPO runs.
+        env_infos = self._build_request_infos() if self._use_tw_intermediate_reward else None
+        if env_infos is not None:
+            try:
+                wrapped = meta.init_env(batch_size=1, request_infos=env_infos)
+                self._tw_registration_succeeded = True
+            except Exception:
+                warnings.warn(
+                    "ALFWorld `init_env(request_infos=...)` failed; falling back "
+                    "to bare init. TextWorld's native `intermediate_reward` field "
+                    "will NOT be populated and the adapter will use the Phase 1 "
+                    "expert-plan-length delta as the V-head signal.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                wrapped = meta.init_env(batch_size=1)
+                self._tw_registration_succeeded = False
+        else:
+            wrapped = meta.init_env(batch_size=1)
+            self._tw_registration_succeeded = False
+        self._is_batched = True
+        if not hasattr(wrapped, "game_files") and hasattr(meta, "game_files"):
+            try:
+                setattr(wrapped, "game_files", meta.game_files)
+            except (AttributeError, TypeError):
+                pass
+        try:
+            setattr(wrapped, "_alfred_meta", meta)
+        except (AttributeError, TypeError):
+            pass
+        return wrapped
 
         env_infos = self._build_request_infos() if self._use_tw_intermediate_reward else None
         wrapped: Any = None

@@ -83,6 +83,81 @@ def _build_progress_branch(
     return trainer, None, None, None, None
 
 
+def _build_max_turn_reward_branch(
+    cfg: dict[str, Any],
+    trainer_cfg: HGPOTrainerConfig,
+    policy: "LoRAPolicy",
+) -> BuildResult:
+    """Max milestone branch: local ALFWorld turn-reward methods only."""
+    from maxrodriguez.grpo.turn_level_reward_methods_todo import (
+        AdmissibleActionMarginTODO,
+        ProgressDeltaTODO,
+        SignedAttentionTODO,
+        load_signed_attention_transformer_checkpoint,
+    )
+
+    max_cfg = cfg.get("max_turn_reward", {}) or {}
+    method = str(max_cfg.get("method", cfg.get("hgpo", {}).get("decomposer", ""))).lower()
+    method_hparams = dict(max_cfg.get("method_hyperparameters", {}) or {})
+
+    if method == "trajectory_only":
+        def _zero_turn_rewards(group):
+            return [[0.0 for _turn in traj.turns] for traj in group.trajectories]
+
+        decomposer = _zero_turn_rewards
+    elif method == "progress_delta":
+        decomposer = ProgressDeltaTODO(
+            terminal_bonus=float(method_hparams.get("terminal_bonus", 1.0)),
+        ).decompose
+    elif method == "signed_attention":
+        device = str(
+            method_hparams.get(
+                "device",
+                "cuda" if torch.cuda.is_available() else "cpu",
+            )
+        )
+        transformer_ckpt_path = str(method_hparams.get("transformer_ckpt_path", "")).strip()
+        if not transformer_ckpt_path:
+            raise ValueError(
+                "signed_attention requires max_turn_reward.method_hyperparameters."
+                "transformer_ckpt_path so the live GRPO run uses the trained transformer."
+            )
+        model = load_signed_attention_transformer_checkpoint(
+            transformer_ckpt_path,
+            device=device,
+        )
+        decomposer = SignedAttentionTODO(
+            model=model,
+            hidden_size=int(method_hparams.get("hidden_size", 128)),
+            outcome_scale=float(method_hparams.get("outcome_scale", 1.0)),
+            device=device,
+        ).decompose
+    elif method == "admissible_margin":
+        decomposer = AdmissibleActionMarginTODO(
+            max_actions_to_score=int(method_hparams.get("max_actions_to_score", 32)),
+            normalize_margin=bool(method_hparams.get("normalize_margin", True)),
+            policy=policy,
+            tokenizer=policy.tokenizer,
+            max_seq_len=int(method_hparams.get("max_seq_len", 2048)),
+            score_normalization=str(method_hparams.get("score_normalization", "mean")),
+            device=str(
+                method_hparams.get(
+                    "device",
+                    "cuda" if torch.cuda.is_available() else "cpu",
+                )
+            ),
+        ).decompose
+    else:
+        raise ValueError(
+            f"_build_max_turn_reward_branch: unknown method {method!r}; "
+            "expected 'trajectory_only' | 'progress_delta' | "
+            "'signed_attention' | 'admissible_margin'."
+        )
+
+    trainer = HGPOTrainer(policy=policy, decomposer=decomposer, cfg=trainer_cfg)
+    return trainer, None, None, None, None
+
+
 def _build_judge_branch(
     cfg: dict[str, Any],
     trainer_cfg: HGPOTrainerConfig,
@@ -524,6 +599,8 @@ def build_trainer_from_config(
             action_parser=action_parser,
             sampling_factory=sampling_factory,
         )
+    if name in {"trajectory_only", "progress_delta", "signed_attention", "admissible_margin"}:
+        return _build_max_turn_reward_branch(cfg, trainer_cfg, policy)
     raise ValueError(
         f"build_trainer_from_config: unknown hgpo.decomposer "
         f"{name!r}; expected 'progress' | 'judge' | 'turnrd' | "

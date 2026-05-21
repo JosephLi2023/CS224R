@@ -1,0 +1,34 @@
+{
+  "_status": "template only; generated runnable configs come from maxrodriguez/grpo/app_alfworld_grpo.py",
+  "_math": "A_H = alpha * A_turn + (1 - alpha) * A_traj",
+  "run": {
+    "name": "filled_from_GRPO_HYPERPARAMETER_GRID",
+    "seed": 42
+  },
+  "dataset_size_mode": "grid_or_full",
+  "env": {
+    "dataset": {
+      "num_train_games": "grid_200_or_full_-1",
+      "num_eval_games": "grid_50_or_full_-1"
+    }
+  },
+  "train": {
+    "algorithm": "max_alpha_grpo",
+    "learning_rate": "grid_value",
+    "K_trajectories_per_task": "grid_value",
+    "kl_coeff": "grid_value",
+    "clip_eps": "grid_value",
+    "grad_accum_steps": "grid_value",
+    "max_tokens_per_microbatch": "grid_value",
+    "kl_warmup_episodes": "grid_value"
+  },
+  "hgpo": {
+    "alpha": "grid_value",
+    "lambda_consistency": 0.0,
+    "decomposer": "milestone_one_of_trajectory_only_progress_delta_signed_attention_admissible_margin"
+  },
+  "max_turn_reward": {
+    "method_hyperparameters": "filled_from_TURN_REWARD_METHOD_GRID"
+  },
+  "_notes": "Counterfactual delta is post-milestone and is intentionally excluded from the first GRPO sweeps."
+}

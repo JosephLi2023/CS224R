@@ -56,6 +56,10 @@ class TurnRecord:
     # trajectory carries a non-None value (mirrors the dataset's
     # all-or-nothing semantics for the existing `progress` field).
     intermediate_reward: float | None = None
+    # Environment-supplied admissible actions at this turn. Required for
+    # admissible-margin style turn scoring, where we compare the chosen action
+    # against alternative valid commands in the same state.
+    valid_actions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

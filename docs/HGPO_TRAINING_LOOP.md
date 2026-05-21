@@ -84,7 +84,7 @@ flowchart LR
     PERTURN["r_hat_t = alpha_t · R"]
     TURNADV["A_turn (group-norm by t)"]
     TRAJADV["A_traj (group-norm by i)<br/>= (R−R_bar)/sigma_R  ← const wrt theta"]
-    AH["A_H = alpha·A_traj + (1−alpha)·A_turn"]
+    AH["A_H = alpha·A_turn + (1−alpha)·A_traj"]
 
     PPO["L_PPO = -mean min(rho·A_H,<br/>clip(rho,1±eps)·A_H)"]
     KLT["beta · KL_k3"]

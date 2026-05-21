@@ -1,0 +1,1 @@
+2026-05-19T19:15:32.8475638-07:00 winner: lr=2e-5 seq=1024 ga=4 val_ce=0.040079 run=sftgrid_milestone_v8_e1_lr0p00002_seq1024_ga4_nodagger
