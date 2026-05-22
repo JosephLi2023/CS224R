@@ -130,9 +130,17 @@ modal run maxrodriguez/supervised_FT/app_alfworld_sft_plus.py::train_sft_plus `
   --post-eval-task-id-base 0
 ```
 
-After the two SFT commands finish, choose the checkpoint with higher full free-form greedy success:
+After the two SFT commands finish, read both summaries and choose exactly one SFT checkpoint for GRPO. The final GRPO comparison is controlled by one variable, `$SFT_CKPT`; every standard/variant GRPO command below uses that same selected checkpoint via `--sft-adapter $SFT_CKPT`. Do not run GRPO from both SFT checkpoints unless you intentionally want a separate 2x-cost ablation.
 
 ```powershell
+modal run maxrodriguez/supervised_FT/app_alfworld_sft_plus.py::read_json_artifact `
+  --path "$SFT_NODAGGER/summary.json"
+
+modal run maxrodriguez/supervised_FT/app_alfworld_sft_plus.py::read_json_artifact `
+  --path "$SFT_DAGGER/summary.json"
+
+# Pick the checkpoint with higher post_train_eval seen/unseen success.
+# Default to DAgger only if it actually wins or is tied on full greedy eval.
 $SFT_CKPT = $SFT_DAGGER
 # Use this instead if no-DAgger wins:
 # $SFT_CKPT = $SFT_NODAGGER
@@ -140,7 +148,7 @@ $SFT_CKPT = $SFT_DAGGER
 
 ## 4. Train Full-Data GRPO And Turn-Level Variants
 
-These settings are the grid-supported settings from the subset sweep, scaled to all 3553 train games with `K=8`. Inline GRPO eval is disabled (`--eval-episodes 0`) because claims should use the full free-form seen/unseen eval commands below.
+These settings are the grid-supported settings from the subset sweep, scaled to all 3553 train games with `K=8`. The loop launches four runs from the one selected SFT checkpoint: standard `trajectory_only`, then `progress_delta`, `signed_attention`, and `admissible_margin`. Inline GRPO eval is disabled (`--eval-episodes 0`) because claims should use the full free-form seen/unseen eval commands below.
 
 ```powershell
 $GRPO_METHODS = @(
