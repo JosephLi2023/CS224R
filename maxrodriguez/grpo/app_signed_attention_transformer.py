@@ -26,7 +26,6 @@ from maxrodriguez.grpo.turn_level_reward_methods_todo import (
     _trajectory_feature_tensor,
     load_signed_attention_transformer_checkpoint,
     save_signed_attention_transformer_checkpoint,
-    train_signed_attention_transformer,
 )
 from src.algorithms.grpo.rollout import Trajectory, TrajectoryGroup, TurnRecord
 from src.datasets.sft_alfworld import synthesize_sft_target
@@ -40,20 +39,20 @@ DEFAULT_OUTPUT_ROOT = "/vol/checkpoints/maxrodriguez_milestone/signed_attention"
 DEFAULT_MANIFEST_ROOT = "/vol/manifests/maxrodriguez/signed_attention"
 
 SIGNED_ATTENTION_TRANSFORMER_GRID: dict[str, list[Any]] = {
-    "epochs": [1],
-    "learning_rate": [5.0e-5, 1.0e-4, 2.0e-4],
-    "hidden_size": [64, 128],
-    "n_layers": [1, 2],
-    "n_heads": [4],
-    "dropout": [0.0],
-    "train_trajectories": [256],
-    "val_trajectories": [64],
+    "epochs": [2],
+    "learning_rate": [5.0e-5, 1.0e-4],
+    "hidden_size": [256, 512],
+    "n_layers": [4, 6],
+    "n_heads": [8],
+    "dropout": [0.05],
+    "train_trajectories": [1024],
+    "val_trajectories": [140],
     "max_turns": [30],
     "seed": [42],
 }
 
 SIGNED_ATTENTION_TRANSFORMER_FINAL_SPACE: dict[str, list[Any]] = {
-    "epochs": [3],
+    "epochs": [8],
 }
 
 BEST_SIGNED_ATTENTION_TRANSFORMER_AFTER_SWEEP: dict[str, Any] = {
@@ -154,10 +153,10 @@ def build_final_signed_attention_train_spec(
     learning_rate: float,
     hidden_size: int,
     n_layers: int,
-    n_heads: int = 4,
-    dropout: float = 0.0,
-    train_trajectories: int = 256,
-    val_trajectories: int = 64,
+    n_heads: int = 8,
+    dropout: float = 0.05,
+    train_trajectories: int = 3553,
+    val_trajectories: int = 140,
     max_turns: int = 30,
     seed: int = 42,
     output_root: str = DEFAULT_OUTPUT_ROOT,
@@ -339,7 +338,77 @@ def _evaluate_signed_attention_transformer(
     }
 
 
-@app.function(image=alfworld_image, gpu="A100-80GB", volumes={VOLUME_MOUNT: volume}, timeout=8 * 60 * 60)
+def _train_signed_attention_transformer_with_validation(
+    model: SignedAttentionTransformer,
+    train_groups: list[TrajectoryGroup],
+    val_groups: list[TrajectoryGroup],
+    *,
+    epochs: int,
+    learning_rate: float,
+    device: str,
+    validation_every_epochs: int = 1,
+) -> tuple[list[float], list[dict[str, Any]]]:
+    """Train the signed transformer and report validation MSE during training."""
+    target_device = torch.device(device if torch.cuda.is_available() else "cpu")
+    model = model.to(target_device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=float(learning_rate), weight_decay=0.01)
+    losses: list[float] = []
+    epoch_metrics: list[dict[str, Any]] = []
+    validate_every = max(1, int(validation_every_epochs))
+
+    for epoch in range(int(epochs)):
+        model.train()
+        epoch_losses: list[float] = []
+        for group in train_groups:
+            for traj in group.trajectories:
+                if not traj.turns:
+                    continue
+
+                features = _trajectory_feature_tensor(
+                    traj,
+                    device=target_device,
+                    dtype=torch.float32,
+                    feature_size=int(model.input_proj.in_features),
+                ).unsqueeze(0)
+                mask = torch.ones((1, features.shape[1]), device=target_device, dtype=torch.bool)
+                target = _signed_attention_target_tensor(
+                    traj,
+                    device=target_device,
+                    dtype=torch.float32,
+                ).unsqueeze(0)
+
+                pred = model(features, mask=mask)
+                loss = F.mse_loss(pred[mask], target[mask])
+
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+
+                loss_value = float(loss.detach().cpu())
+                epoch_losses.append(loss_value)
+                losses.append(loss_value)
+
+        should_validate = bool(val_groups) and ((epoch + 1) % validate_every == 0 or epoch == int(epochs) - 1)
+        val_metrics = (
+            _evaluate_signed_attention_transformer(model, val_groups, device=str(target_device))
+            if should_validate
+            else {"n_groups": len(val_groups), "mse": None}
+        )
+        row = {
+            "epoch": int(epoch),
+            "train_loss": round(sum(epoch_losses) / max(1, len(epoch_losses)), 6),
+            "n_updates": int(len(epoch_losses)),
+            "val_mse": val_metrics.get("mse"),
+            "val_groups": int(val_metrics.get("n_groups", len(val_groups))),
+        }
+        epoch_metrics.append(row)
+        print(f">>> signed_attention_epoch {json.dumps(row, sort_keys=True)}")
+
+    return losses, epoch_metrics
+
+
+@app.function(image=alfworld_image, gpu="A100-80GB", volumes={VOLUME_MOUNT: volume}, timeout=24 * 60 * 60)
 def train_signed_attention_transformer_model(
     *,
     epochs: int,
@@ -355,6 +424,7 @@ def train_signed_attention_transformer_model(
     run_name: str,
     output_dir: str,
     base_model_path: str = DEFAULT_BASE_MODEL_PATH,
+    validation_every_epochs: int = 1,
 ) -> dict[str, Any]:
     sys.path.insert(0, "/workspace")
     torch.manual_seed(seed)
@@ -385,6 +455,19 @@ def train_signed_attention_transformer_model(
         max_turns=int(max_turns),
         task_id_base=0,
     )
+    validation_source = "eval_in_distribution"
+    if int(val_trajectories) > 0 and int(val_result["n_groups"]) == 0 and train_result["groups"]:
+        fallback_n = min(int(val_trajectories), len(train_result["groups"]))
+        val_result = {
+            "groups": train_result["groups"][-fallback_n:],
+            "n_groups": fallback_n,
+            "n_skipped": 0,
+        }
+        validation_source = "train_tail_fallback_no_eval_expert_plan"
+        print(
+            ">>> signed_attention_validation_fallback "
+            f"source={validation_source} n_groups={fallback_n}"
+        )
 
     model = SignedAttentionTransformer(
         input_size=SIGNED_ATTENTION_FEATURE_SIZE,
@@ -396,17 +479,25 @@ def train_signed_attention_transformer_model(
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     t0 = time.time()
-    losses = train_signed_attention_transformer(
+    losses, epoch_metrics = _train_signed_attention_transformer_with_validation(
         model,
         train_result["groups"],
+        val_result["groups"],
         epochs=int(epochs),
         learning_rate=float(learning_rate),
         device=device,
+        validation_every_epochs=int(validation_every_epochs),
     )
     val_metrics = _evaluate_signed_attention_transformer(
         model,
         val_result["groups"],
         device=device,
+    )
+    validated_epochs = [row for row in epoch_metrics if row.get("val_mse") is not None]
+    best_epoch = (
+        min(validated_epochs, key=lambda row: float(row["val_mse"]))
+        if validated_epochs
+        else None
     )
 
     ckpt_path = os.path.join(ckpt_dir, "signed_attention_transformer.pt")
@@ -434,17 +525,22 @@ def train_signed_attention_transformer_model(
         "val_trajectories_requested": int(val_trajectories),
         "val_trajectories_collected": int(val_result["n_groups"]),
         "val_trajectories_skipped": int(val_result["n_skipped"]),
+        "validation_source": validation_source,
         "max_turns": int(max_turns),
         "seed": int(seed),
         "val_mse": val_metrics["mse"],
+        "best_val_mse": None if best_epoch is None else best_epoch["val_mse"],
+        "best_val_epoch": None if best_epoch is None else best_epoch["epoch"],
         "n_training_updates": len(losses),
         "final_train_loss": round(losses[-1], 6) if losses else None,
         "elapsed_s": round(time.time() - t0, 2),
         "manifest_dir": manifest_dir,
+        "validation_every_epochs": int(validation_every_epochs),
     }
     artifact = {
         "summary": summary,
         "val_metrics": val_metrics,
+        "epoch_metrics": epoch_metrics,
         "train_losses": losses[-200:],
     }
 
@@ -461,7 +557,7 @@ def train_signed_attention_transformer_model(
     return summary
 
 
-@app.function(image=alfworld_image, gpu="A100-80GB", volumes={VOLUME_MOUNT: volume}, timeout=2 * 60 * 60)
+@app.function(image=alfworld_image, gpu="A100-80GB", volumes={VOLUME_MOUNT: volume}, timeout=4 * 60 * 60)
 def evaluate_signed_attention_transformer_checkpoint(
     *,
     checkpoint_path: str,
@@ -485,3 +581,40 @@ def evaluate_signed_attention_transformer_checkpoint(
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = load_signed_attention_transformer_checkpoint(checkpoint_path, device=device)
     return _evaluate_signed_attention_transformer(model, val_result["groups"], device=device)
+
+
+@app.local_entrypoint()
+def main(
+    epochs: int = 8,
+    learning_rate: float = 5.0e-5,
+    hidden_size: int = 512,
+    n_layers: int = 6,
+    n_heads: int = 8,
+    dropout: float = 0.05,
+    train_trajectories: int = 3553,
+    val_trajectories: int = 140,
+    max_turns: int = 30,
+    seed: int = 42,
+    run_name: str = "satf_alltrain_h512_l6_e8",
+    output_dir: str = "/vol/checkpoints/maxrodriguez_unlimited/signed_attention/satf_alltrain_h512_l6_e8",
+    base_model_path: str = DEFAULT_BASE_MODEL_PATH,
+    validation_every_epochs: int = 1,
+) -> None:
+    """Train a signed-attention transformer from the command line."""
+    result = train_signed_attention_transformer_model.remote(
+        epochs=epochs,
+        learning_rate=learning_rate,
+        hidden_size=hidden_size,
+        n_layers=n_layers,
+        n_heads=n_heads,
+        dropout=dropout,
+        train_trajectories=train_trajectories,
+        val_trajectories=val_trajectories,
+        max_turns=max_turns,
+        seed=seed,
+        run_name=run_name,
+        output_dir=output_dir,
+        base_model_path=base_model_path,
+        validation_every_epochs=validation_every_epochs,
+    )
+    print(json.dumps(result, indent=2, default=str))

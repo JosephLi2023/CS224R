@@ -1,0 +1,266 @@
+\documentclass[10pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{microtype}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{array}
+\usepackage{hyperref}
+
+\setlist{nosep,leftmargin=1em,itemsep=1pt,topsep=2pt}
+\titlespacing*{\section}{0pt}{1em}{0.35em}
+\titlespacing*{\subsection}{0pt}{0.7em}{0.25em}
+\setlength{\parskip}{0.22em}
+\setlength{\parindent}{0pt}
+
+\newcommand{\method}[1]{\texttt{#1}}
+\newcommand{\pending}[1]{\textcolor{blue}{\textbf{PENDING:} #1}}
+
+\title{\vspace{-2.2em}\textbf{H-GRPO: Hierarchical Group Relative Policy Optimization for LLM Agents}}
+\author{Max Rodriguez, Samantha Leventis, Joseph Li}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-1.2em}
+
+\section{Project Goal}
+This project studies whether sparse-reward LLM agents in ALFWorld can be improved by augmenting standard trajectory-level GRPO with turn-level credit assignment. The original hypothesis is that long-horizon text environments waste sample efficiency when every action in a sampled trajectory receives the same scalar outcome advantage. H-GRPO instead combines a group-normalized trajectory advantage with a per-turn advantage signal:
+\[
+    A_H(i,t) = (1-\alpha) A_{\mathrm{traj}}(i) + \alpha A_{\mathrm{turn}}(i,t),
+\]
+where \(i\) indexes a trajectory in a same-task GRPO group, \(t\) indexes a turn, and \(\alpha\) controls how much turn-level credit assignment influences the policy update.
+
+We focus on ALFWorld because it exposes the failure mode directly: tasks are long horizon, rewards are sparse, and small action errors often collapse an entire trajectory. WebShop was deprioritized so the milestone could concentrate compute on one validated agent pipeline.
+
+\section{End-to-End Pipeline}
+The full pipeline is:
+\begin{enumerate}
+    \item Supervised fine-tuning (SFT) from ALFWorld expert ReAct trajectories.
+    \item Free-form greedy environment evaluation on \texttt{valid\_seen} and \texttt{valid\_unseen}.
+    \item GRPO warm-started from the selected SFT checkpoint.
+    \item Optional turn-level reward decomposition to compute \(A_{\mathrm{turn}}\).
+    \item Final claims based only on \texttt{evaluate\_freeform\_greedy} seen/unseen evals, not inline train-split eval.
+\end{enumerate}
+
+The current best SFT warm start for the overnight full-data GRPO rerun is:
+\[
+\texttt{/vol/checkpoints/maxrodriguez\_overnight/full\_lr1e5\_e10\_v2}.
+\]
+
+\section{Dataset and Split Protocol}
+ALFWorld split usage is as follows:
+\begin{itemize}
+    \item \textbf{SFT training}: expert trajectory JSONL generated from ALFWorld training games.
+    \item \textbf{GRPO training}: ALFWorld \texttt{train} split.
+    \item \textbf{Validation seen}: \texttt{eval\_in\_distribution}, corresponding to ALFWorld \texttt{valid\_seen}.
+    \item \textbf{Validation unseen}: \texttt{eval\_out\_of\_distribution}, corresponding to ALFWorld \texttt{valid\_unseen}.
+\end{itemize}
+
+The training split contains 3553 games. Earlier GRPO reruns used only 50--300 episodes, which meant GRPO saw a small slice of the training set. The overnight run fixes this by setting:
+\[
+n_{\mathrm{episodes}} = 3553,\qquad K=4,\qquad \mathrm{stride}=37.
+\]
+The ALFWorld adapter maps task ids modulo the number of available games. Since the stride is relatively prime to 3553, the 3553-episode run visits every train game exactly once in permuted order.
+
+\section{SFT Experiments}
+\subsection{Initial SFT Grid}
+We first grid-searched SFT hyperparameters using token-level cross entropy and then evaluated the selected model in the environment. The grid varied:
+\[
+\eta \in \{10^{-4}, 10^{-5}, 2\cdot10^{-5}, 10^{-6}\},\quad
+\mathrm{seq\_len}\in\{1024,2048\},\quad
+\mathrm{grad\_accum}\in\{4,8\}.
+\]
+The best early token-loss configuration used learning rate \(2\cdot10^{-5}\), max sequence length 1024, and gradient accumulation 4. Its full free-form eval result was approximately:
+\[
+\texttt{valid\_seen}: 24/140 = 17.14\%,\qquad
+\texttt{valid\_unseen}: 21/134 = 15.67\%.
+\]
+
+\subsection{DAgger and Stronger SFT Attempts}
+We then tested whether DAgger-style data aggregation could improve the warm-start policy. Quick 10/10 evals showed:
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+SFT candidate & Seen & Unseen & Total \\
+\midrule
+No DAgger quick run & 2/10 & 2/10 & 4/20 \\
+DAgger quick run & 3/10 & 1/10 & 4/20 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+A stronger DAgger/no-DAgger run was started, but stopped once it became clear that the immediate GRPO bottleneck was training-set coverage rather than SFT selection alone. The no-DAgger candidate from that run had reached a 30/30 slice result of 4/30 seen and 1/30 unseen, below the 40\% target gate.
+
+\subsection{Current Best SFT}
+The current overnight GRPO run uses the stronger full SFT checkpoint:
+\[
+\texttt{full\_lr1e5\_e10\_v2}.
+\]
+This checkpoint is treated as the policy initialization for all GRPO variants. Final report numbers should include its full \texttt{valid\_seen}/\texttt{valid\_unseen} free-form greedy evaluation.
+
+\section{GRPO Objective}
+For each task, GRPO samples a group of \(K\) trajectories. Let \(R_i\) be the final reward for trajectory \(i\). Standard GRPO computes:
+\[
+    A_{\mathrm{traj}}(i) =
+    \frac{R_i - \mu_R}{\sigma_R + \epsilon},
+\]
+where \(\mu_R\) and \(\sigma_R\) are computed within the same-task group. The clipped policy loss over action tokens is:
+\[
+    \mathcal{L}_{\mathrm{GRPO}} =
+    -\mathbb{E}_{i,t,u}\left[
+        \min\left(
+            r_{i,t,u} A(i,t),
+            \mathrm{clip}(r_{i,t,u}, 1-\epsilon, 1+\epsilon) A(i,t)
+        \right)
+    \right]
+    + \beta D_{\mathrm{KL}}(\pi_\theta \Vert \pi_{\mathrm{ref}}),
+\]
+where \(u\) indexes action tokens, \(r_{i,t,u}\) is the policy probability ratio, and \(\pi_{\mathrm{ref}}\) is the SFT reference policy.
+
+H-GRPO changes only the advantage term:
+\[
+    A(i,t) = A_H(i,t) =
+    (1-\alpha) A_{\mathrm{traj}}(i) + \alpha A_{\mathrm{turn}}(i,t).
+\]
+When \(\alpha=0\), the method reduces exactly to standard trajectory-only GRPO.
+
+\section{Turn-Level Variants}
+\subsection{\method{trajectory\_only}}
+This is the standard GRPO baseline. It uses \(\alpha=0\), so every action token in a trajectory receives the same group-normalized trajectory advantage. It is stable and simple, but it cannot distinguish helpful and harmful turns inside a failed long-horizon episode.
+
+\subsection{\method{progress\_delta}}
+This rule-based method uses ALFWorld intermediate progress signals and facts-diff feedback to reward turns that make measurable environment progress. The motivation is that ALFWorld often exposes partial state progress before terminal success. This signal is denser than terminal reward, but can be noisy because not every useful action immediately changes a tracked fact.
+
+\subsection{\method{admissible\_margin}}
+This method scores the chosen action against admissible alternatives. The intended signal is a margin: actions that are more likely than plausible alternatives receive higher turn reward. It is attractive because ALFWorld exposes admissible commands, but the signal can be shallow if the model assigns high likelihood to admissible but strategically wrong commands.
+
+\subsection{\method{signed\_attention}}
+The signed-attention method learns a small transformer that maps per-turn trajectory features to centered signed credit weights. The model outputs:
+\[
+    s_t = T\cdot \mathrm{softmax}(z_t) - 1,
+\]
+so the average turn score is centered and individual turns can receive negative credit.
+
+The target combines normalized progress deltas with heuristic action-quality bias:
+\[
+    y_t =
+    \mathrm{normalize}\left(\Delta p_t - \overline{\Delta p}\right)
+    + \lambda_{\mathrm{bias}} b_t.
+\]
+The bias \(b_t\) penalizes invalid, empty, and repeated actions and rewards progress-making turns. The live GRPO pipeline requires an explicit transformer checkpoint for \method{signed\_attention}; otherwise the run fails fast rather than silently using a heuristic fallback.
+
+\section{GRPO Hyperparameter Search}
+The subset sweep searched a compact grid:
+\[
+\alpha \in \{0.0,0.1,0.5,0.9\},\quad
+\eta \in \{10^{-6},2\cdot10^{-6},5\cdot10^{-6}\},\quad
+\beta_{\mathrm{KL}}\in\{0.02,0.05\}.
+\]
+The final selected hyperparameters are:
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+Method & \(\alpha\) & LR & KL coefficient \\
+\midrule
+\method{trajectory\_only} & 0.0 & \(10^{-6}\) & 0.02 \\
+\method{progress\_delta} & 0.1 & \(10^{-6}\) & 0.05 \\
+\method{signed\_attention} & 0.1 & \(10^{-6}\) & 0.02 \\
+\method{admissible\_margin} & 0.1 & \(10^{-6}\) & 0.05 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+These settings are conservative: they preserve the SFT behavior while allowing some movement from RL. The main issue in the earlier full-data reruns was not the exact LR/KL choice; it was that ``full'' reruns still covered too few train games. The overnight run therefore fixes coverage first.
+
+\section{Completed GRPO Results Before Overnight Run}
+Earlier cheap 50-episode GRPO reruns from a fast SFT checkpoint produced:
+\begin{center}
+\begin{tabular}{lcccc}
+\toprule
+Method & Episodes & Dead-\(K\) rate & Seen 10 & Unseen 10 \\
+\midrule
+\method{trajectory\_only} & 50 & 0.84 & 3/10 & 1/10 \\
+\method{progress\_delta} & 50 & 0.08 & 3/10 & 1/10 \\
+\method{signed\_attention} & 50 & 0.10 & 3/10 & 1/10 \\
+\method{admissible\_margin} & 50 & 0.00 & 3/10 & 1/10 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+These runs were useful diagnostically but are not strong final claims. A high dead-\(K\) rate means many same-task GRPO groups had zero reward variance, so normalized advantages collapsed and the policy received little useful update signal. This explains why small-budget GRPO did not reliably outperform SFT.
+
+\section{Overnight Full-3553 L4 Run}
+The current overnight run performs:
+\begin{enumerate}
+    \item Train a stronger signed-attention transformer on 1024 ALFWorld expert trajectories and 256 validation trajectories.
+    \item Launch four detached L4 GRPO runs over all 3553 train games.
+    \item Save adapters for later full \texttt{valid\_seen}/\texttt{valid\_unseen} evaluation.
+\end{enumerate}
+
+The signed-attention transformer run uses:
+\[
+\mathrm{train\_trajectories}=1024,\quad
+\mathrm{val\_trajectories}=256,\quad
+\mathrm{epochs}=3,\quad
+\eta=10^{-4},\quad
+d_{\mathrm{hidden}}=128,\quad L=2,\quad H=4.
+\]
+
+The full GRPO run matrix is:
+\begin{center}
+\begin{tabular}{lcccccc}
+\toprule
+Method & Episodes & \(K\) & Stride & \(\alpha\) & LR & KL \\
+\midrule
+\method{trajectory\_only} & 3553 & 4 & 37 & 0.0 & \(10^{-6}\) & 0.02 \\
+\method{progress\_delta} & 3553 & 4 & 37 & 0.1 & \(10^{-6}\) & 0.05 \\
+\method{signed\_attention} & 3553 & 4 & 37 & 0.1 & \(10^{-6}\) & 0.02 \\
+\method{admissible\_margin} & 3553 & 4 & 37 & 0.1 & \(10^{-6}\) & 0.05 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Prospective Results Table}
+Fill this table after the overnight run completes and each adapter is evaluated with \texttt{evaluate\_freeform\_greedy} on the full seen/unseen validation splits.
+\begin{center}
+\begin{tabular}{lcccccc}
+\toprule
+Checkpoint & Seen & Seen \% & Unseen & Unseen \% & Dead-\(K\) & Notes \\
+\midrule
+SFT \method{full\_lr1e5\_e10\_v2} & \pending{x/140} & \pending{x\%} & \pending{x/134} & \pending{x\%} & -- & Baseline \\
+\method{trajectory\_only} GRPO & \pending{x/140} & \pending{x\%} & \pending{x/134} & \pending{x\%} & \pending{x} & Standard GRPO \\
+\method{progress\_delta} GRPO & \pending{x/140} & \pending{x\%} & \pending{x/134} & \pending{x\%} & \pending{x} & Dense progress signal \\
+\method{signed\_attention} GRPO & \pending{x/140} & \pending{x\%} & \pending{x/134} & \pending{x\%} & \pending{x} & 1024-trajectory transformer \\
+\method{admissible\_margin} GRPO & \pending{x/140} & \pending{x\%} & \pending{x/134} & \pending{x\%} & \pending{x} & Admissible action margin \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Interpretation So Far}
+The current evidence suggests that earlier GRPO failures were primarily due to insufficient useful RL signal, not necessarily a flawed H-GRPO idea. Three factors mattered:
+\begin{itemize}
+    \item Small GRPO budgets covered too few of the 3553 train games.
+    \item Many trajectory-only groups had dead-\(K\) collapse, producing zero or near-zero normalized advantage.
+    \item The first signed-attention attempts were too lightly trained and therefore unlikely to dominate the SFT baseline.
+\end{itemize}
+
+The overnight run directly targets these issues by using all train games, tracking dead-\(K\) and reward variance, and training the signed transformer on eight times more expert trajectories than the fast run.
+
+\section{Next Steps}
+\begin{enumerate}
+    \item \textbf{Complete full seen/unseen eval for all overnight adapters.} This is required for final claims. Impact: high. Effort: low.
+    \item \textbf{Compare against the full SFT baseline under identical decoding and max-turn settings.} This prevents train/eval interpretation errors. Impact: high. Effort: low.
+    \item \textbf{Inspect dead-\(K\), reward variance, and KL drift curves.} If dead-\(K\) remains high, increase exploration or alter sampling rather than merely extending training. Impact: high. Effort: medium.
+    \item \textbf{If signed attention helps, retrain it on mixed expert plus SFT-failure trajectories.} Expert-only credit labels may miss the policy's actual failure modes. Impact: medium-high. Effort: medium.
+    \item \textbf{Reintroduce DAgger only after RL coverage is validated.} DAgger is still promising, but it should be evaluated against the stronger full SFT and the all-game GRPO protocol. Impact: medium. Effort: medium-high.
+\end{enumerate}
+
+\section{Conclusion}
+H-GRPO remains a plausible approach for ALFWorld because it addresses a real credit-assignment gap in trajectory-only RL. However, the early negative results should not be interpreted as a definitive failure of turn-level reward shaping. They were dominated by weak SFT variants, small GRPO budgets, and insufficient train-game coverage. The current full-3553 L4 run is the first protocol that gives standard GRPO and the turn-level variants a fair comparison against the best available SFT checkpoint.
+
+\end{document}

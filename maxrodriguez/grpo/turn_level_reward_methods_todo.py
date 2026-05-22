@@ -155,7 +155,7 @@ def _signed_attention_target_tensor(
     device: torch.device,
     dtype: torch.dtype,
     heuristic_bias_scale: float = 0.25,
-    failure_scale: float = 0.5,
+    failure_scale: float = -1.0,
 ) -> Tensor:
     progress = torch.tensor(
         [_turn_progress(turn) for turn in traj.turns],
@@ -215,10 +215,10 @@ class SignedAttentionTransformer(nn.Module):
     def __init__(
         self,
         input_size: int = SIGNED_ATTENTION_FEATURE_SIZE,
-        hidden_size: int = 128,
-        n_heads: int = 4,
-        n_layers: int = 2,
-        dropout: float = 0.0,
+        hidden_size: int = 512,
+        n_heads: int = 8,
+        n_layers: int = 6,
+        dropout: float = 0.05,
     ) -> None:
         super().__init__()
         self.input_proj = nn.Linear(input_size, hidden_size)
@@ -313,7 +313,7 @@ class SignedAttentionTODO:
     """
 
     model: SignedAttentionTransformer | None = None
-    hidden_size: int = 128
+    hidden_size: int = 512
     outcome_scale: float = 1.0
     failure_scale: float = -1.0
     heuristic_bias_scale: float = 0.0
@@ -636,7 +636,7 @@ TURN_REWARD_METHOD_GRID: dict[str, list[object]] = {
         "admissible_margin",
     ],
     "terminal_bonus": [0.5, 1.0],
-    "signed_attention_hidden_size": [64, 128],
+    "signed_attention_hidden_size": [256, 512],
     "signed_attention_outcome_scale": [0.5, 1.0],
     "admissible_margin_weight": [0.0, 0.25],
 }

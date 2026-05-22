@@ -1,4 +1,4 @@
-"""Modal A100 app: H-GRPO training loop on real WebShop OR AlfWorld.
+"""Modal GPU app: H-GRPO training loop on real WebShop OR AlfWorld.
 
   modal run infra/app_train_loop.py --env-name webshop  --n-episodes 50 --k 4 --max-turns 6
   modal run infra/app_train_loop.py --env-name alfworld --n-episodes 50 --k 4 --max-turns 30 --config configs/method_hgpo_turnrd_v2_alfworld.json
@@ -24,7 +24,7 @@ Env-name dispatch:
   Modal's image binding is decorator-time — a single `@app.function`
   cannot switch images at call time — hence the two-entrypoint shape.
 
-Cost: ~$3-5 for 50 episodes (~10-15 min on A100).
+Cost depends on GPU class and episode budget.
 """
 from __future__ import annotations
 
@@ -694,7 +694,7 @@ def train_loop_webshop(
     )
 
 
-@app.function(image=alfworld_image, gpu="A100-80GB", volumes={VOLUME_MOUNT: volume}, secrets=maybe_openai_secret(), timeout=240 * 60)
+@app.function(image=alfworld_image, gpu="A100-80GB", volumes={VOLUME_MOUNT: volume}, secrets=maybe_openai_secret(), timeout=24 * 60 * 60)
 def train_loop_alfworld(
     n_episodes: int = 50,
     k: int = 4,

@@ -128,7 +128,7 @@ def _build_max_turn_reward_branch(
         )
         decomposer = SignedAttentionTODO(
             model=model,
-            hidden_size=int(method_hparams.get("hidden_size", 128)),
+            hidden_size=int(method_hparams.get("hidden_size", 512)),
             outcome_scale=float(method_hparams.get("outcome_scale", 1.0)),
             failure_scale=float(method_hparams.get("failure_scale", -1.0)),
             heuristic_bias_scale=float(method_hparams.get("heuristic_bias_scale", 0.0)),
@@ -136,7 +136,7 @@ def _build_max_turn_reward_branch(
         ).decompose
     elif method == "admissible_margin":
         decomposer = AdmissibleActionMarginTODO(
-            max_actions_to_score=int(method_hparams.get("max_actions_to_score", 32)),
+            max_actions_to_score=int(method_hparams.get("max_actions_to_score", 64)),
             normalize_margin=bool(method_hparams.get("normalize_margin", True)),
             policy=policy,
             tokenizer=policy.tokenizer,

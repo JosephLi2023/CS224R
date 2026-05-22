@@ -21,7 +21,7 @@ import json
 import os
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -89,17 +89,17 @@ TURN_REWARD_DEFAULT_CONFIGS: dict[str, dict[str, Any]] = {
         "terminal_bonus": 1.0,
     },
     "signed_attention": {
-        "hidden_size": 128,
-        "n_heads": 4,
-        "n_layers": 2,
-        "dropout": 0.0,
+        "hidden_size": 512,
+        "n_heads": 8,
+        "n_layers": 6,
+        "dropout": 0.05,
         "outcome_scale": 1.0,
-        "failure_scale": 0.5,
+        "failure_scale": -1.0,
         "heuristic_bias_scale": 0.25,
         "transformer_ckpt_path": DEFAULT_SIGNED_ATTENTION_TRANSFORMER_CKPT,
     },
     "admissible_margin": {
-        "max_actions_to_score": 32,
+        "max_actions_to_score": 64,
         "normalize_margin": True,
         "max_seq_len": 2048,
         "score_normalization": "mean",
@@ -576,6 +576,7 @@ def main(
     eval_episodes: int = FULL_NUM_GAMES,
     run_name_suffix: str = "final",
     task_id_stride: int = 0,
+    save_adapter_out: str = "",
 ) -> None:
     """Local entrypoint for inspecting configs or launching GRPO runs."""
     limit = max_specs if max_specs > 0 else None
@@ -626,6 +627,41 @@ def main(
             )
         )
         return
+    if action == "show_manual_config":
+        spec = build_manual_run_spec(
+            sft_adapter=sft_adapter,
+            alpha=alpha,
+            turn_reward_method=turn_reward_method,
+            learning_rate=learning_rate,
+            kl_coeff=kl_coeff,
+            n_episodes=n_episodes,
+            k=k,
+            max_turns=max_turns,
+            clip_eps=clip_eps,
+            grad_accum_steps=grad_accum_steps,
+            max_tokens_per_microbatch=max_tokens_per_microbatch,
+            kl_warmup_episodes=kl_warmup_episodes,
+            dataset_size_mode=dataset_size_mode,
+            eval_episodes=eval_episodes,
+            run_name_suffix=run_name_suffix,
+            signed_attention_transformer_ckpt=signed_attention_transformer_ckpt,
+            task_id_stride=task_id_stride,
+        )
+        if save_adapter_out:
+            spec = replace(spec, save_adapter_out=save_adapter_out)
+        print(
+            json.dumps(
+                {
+                    "spec": spec.__dict__,
+                    "config": build_config_for_run(spec),
+                    "save_adapter_out": spec.save_adapter_out
+                    or f"/vol/checkpoints/grpo/{spec.run_name}",
+                },
+                indent=2,
+                default=str,
+            )
+        )
+        return
     if action == "launch_sample":
         spec = iter_grid_run_specs(
             sft_adapter=sft_adapter,
@@ -669,10 +705,12 @@ def main(
             signed_attention_transformer_ckpt=signed_attention_transformer_ckpt,
             task_id_stride=task_id_stride,
         )
+        if save_adapter_out:
+            spec = replace(spec, save_adapter_out=save_adapter_out)
         print(json.dumps(launch_grpo_run(spec), indent=2, default=str))
         return
     raise ValueError(
         "action must be one of: show_grid, show_best, "
-        "show_sample_config, write_sample_config, write_grid_configs, "
+        "show_sample_config, write_sample_config, write_grid_configs, show_manual_config, "
         "launch_sample, launch_grid, launch_manual"
     )
