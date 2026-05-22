@@ -4,7 +4,7 @@ Run these from the repo root after pulling the branch:
 
 ```powershell
 cd C:\Users\maxlr\CS224R
-git checkout codex/maxrodriguez-alfworld-preserve
+git checkout maxrodriguez
 git pull
 $env:CS224R_SKIP_OPENAI_SECRET = "1"
 $env:PYTHONIOENCODING = "utf-8"
@@ -38,10 +38,10 @@ This is the high-capacity signed turn-reward transformer: 6 layers, hidden size 
 
 ```powershell
 modal run maxrodriguez/grpo/app_signed_attention_transformer.py::train_signed_attention_transformer_model `
-  --epochs 8 `
+  --epochs 5`
   --learning-rate 5e-5 `
-  --hidden-size 512 `
-  --n-layers 6 `
+  --hidden-size 256`
+  --n-layers 4 `
   --n-heads 8 `
   --dropout 0.05 `
   --train-trajectories 3553 `
@@ -61,7 +61,7 @@ This trains on every loaded SFT row (`--max-examples 0`) for 10 epochs at the be
 ```powershell
 modal run maxrodriguez/supervised_FT/app_alfworld_sft_plus.py::train_sft_plus `
   --data-path $SFT_DATA `
-  --epochs 10 `
+  --epochs 3`
   --learning-rate 1e-5 `
   --min-reward 1.0 `
   --max-seq-len 2048 `
@@ -99,7 +99,7 @@ This starts from the same supervised data, then after epoch 1 collects DAgger co
 ```powershell
 modal run maxrodriguez/supervised_FT/app_alfworld_sft_plus.py::train_sft_plus `
   --data-path $SFT_DATA `
-  --epochs 10 `
+  --epochs 3`
   --learning-rate 1e-5 `
   --min-reward 1.0 `
   --max-seq-len 2048 `
@@ -168,7 +168,7 @@ foreach ($row in $GRPO_METHODS) {
     --learning-rate $($row.lr) `
     --kl-coeff $($row.kl) `
     --n-episodes 3553 `
-    --k 8 `
+    --k 6 `
     --max-turns 30 `
     --clip-eps 0.2 `
     --grad-accum-steps 1 `
@@ -177,7 +177,7 @@ foreach ($row in $GRPO_METHODS) {
     --dataset-size-mode full `
     --eval-episodes 0 `
     --run-name-suffix "${TAG}_full3553_k8_a100" `
-    --task-id-stride 37 `
+    --task-id-stride 1 `
     --signed-attention-transformer-ckpt $SAT_CKPT `
     --save-adapter-out "$GRPO_ROOT/$method"
 }
