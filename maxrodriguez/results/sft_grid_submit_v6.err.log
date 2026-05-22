@@ -1,0 +1,355 @@
+┌───────────────────── Traceback (most recent call last) ─────────────────────┐
+│ <frozen runpy>:198 in _run_module_as_main                                   │
+│                                                                             │
+│ <frozen runpy>:88 in _run_code                                              │
+│                                                                             │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Scripts\modal.exe\__main__.py:6 in <module>       │
+│                                                                             │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\modal\__main__.py:20 in main    │
+│                                                                             │
+│   19 │   │   try:                                                           │
+│ > 20 │   │   │   entrypoint_cli()                                           │
+│   21                                                                        │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\click\core.py:1442 in __call__  │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\typer\core.py:803 in main       │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\typer\core.py:192 in _main      │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\click\core.py:1830 in invoke    │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\click\core.py:1830 in invoke    │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\click\core.py:1226 in invoke    │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\click\core.py:794 in invoke     │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\click\decorators.py:34 in       │
+│ new_func                                                                    │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\modal\cli\run.py:242 in f       │
+│                                                                             │
+│   241 │   │   ):                                                            │
+│ > 242 │   │   │   res = inner(args, kwargs)                                 │
+│   243                                                                       │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\modal\cli\run.py:270 in _inner  │
+│                                                                             │
+│   269 │   │   if ctx.obj["detach"]:                                         │
+│ > 270 │   │   │   return function.spawn(*args, **click_kwargs).get()        │
+│   271 │   │   else:                                                         │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\modal\_object.py:46 in wrapped  │
+│                                                                             │
+│    45 │   │   await self.hydrate()                                          │
+│ >  46 │   │   return await method(self, *args, **kwargs)                    │
+│    47                                                                       │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\modal\_functions.py:1980 in get │
+│                                                                             │
+│   1979 │   │   """                                                          │
+│ > 1980 │   │   return await self._invocation().poll_function(timeout=timeou │
+│   1981                                                                      │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\modal\_functions.py:331 in      │
+│ poll_function                                                               │
+│                                                                             │
+│    330 │   │                                                                │
+│ >  331 │   │   return await _process_result(                                │
+│    332 │   │   │   response.outputs[0].result, response.outputs[0].data_for │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\modal\_utils\function_utils.py: │
+│ 529 in _process_result                                                      │
+│                                                                             │
+│   528 │   │                                                                 │
+│ > 529 │   │   raise RemoteError(result.exception)                           │
+│   530                                                                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+RemoteError
+┌───────────────────── Traceback (most recent call last) ─────────────────────┐
+│ <frozen runpy>:198 in _run_module_as_main                                   │
+│                                                                             │
+│ <frozen runpy>:88 in _run_code                                              │
+│                                                                             │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Scripts\modal.exe\__main__.py:6 in <module>       │
+│                                                                             │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\modal\__main__.py:20 in main    │
+│                                                                             │
+│   19 │   │   try:                                                           │
+│ > 20 │   │   │   entrypoint_cli()                                           │
+│   21                                                                        │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\click\core.py:1442 in __call__  │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\typer\core.py:803 in main       │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\typer\core.py:192 in _main      │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\click\core.py:1830 in invoke    │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\click\core.py:1830 in invoke    │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\click\core.py:1226 in invoke    │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\click\core.py:794 in invoke     │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\click\decorators.py:34 in       │
+│ new_func                                                                    │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\modal\cli\run.py:242 in f       │
+│                                                                             │
+│   241 │   │   ):                                                            │
+│ > 242 │   │   │   res = inner(args, kwargs)                                 │
+│   243                                                                       │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\modal\cli\run.py:270 in _inner  │
+│                                                                             │
+│   269 │   │   if ctx.obj["detach"]:                                         │
+│ > 270 │   │   │   return function.spawn(*args, **click_kwargs).get()        │
+│   271 │   │   else:                                                         │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\modal\_object.py:46 in wrapped  │
+│                                                                             │
+│    45 │   │   await self.hydrate()                                          │
+│ >  46 │   │   return await method(self, *args, **kwargs)                    │
+│    47                                                                       │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\modal\_functions.py:1980 in get │
+│                                                                             │
+│   1979 │   │   """                                                          │
+│ > 1980 │   │   return await self._invocation().poll_function(timeout=timeou │
+│   1981                                                                      │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\modal\_functions.py:331 in      │
+│ poll_function                                                               │
+│                                                                             │
+│    330 │   │                                                                │
+│ >  331 │   │   return await _process_result(                                │
+│    332 │   │   │   response.outputs[0].result, response.outputs[0].data_for │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\modal\_utils\function_utils.py: │
+│ 529 in _process_result                                                      │
+│                                                                             │
+│   528 │   │                                                                 │
+│ > 529 │   │   raise RemoteError(result.exception)                           │
+│   530                                                                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+RemoteError
+┌───────────────────── Traceback (most recent call last) ─────────────────────┐
+│ <frozen runpy>:198 in _run_module_as_main                                   │
+│                                                                             │
+│ <frozen runpy>:88 in _run_code                                              │
+│                                                                             │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Scripts\modal.exe\__main__.py:6 in <module>       │
+│                                                                             │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\modal\__main__.py:20 in main    │
+│                                                                             │
+│   19 │   │   try:                                                           │
+│ > 20 │   │   │   entrypoint_cli()                                           │
+│   21                                                                        │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\click\core.py:1442 in __call__  │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\typer\core.py:803 in main       │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\typer\core.py:192 in _main      │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\click\core.py:1830 in invoke    │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\click\core.py:1830 in invoke    │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\click\core.py:1226 in invoke    │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\click\core.py:794 in invoke     │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\click\decorators.py:34 in       │
+│ new_func                                                                    │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\modal\cli\run.py:242 in f       │
+│                                                                             │
+│   241 │   │   ):                                                            │
+│ > 242 │   │   │   res = inner(args, kwargs)                                 │
+│   243                                                                       │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\modal\cli\run.py:270 in _inner  │
+│                                                                             │
+│   269 │   │   if ctx.obj["detach"]:                                         │
+│ > 270 │   │   │   return function.spawn(*args, **click_kwargs).get()        │
+│   271 │   │   else:                                                         │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\modal\_object.py:46 in wrapped  │
+│                                                                             │
+│    45 │   │   await self.hydrate()                                          │
+│ >  46 │   │   return await method(self, *args, **kwargs)                    │
+│    47                                                                       │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\modal\_functions.py:1980 in get │
+│                                                                             │
+│   1979 │   │   """                                                          │
+│ > 1980 │   │   return await self._invocation().poll_function(timeout=timeou │
+│   1981                                                                      │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\modal\_functions.py:331 in      │
+│ poll_function                                                               │
+│                                                                             │
+│    330 │   │                                                                │
+│ >  331 │   │   return await _process_result(                                │
+│    332 │   │   │   response.outputs[0].result, response.outputs[0].data_for │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\modal\_utils\function_utils.py: │
+│ 529 in _process_result                                                      │
+│                                                                             │
+│   528 │   │                                                                 │
+│ > 529 │   │   raise RemoteError(result.exception)                           │
+│   530                                                                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+RemoteError
+┌───────────────────── Traceback (most recent call last) ─────────────────────┐
+│ <frozen runpy>:198 in _run_module_as_main                                   │
+│                                                                             │
+│ <frozen runpy>:88 in _run_code                                              │
+│                                                                             │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Scripts\modal.exe\__main__.py:6 in <module>       │
+│                                                                             │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\modal\__main__.py:20 in main    │
+│                                                                             │
+│   19 │   │   try:                                                           │
+│ > 20 │   │   │   entrypoint_cli()                                           │
+│   21                                                                        │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\click\core.py:1442 in __call__  │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\typer\core.py:803 in main       │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\typer\core.py:192 in _main      │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\click\core.py:1830 in invoke    │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\click\core.py:1830 in invoke    │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\click\core.py:1226 in invoke    │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\click\core.py:794 in invoke     │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\click\decorators.py:34 in       │
+│ new_func                                                                    │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\modal\cli\run.py:242 in f       │
+│                                                                             │
+│   241 │   │   ):                                                            │
+│ > 242 │   │   │   res = inner(args, kwargs)                                 │
+│   243                                                                       │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\modal\cli\run.py:270 in _inner  │
+│                                                                             │
+│   269 │   │   if ctx.obj["detach"]:                                         │
+│ > 270 │   │   │   return function.spawn(*args, **click_kwargs).get()        │
+│   271 │   │   else:                                                         │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\modal\_object.py:46 in wrapped  │
+│                                                                             │
+│    45 │   │   await self.hydrate()                                          │
+│ >  46 │   │   return await method(self, *args, **kwargs)                    │
+│    47                                                                       │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\modal\_functions.py:1980 in get │
+│                                                                             │
+│   1979 │   │   """                                                          │
+│ > 1980 │   │   return await self._invocation().poll_function(timeout=timeou │
+│   1981                                                                      │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\modal\_functions.py:331 in      │
+│ poll_function                                                               │
+│                                                                             │
+│    330 │   │                                                                │
+│ >  331 │   │   return await _process_result(                                │
+│    332 │   │   │   response.outputs[0].result, response.outputs[0].data_for │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\modal\_utils\function_utils.py: │
+│ 529 in _process_result                                                      │
+│                                                                             │
+│   528 │   │                                                                 │
+│ > 529 │   │   raise RemoteError(result.exception)                           │
+│   530                                                                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+RemoteError
+┌───────────────────── Traceback (most recent call last) ─────────────────────┐
+│ <frozen runpy>:198 in _run_module_as_main                                   │
+│                                                                             │
+│ <frozen runpy>:88 in _run_code                                              │
+│                                                                             │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Scripts\modal.exe\__main__.py:6 in <module>       │
+│                                                                             │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\modal\__main__.py:20 in main    │
+│                                                                             │
+│   19 │   │   try:                                                           │
+│ > 20 │   │   │   entrypoint_cli()                                           │
+│   21                                                                        │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\click\core.py:1442 in __call__  │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\typer\core.py:803 in main       │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\typer\core.py:192 in _main      │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\click\core.py:1830 in invoke    │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\click\core.py:1830 in invoke    │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\click\core.py:1226 in invoke    │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\click\core.py:794 in invoke     │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\click\decorators.py:34 in       │
+│ new_func                                                                    │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\modal\cli\run.py:242 in f       │
+│                                                                             │
+│   241 │   │   ):                                                            │
+│ > 242 │   │   │   res = inner(args, kwargs)                                 │
+│   243                                                                       │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\modal\cli\run.py:270 in _inner  │
+│                                                                             │
+│   269 │   │   if ctx.obj["detach"]:                                         │
+│ > 270 │   │   │   return function.spawn(*args, **click_kwargs).get()        │
+│   271 │   │   else:                                                         │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\modal\_object.py:46 in wrapped  │
+│                                                                             │
+│    45 │   │   await self.hydrate()                                          │
+│ >  46 │   │   return await method(self, *args, **kwargs)                    │
+│    47                                                                       │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\modal\_functions.py:1980 in get │
+│                                                                             │
+│   1979 │   │   """                                                          │
+│ > 1980 │   │   return await self._invocation().poll_function(timeout=timeou │
+│   1981                                                                      │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\modal\_functions.py:331 in      │
+│ poll_function                                                               │
+│                                                                             │
+│    330 │   │                                                                │
+│ >  331 │   │   return await _process_result(                                │
+│    332 │   │   │   response.outputs[0].result, response.outputs[0].data_for │
+│                                                                             │
+│ C:\Users\maxlr\miniconda3\Lib\site-packages\modal\_utils\function_utils.py: │
+│ 529 in _process_result                                                      │
+│                                                                             │
+│   528 │   │                                                                 │
+│ > 529 │   │   raise RemoteError(result.exception)                           │
+│   530                                                                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+RemoteError

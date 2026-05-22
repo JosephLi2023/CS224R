@@ -25,6 +25,7 @@ from src.datasets.sft_alfworld import synthesize_sft_target
 
 
 TurnRewards = list[list[float]]
+SIGNED_ATTENTION_FEATURE_SIZE = 8
 
 
 class TurnRewardMethod(Protocol):
@@ -61,18 +62,112 @@ def _trajectory_feature_tensor(
     *,
     device: torch.device,
     dtype: torch.dtype,
+    feature_size: int = SIGNED_ATTENTION_FEATURE_SIZE,
 ) -> Tensor:
     """Build lightweight per-turn features when hidden embeddings are absent."""
     rows: list[list[float]] = []
     n_turns = max(len(traj.turns), 1)
+    prev_action = ""
     for turn in traj.turns:
         progress = _turn_progress(turn)
         raw = _safe_float(getattr(turn, "raw_env_reward", 0.0))
         position = _safe_float(getattr(turn, "turn_idx", len(rows))) / max(n_turns - 1, 1)
-        action_tokens = float(len(getattr(turn, "action_token_ids", ()) or ()))
-        prompt_tokens = _safe_float(getattr(turn, "prompt_token_count", 0.0))
-        rows.append([progress, raw, position, action_tokens, prompt_tokens])
+        action_tokens = min(float(len(getattr(turn, "action_token_ids", ()) or ())), 64.0) / 64.0
+        prompt_tokens = min(_safe_float(getattr(turn, "prompt_token_count", 0.0)), 4096.0) / 4096.0
+        action_text = str(getattr(turn, "action_text", "") or "").strip()
+        valid_actions = [
+            str(action).strip()
+            for action in list(getattr(turn, "valid_actions", ()) or ())
+            if str(action).strip()
+        ]
+        if valid_actions:
+            admissible = 1.0 if action_text in valid_actions else -1.0
+        else:
+            admissible = 0.0
+        valid_count = min(float(len(valid_actions)), 64.0) / 64.0
+        repeated_or_empty = 1.0 if (not action_text or (prev_action and action_text == prev_action)) else 0.0
+        row = [
+            progress,
+            raw,
+            position,
+            action_tokens,
+            prompt_tokens,
+            admissible,
+            valid_count,
+            repeated_or_empty,
+        ]
+        if feature_size < len(row):
+            row = row[:feature_size]
+        elif feature_size > len(row):
+            row.extend([0.0] * (feature_size - len(row)))
+        rows.append(row)
+        prev_action = action_text
     return torch.as_tensor(rows, device=device, dtype=dtype)
+
+
+def _signed_attention_feature_size(model: nn.Module | None) -> int:
+    if model is None:
+        return SIGNED_ATTENTION_FEATURE_SIZE
+    input_proj = getattr(model, "input_proj", None)
+    in_features = getattr(input_proj, "in_features", SIGNED_ATTENTION_FEATURE_SIZE)
+    return int(in_features)
+
+
+def _behavior_bias_tensor(
+    traj: Trajectory,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tensor:
+    """Centered heuristic bias for invalid, empty, repeated, and progress-making turns."""
+    values: list[float] = []
+    prev_action = ""
+    for turn in traj.turns:
+        action_text = str(getattr(turn, "action_text", "") or "").strip()
+        valid_actions = [
+            str(action).strip()
+            for action in list(getattr(turn, "valid_actions", ()) or ())
+            if str(action).strip()
+        ]
+        invalid = bool(valid_actions and action_text not in valid_actions)
+        repeated = bool(action_text and prev_action and action_text == prev_action)
+        empty = not action_text
+        value = _turn_progress(turn)
+        if invalid:
+            value -= 1.0
+        if empty:
+            value -= 0.75
+        if repeated:
+            value -= 0.35
+        values.append(float(value))
+        prev_action = action_text
+    if not values:
+        return torch.empty(0, device=device, dtype=dtype)
+    row = torch.as_tensor(values, device=device, dtype=dtype)
+    centered = row - row.mean()
+    scale = centered.abs().max().clamp_min(1e-8)
+    return centered / scale
+
+
+def _signed_attention_target_tensor(
+    traj: Trajectory,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    heuristic_bias_scale: float = 0.25,
+    failure_scale: float = 0.5,
+) -> Tensor:
+    progress = torch.tensor(
+        [_turn_progress(turn) for turn in traj.turns],
+        device=device,
+        dtype=dtype,
+    )
+    centered_progress = progress - progress.mean()
+    scale = centered_progress.abs().max().clamp_min(1e-8)
+    normalized_progress = centered_progress / scale
+    outcome_scale = 1.0 if float(traj.final_reward) > 0.0 else float(failure_scale)
+    bias = _behavior_bias_tensor(traj, device=device, dtype=dtype)
+    return outcome_scale * normalized_progress + float(heuristic_bias_scale) * bias
 
 
 def _to_float_rows(rows: list[Tensor]) -> TurnRewards:
@@ -119,7 +214,7 @@ class SignedAttentionTransformer(nn.Module):
 
     def __init__(
         self,
-        input_size: int = 5,
+        input_size: int = SIGNED_ATTENTION_FEATURE_SIZE,
         hidden_size: int = 128,
         n_heads: int = 4,
         n_layers: int = 2,
@@ -177,7 +272,7 @@ def save_signed_attention_transformer_checkpoint(
 ) -> None:
     payload = {
         "model_config": {
-            "input_size": 5,
+            "input_size": int(model.input_proj.in_features),
             "hidden_size": int(hidden_size),
             "n_heads": int(n_heads),
             "n_layers": int(n_layers),
@@ -220,6 +315,8 @@ class SignedAttentionTODO:
     model: SignedAttentionTransformer | None = None
     hidden_size: int = 128
     outcome_scale: float = 1.0
+    failure_scale: float = -1.0
+    heuristic_bias_scale: float = 0.0
     device: str = "cpu"
 
     def decompose(self, group: TrajectoryGroup) -> TurnRewards:
@@ -249,11 +346,18 @@ class SignedAttentionTODO:
                 scores = normalized_progress + 0.1 * positions
                 attention = torch.softmax(scores, dim=0)
                 centered = progress.numel() * attention - 1.0
-                outcome_sign = 1.0 if float(traj.final_reward) > 0.0 else -1.0
-                reward_rows.append(float(self.outcome_scale) * outcome_sign * centered)
+                if float(self.heuristic_bias_scale) != 0.0:
+                    centered = centered + float(self.heuristic_bias_scale) * _behavior_bias_tensor(
+                        traj,
+                        device=device,
+                        dtype=torch.float32,
+                    )
+                outcome_multiplier = 1.0 if float(traj.final_reward) > 0.0 else float(self.failure_scale)
+                reward_rows.append(float(self.outcome_scale) * outcome_multiplier * centered)
         else:
             model = self.model.to(device)
             model.eval()
+            feature_size = _signed_attention_feature_size(model)
             with torch.no_grad():
                 for traj in group.trajectories:
                     if not traj.turns:
@@ -264,6 +368,7 @@ class SignedAttentionTODO:
                         traj,
                         device=device,
                         dtype=torch.float32,
+                        feature_size=feature_size,
                     ).unsqueeze(0)
                     mask = torch.ones(
                         (1, features.shape[1]),
@@ -271,8 +376,14 @@ class SignedAttentionTODO:
                         dtype=torch.bool,
                     )
                     centered = model(features, mask=mask).squeeze(0)
-                    outcome_sign = 1.0 if float(traj.final_reward) > 0.0 else -1.0
-                    reward_rows.append(float(self.outcome_scale) * outcome_sign * centered)
+                    if float(self.heuristic_bias_scale) != 0.0:
+                        centered = centered + float(self.heuristic_bias_scale) * _behavior_bias_tensor(
+                            traj,
+                            device=device,
+                            dtype=torch.float32,
+                        )
+                    outcome_multiplier = 1.0 if float(traj.final_reward) > 0.0 else float(self.failure_scale)
+                    reward_rows.append(float(self.outcome_scale) * outcome_multiplier * centered)
 
         rewards = _to_float_rows(reward_rows)
         _assert_ragged_shape(group, rewards)
@@ -312,21 +423,18 @@ def train_signed_attention_transformer(
                     traj,
                     device=target_device,
                     dtype=torch.float32,
+                    feature_size=_signed_attention_feature_size(model),
                 ).unsqueeze(0)
                 mask = torch.ones(
                     (1, features.shape[1]),
                     device=target_device,
                     dtype=torch.bool,
                 )
-                progress = torch.tensor(
-                    [_turn_progress(turn) for turn in traj.turns],
+                target = _signed_attention_target_tensor(
+                    traj,
                     device=target_device,
                     dtype=torch.float32,
-                )
-                centered_progress = progress - progress.mean()
-                scale = centered_progress.abs().max().clamp_min(1e-8)
-                outcome_sign = 1.0 if float(traj.final_reward) > 0.0 else -1.0
-                target = (float(outcome_sign) * centered_progress / scale).unsqueeze(0)
+                ).unsqueeze(0)
 
                 pred = model(features, mask=mask)
                 loss = F.mse_loss(pred[mask], target[mask])

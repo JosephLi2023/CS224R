@@ -130,6 +130,8 @@ def _build_max_turn_reward_branch(
             model=model,
             hidden_size=int(method_hparams.get("hidden_size", 128)),
             outcome_scale=float(method_hparams.get("outcome_scale", 1.0)),
+            failure_scale=float(method_hparams.get("failure_scale", -1.0)),
+            heuristic_bias_scale=float(method_hparams.get("heuristic_bias_scale", 0.0)),
             device=device,
         ).decompose
     elif method == "admissible_margin":

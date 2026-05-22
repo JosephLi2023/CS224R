@@ -1,0 +1,158 @@
+{
+  "run_tag": "codex_fast_remaining_20260521_163504_20260521_233521",
+  "elapsed_s": 4146.65,
+  "research_based_choices": {
+    "sft": "Reuse prior CE winner lr=2e-5, seq=1024, ga=4; compare no-DAgger vs minimal DAgger by env success.",
+    "grpo": "Use a slightly less conservative lr=2e-6 and kl=0.02 for short 50-episode runs; raise turn alpha above the old 0.1 so variants can move.",
+    "task_sampling": "Use stride 37 so 50 episodes cover task ids across the full train split instead of ids 0..49."
+  },
+  "sft_results": [
+    {
+      "ckpt_dir": "/vol/checkpoints/maxrodriguez_milestone/fast_pipeline/codex_fast_20260521_112735_20260521_182748/sft_dagger",
+      "reused": true
+    }
+  ],
+  "best_sft_path": "/vol/checkpoints/maxrodriguez_milestone/fast_pipeline/codex_fast_20260521_112735_20260521_182748/sft_dagger",
+  "signed_attention_summary": {
+    "checkpoint_path": "/vol/checkpoints/maxrodriguez_milestone/fast_pipeline/codex_fast_20260521_112735_20260521_182748/signed_attention/signed_attention_transformer.pt",
+    "reused": true
+  },
+  "grpo_results": [
+    {
+      "method": "signed_attention",
+      "alpha": 0.2,
+      "learning_rate": 2e-06,
+      "kl_coeff": 0.02,
+      "adapter_out": "/vol/checkpoints/maxrodriguez_milestone/fast_pipeline/codex_fast_remaining_20260521_163504_20260521_233521/grpo/max_grpo_signed_attention_a0p2_lr2em06_kl0p02_k4_t30_full_codex_fast_remaining_20260521_163504_20260521_233521_fast50",
+      "train_summary": {
+        "run_dir": "/vol/manifests/max_grpo_signed_attention_a0p2_lr2em06_kl0p02_k4_t30_full_codex_fast_remaining_20260521_163504_20260521_233521_fast50_20260521_233533",
+        "env_name": "alfworld",
+        "n_episodes": 50,
+        "K": 4,
+        "completed_episodes": 50,
+        "total_elapsed_s": 1550.59,
+        "train_task_id_stride": 37,
+        "dead_K_rate": 0.1,
+        "mean_std_reward_group": 0.107942,
+        "mean_abs_adv_token": 0.298254,
+        "mean_reward_first_10pct": 0.05,
+        "mean_reward_last_10pct": 0.45,
+        "mean_grad_norm": 0.0248,
+        "mean_kl_coef_final": 0.0001,
+        "log_path": "/vol/manifests/max_grpo_signed_attention_a0p2_lr2em06_kl0p02_k4_t30_full_codex_fast_remaining_20260521_163504_20260521_233521_fast50_20260521_233533/train_log.json"
+      },
+      "seen_eval": {
+        "run_dir": "/vol/manifests/maxrodriguez/max_grpo_signed_attention_a0p2_lr2em06_kl0p02_k4_t30_full_codex_fast_remaining_20260521_163504_20260521_233521_fast50_seen10_20260522_000152",
+        "adapter_path": "/vol/checkpoints/maxrodriguez_milestone/fast_pipeline/codex_fast_remaining_20260521_163504_20260521_233521/grpo/max_grpo_signed_attention_a0p2_lr2em06_kl0p02_k4_t30_full_codex_fast_remaining_20260521_163504_20260521_233521_fast50",
+        "checkpoint_type": "lora",
+        "eval_type": "freeform_greedy",
+        "episodes": 10,
+        "task_id_base": 0,
+        "task_id_range": [
+          0,
+          10
+        ],
+        "split": "eval_in_distribution",
+        "max_turns": 30,
+        "avg_return": 0.3,
+        "pct_success": 0.3,
+        "n_success": 3,
+        "n_eval": 10,
+        "avg_turns": 23.6,
+        "elapsed_s": 222.58,
+        "max_history_turns": 3,
+        "stop_after_success": false
+      },
+      "unseen_eval": {
+        "run_dir": "/vol/manifests/maxrodriguez/max_grpo_signed_attention_a0p2_lr2em06_kl0p02_k4_t30_full_codex_fast_remaining_20260521_163504_20260521_233521_fast50_unseen10_20260522_000544",
+        "adapter_path": "/vol/checkpoints/maxrodriguez_milestone/fast_pipeline/codex_fast_remaining_20260521_163504_20260521_233521/grpo/max_grpo_signed_attention_a0p2_lr2em06_kl0p02_k4_t30_full_codex_fast_remaining_20260521_163504_20260521_233521_fast50",
+        "checkpoint_type": "lora",
+        "eval_type": "freeform_greedy",
+        "episodes": 10,
+        "task_id_base": 0,
+        "task_id_range": [
+          0,
+          10
+        ],
+        "split": "eval_out_of_distribution",
+        "max_turns": 30,
+        "avg_return": 0.1,
+        "pct_success": 0.1,
+        "n_success": 1,
+        "n_eval": 10,
+        "avg_turns": 27.8,
+        "elapsed_s": 256.35,
+        "max_history_turns": 3,
+        "stop_after_success": false
+      }
+    },
+    {
+      "method": "admissible_margin",
+      "alpha": 0.15,
+      "learning_rate": 2e-06,
+      "kl_coeff": 0.02,
+      "adapter_out": "/vol/checkpoints/maxrodriguez_milestone/fast_pipeline/codex_fast_remaining_20260521_163504_20260521_233521/grpo/max_grpo_admissible_margin_a0p15_lr2em06_kl0p02_k4_t30_full_codex_fast_remaining_20260521_163504_20260521_233521_fast50",
+      "train_summary": {
+        "run_dir": "/vol/manifests/max_grpo_admissible_margin_a0p15_lr2em06_kl0p02_k4_t30_full_codex_fast_remaining_20260521_163504_20260521_233521_fast50_20260521_233531",
+        "env_name": "alfworld",
+        "n_episodes": 50,
+        "K": 4,
+        "completed_episodes": 50,
+        "total_elapsed_s": 3554.72,
+        "train_task_id_stride": 37,
+        "dead_K_rate": 0.0,
+        "mean_std_reward_group": 0.073301,
+        "mean_abs_adv_token": 0.228176,
+        "mean_reward_first_10pct": 0.0,
+        "mean_reward_last_10pct": 0.3,
+        "mean_grad_norm": 0.0171,
+        "mean_kl_coef_final": 0.0001,
+        "log_path": "/vol/manifests/max_grpo_admissible_margin_a0p15_lr2em06_kl0p02_k4_t30_full_codex_fast_remaining_20260521_163504_20260521_233521_fast50_20260521_233531/train_log.json"
+      },
+      "seen_eval": {
+        "run_dir": "/vol/manifests/maxrodriguez/max_grpo_admissible_margin_a0p15_lr2em06_kl0p02_k4_t30_full_codex_fast_remaining_20260521_163504_20260521_233521_fast50_seen10_20260522_003513",
+        "adapter_path": "/vol/checkpoints/maxrodriguez_milestone/fast_pipeline/codex_fast_remaining_20260521_163504_20260521_233521/grpo/max_grpo_admissible_margin_a0p15_lr2em06_kl0p02_k4_t30_full_codex_fast_remaining_20260521_163504_20260521_233521_fast50",
+        "checkpoint_type": "lora",
+        "eval_type": "freeform_greedy",
+        "episodes": 10,
+        "task_id_base": 0,
+        "task_id_range": [
+          0,
+          10
+        ],
+        "split": "eval_in_distribution",
+        "max_turns": 30,
+        "avg_return": 0.3,
+        "pct_success": 0.3,
+        "n_success": 3,
+        "n_eval": 10,
+        "avg_turns": 23.6,
+        "elapsed_s": 237.01,
+        "max_history_turns": 3,
+        "stop_after_success": false
+      },
+      "unseen_eval": {
+        "run_dir": "/vol/manifests/maxrodriguez/max_grpo_admissible_margin_a0p15_lr2em06_kl0p02_k4_t30_full_codex_fast_remaining_20260521_163504_20260521_233521_fast50_unseen10_20260522_003922",
+        "adapter_path": "/vol/checkpoints/maxrodriguez_milestone/fast_pipeline/codex_fast_remaining_20260521_163504_20260521_233521/grpo/max_grpo_admissible_margin_a0p15_lr2em06_kl0p02_k4_t30_full_codex_fast_remaining_20260521_163504_20260521_233521_fast50",
+        "checkpoint_type": "lora",
+        "eval_type": "freeform_greedy",
+        "episodes": 10,
+        "task_id_base": 0,
+        "task_id_range": [
+          0,
+          10
+        ],
+        "split": "eval_out_of_distribution",
+        "max_turns": 30,
+        "avg_return": 0.1,
+        "pct_success": 0.1,
+        "n_success": 1,
+        "n_eval": 10,
+        "avg_turns": 27.8,
+        "elapsed_s": 291.33,
+        "max_history_turns": 3,
+        "stop_after_success": false
+      }
+    }
+  ]
+}

@@ -374,6 +374,30 @@ def admissible_action_diagnostic(examples, tokenizer, model, max_seq_len, max_ex
         "mean_expert_margin": round(sum(margins) / max(1, len(margins)), 6) if margins else None,
     }
 
+
+def sample_examples_by_trajectory(examples: list[Any], max_examples: int, seed: int) -> list[Any]:
+    """Select a bounded but diverse set of SFT rows by whole trajectories."""
+    max_examples = int(max_examples or 0)
+    if max_examples <= 0 or len(examples) <= max_examples:
+        return list(examples)
+
+    by_traj: dict[str, list[Any]] = {}
+    for idx, ex in enumerate(examples):
+        traj = str(getattr(ex, "trajectory_id", "") or f"row_{idx}")
+        by_traj.setdefault(traj, []).append(ex)
+
+    rng = random.Random(seed)
+    trajectory_ids = list(by_traj)
+    rng.shuffle(trajectory_ids)
+
+    selected: list[Any] = []
+    for traj in trajectory_ids:
+        selected.extend(by_traj[traj])
+        if len(selected) >= max_examples:
+            break
+    return selected[:max_examples]
+
+
 def collect_dagger_examples(
     model,
     tokenizer,
@@ -459,7 +483,7 @@ def collect_dagger_examples(
         "n_no_expert_plan": n_no_expert_plan,
     }
 
-@app.function(image=image, gpu="A100-80GB", volumes={VOLUME_MOUNT: volume}, timeout=24 * 60 * 60)
+@app.function(image=alfworld_image, gpu="A100-80GB", volumes={VOLUME_MOUNT: volume}, timeout=24 * 60 * 60)
 def train_sft_plus(
     epochs: int,
     learning_rate: float,
@@ -484,6 +508,16 @@ def train_sft_plus(
     dagger_every_n_epochs: int,
     dagger_task_id_base: int,
     dagger_split: str,
+    post_eval_seen_episodes: int = 0,
+    post_eval_unseen_episodes: int = 0,
+    post_eval_max_turns: int = 30,
+    post_eval_max_seq_len: int = 2048,
+    post_eval_task_id_base: int = 0,
+    sample_after_load: bool = False,
+    full_finetune: bool = True,
+    lora_r: int = DEFAULT_EVAL_LORA_R,
+    lora_alpha: int = DEFAULT_EVAL_LORA_ALPHA,
+    lora_dropout: float = DEFAULT_EVAL_LORA_DROPOUT,
 ) -> dict:
     """SFT training entrypoint with the core implementation intentionally blank.
 
@@ -509,11 +543,15 @@ def train_sft_plus(
 
     # Load expert demonstrations. min_reward filters out failed trajectories so
     # the BC/SFT objective imitates successful behavior.
+    load_cap = None if bool(sample_after_load) and int(max_examples or 0) > 0 else (max_examples or None)
     examples = load_sft_examples_from_jsonl(
         data_path,
         min_reward=min_reward,
-        max_examples=(max_examples or None),
+        max_examples=load_cap,
     )
+    n_examples_before_sampling = len(examples)
+    if bool(sample_after_load) and int(max_examples or 0) > 0:
+        examples = sample_examples_by_trajectory(examples, int(max_examples), seed)
     dataset_summary = summarize_sft_dataset(examples)
     if not examples:
         raise RuntimeError(f"No usable SFT examples found at {data_path}")
@@ -548,14 +586,35 @@ def train_sft_plus(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_source,
-        torch_dtype=torch.bfloat16, # semi optimzed
-        cache_dir="/vol/hf_cache",
-        device_map="cuda:0"
-    )
+    if bool(full_finetune):
+        model = AutoModelForCausalLM.from_pretrained(
+            model_source,
+            torch_dtype=torch.bfloat16, # semi optimzed
+            cache_dir="/vol/hf_cache",
+            device_map="cuda:0"
+        )
+        model.requires_grad_(True)
+        checkpoint_type = "full"
+    else:
+        from peft import LoraConfig, get_peft_model  # type: ignore[import-not-found]
 
-    model.requires_grad_(True)
+        base = AutoModelForCausalLM.from_pretrained(
+            model_source,
+            torch_dtype=torch.bfloat16,
+            cache_dir="/vol/hf_cache",
+            device_map="cuda:0",
+        )
+        base.requires_grad_(False)
+        lora_cfg = LoraConfig(
+            r=int(lora_r),
+            lora_alpha=int(lora_alpha),
+            lora_dropout=float(lora_dropout),
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(base, lora_cfg)
+        checkpoint_type = "lora"
 
     # kv cache is for gen not for gradient based training
     model.config.use_cache = False
@@ -563,6 +622,8 @@ def train_sft_plus(
     model.gradient_checkpointing_enable(
         gradient_checkpointing_kwargs={"use_reentrant": False}
     )
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
 
     device = next(model.parameters()).device
 
@@ -758,8 +819,9 @@ def train_sft_plus(
 
     final = {
         "ckpt_dir": ckpt_dir,
-        "checkpoint_type": "full",
+        "checkpoint_type": checkpoint_type,
         "n_examples_total": len(examples),
+        "n_examples_before_sampling": n_examples_before_sampling,
         "n_train_examples": len(train_rows),
         "n_val_examples": len(val_rows),
         "epochs": epochs,
@@ -769,7 +831,12 @@ def train_sft_plus(
         "final_log_row": log[-1] if log else None,
         "n_train_truncated_prompts": n_train_trunc,
         "n_val_truncated_prompts": n_val_trunc,
-        "full_finetune": True,
+        "full_finetune": bool(full_finetune),
+        "sample_after_load": bool(sample_after_load),
+        "max_examples_requested": int(max_examples or 0),
+        "lora_r": int(lora_r),
+        "lora_alpha": int(lora_alpha),
+        "lora_dropout": float(lora_dropout),
         "max_seq_len": max_seq_len,
         "micro_batch_size": micro_batch_size,
         "grad_accum": grad_accum,
@@ -784,9 +851,45 @@ def train_sft_plus(
         "dagger_task_id_base": dagger_task_id_base,
         "dagger_split": dagger_split,
         "n_dagger_rows_total": n_dagger_rows_total,
+        "post_eval_seen_episodes": int(post_eval_seen_episodes),
+        "post_eval_unseen_episodes": int(post_eval_unseen_episodes),
     }
     manifest_dir = _make_run_dir(f"{run_name}_train")
     final["manifest_dir"] = manifest_dir
+
+    post_train_eval: dict[str, Any] = {}
+    if int(post_eval_seen_episodes) > 0:
+        seen_eval = _evaluate_loaded_model_freeform(
+            model=model,
+            tokenizer=tokenizer,
+            episodes=int(post_eval_seen_episodes),
+            task_id_base=int(post_eval_task_id_base),
+            split="eval_in_distribution",
+            max_turns=int(post_eval_max_turns),
+            max_seq_len=int(post_eval_max_seq_len),
+            eval_type="post_train_freeform_greedy_seen",
+            checkpoint_type=checkpoint_type,
+        )
+        post_train_eval["seen"] = seen_eval["summary"]
+        _write_json(os.path.join(ckpt_dir, "post_train_eval_seen.json"), seen_eval)
+        _write_json(os.path.join(manifest_dir, "post_train_eval_seen.json"), seen_eval)
+    if int(post_eval_unseen_episodes) > 0:
+        unseen_eval = _evaluate_loaded_model_freeform(
+            model=model,
+            tokenizer=tokenizer,
+            episodes=int(post_eval_unseen_episodes),
+            task_id_base=int(post_eval_task_id_base),
+            split="eval_out_of_distribution",
+            max_turns=int(post_eval_max_turns),
+            max_seq_len=int(post_eval_max_seq_len),
+            eval_type="post_train_freeform_greedy_unseen",
+            checkpoint_type=checkpoint_type,
+        )
+        post_train_eval["unseen"] = unseen_eval["summary"]
+        _write_json(os.path.join(ckpt_dir, "post_train_eval_unseen.json"), unseen_eval)
+        _write_json(os.path.join(manifest_dir, "post_train_eval_unseen.json"), unseen_eval)
+    if post_train_eval:
+        final["post_train_eval"] = post_train_eval
 
     with open(os.path.join(ckpt_dir, "train_log.json"), "w") as f:
         train_artifact = {
@@ -799,7 +902,12 @@ def train_sft_plus(
                 "seed": seed,
                 "val_fraction": val_fraction,
                 "max_examples": max_examples,
+                "sample_after_load": bool(sample_after_load),
                 "base_model_path": base_model_path,
+                "full_finetune": bool(full_finetune),
+                "lora_r": int(lora_r),
+                "lora_alpha": int(lora_alpha),
+                "lora_dropout": float(lora_dropout),
                 "use_dagger": use_dagger,
                 "dagger_episodes": dagger_episodes,
                 "dagger_max_turns": dagger_max_turns,
@@ -848,8 +956,30 @@ def _load_eval_model(
         model.eval()
         return tokenizer, model
 
+    # GRPO final checkpoints are LoRA adapters trained on top of the final
+    # SFT full checkpoint, not on top of raw Qwen. When an adapter_config is
+    # available, trust it over the CLI defaults so eval loads the exact same
+    # backbone/rank/alpha/dropout the adapter was trained with.
+    if adapter_path:
+        adapter_config_path = os.path.join(adapter_path, "adapter_config.json")
+        if os.path.exists(adapter_config_path):
+            with open(adapter_config_path) as f:
+                adapter_cfg = json.load(f)
+            lora_r = int(adapter_cfg.get("r", lora_r))
+            lora_alpha = int(adapter_cfg.get("lora_alpha", lora_alpha))
+            lora_dropout = float(adapter_cfg.get("lora_dropout", lora_dropout))
+            model_name = str(
+                adapter_cfg.get("base_model_name_or_path")
+                or "Qwen/Qwen2.5-1.5B-Instruct"
+            )
+        else:
+            model_name = "Qwen/Qwen2.5-1.5B-Instruct"
+    else:
+        model_name = "Qwen/Qwen2.5-1.5B-Instruct"
+
     policy = LoRAPolicy(
         LoRAPolicyConfig(
+            model_name=model_name,
             cache_dir="/vol/hf_cache",
             lora_r=lora_r,
             lora_alpha=lora_alpha,
@@ -873,6 +1003,114 @@ def _build_alfworld_adapter(max_turns: int, split: str) -> Any:
         task_split=split,
         env_kwargs={"config": config},
     )
+
+
+def _evaluate_loaded_model_freeform(
+    *,
+    model: Any,
+    tokenizer: Any,
+    episodes: int,
+    task_id_base: int,
+    split: str,
+    max_turns: int,
+    max_seq_len: int,
+    eval_type: str,
+    checkpoint_type: str = "full",
+) -> dict[str, Any]:
+    """Run a compact free-form greedy ALFWorld eval without reloading weights."""
+    adapter = _build_alfworld_adapter(max_turns=max_turns, split=split)
+    device = next(model.parameters()).device
+    was_training = bool(getattr(model, "training", False))
+    model.eval()
+
+    rows: list[dict[str, Any]] = []
+    started_at = time.time()
+    for ep in range(int(episodes)):
+        task_id = int(task_id_base) + ep
+        ep_started_at = time.time()
+        state = adapter.reset(task_id=task_id)
+        history: list[SimpleNamespace] = []
+        total_reward = 0.0
+        done = False
+        won = False
+        turns: list[dict[str, Any]] = []
+
+        for turn_idx in range(int(max_turns)):
+            prompt = render_alfworld_turn_prompt(state, history, max_history_turns=3)
+            enc = tokenizer(
+                prompt,
+                add_special_tokens=False,
+                return_tensors="pt",
+                return_attention_mask=True,
+            )
+            ids = enc.input_ids[:, -int(max_seq_len):].to(device)
+            attn = enc.attention_mask[:, -int(max_seq_len):].to(device)
+            with torch.no_grad():
+                out = model.generate(
+                    ids,
+                    attention_mask=attn,
+                    do_sample=False,
+                    max_new_tokens=48,
+                    pad_token_id=tokenizer.eos_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                )
+            generation = tokenizer.decode(out[0, ids.shape[-1] :], skip_special_tokens=True)
+            action = parse_react_action(generation)
+            next_state, reward, done, info = adapter.step(action)
+            won = won or _extract_won(info) or bool(float(reward) > 0)
+            turns.append(
+                {
+                    "turn_idx": turn_idx,
+                    "action": action,
+                    "generation": generation[:500],
+                    "reward": float(reward),
+                    "done": bool(done),
+                }
+            )
+            history.append(
+                SimpleNamespace(
+                    observation_text=getattr(state, "observation_text", "") or "",
+                    action_text=action,
+                )
+            )
+            total_reward += float(reward)
+            state = next_state
+            if done:
+                break
+
+        row = {
+            "episode": ep,
+            "task_id": task_id,
+            "final_reward": total_reward,
+            "success": bool(won or total_reward > 0.0),
+            "n_turns": len(turns),
+            "done": bool(done),
+            "elapsed_s": round(time.time() - ep_started_at, 2),
+            "turns": turns,
+        }
+        rows.append(row)
+        print(
+            f">>> post-eval {eval_type} ep={ep:03d} task={task_id} "
+            f"R={total_reward:.1f} success={row['success']}"
+        )
+
+    if was_training:
+        model.train()
+
+    summary = _summarize_eval(
+        rows=rows,
+        run_dir="<in-process-post-train>",
+        adapter_path="<loaded-training-model>",
+        checkpoint_type=checkpoint_type,
+        eval_type=eval_type,
+        episodes=int(episodes),
+        task_id_base=int(task_id_base),
+        split=split,
+        max_turns=int(max_turns),
+        started_at=started_at,
+        extra={"max_history_turns": 3, "max_seq_len": int(max_seq_len)},
+    )
+    return {"summary": summary, "rows": rows}
 
 
 def _summarize_eval(
@@ -1251,14 +1489,17 @@ def main(
     lora_r: int | None = None,
     lora_alpha: int | None = None,
     lora_dropout: float | None = None,
-    full_finetune: bool = False,
+    full_finetune: bool = True,
     seed: int | None = None,
     val_fraction: float | None = None,
     max_examples: int = 0,
+    sample_after_load: bool = False,
     checkpoint_type: str = "lora",
     output_dir: str = "",
     base_model_path: str = "",
     episodes: int = 50,
+    seen_episodes: int = 140,
+    unseen_episodes: int = 134,
     task_id_base: int = 6500,
     run_name: str = "",
     score_normalization: str = "mean",
@@ -1275,6 +1516,11 @@ def main(
     dagger_every_n_epochs: int = 2,
     dagger_task_id_base: int = 8000,
     dagger_split: str = "train",
+    post_eval_seen_episodes: int = 0,
+    post_eval_unseen_episodes: int = 0,
+    post_eval_max_turns: int = 30,
+    post_eval_max_seq_len: int = 2048,
+    post_eval_task_id_base: int = 0,
 ) -> None:
     """Dispatch one Modal action from the command line."""
     if action in {"train", "train_then_eval", "train_then_eval_both"}:
@@ -1321,6 +1567,11 @@ def main(
             data_path=data_path,
             output_dir=output_dir,
             base_model_path=base_model_path,
+            sample_after_load=sample_after_load,
+            full_finetune=full_finetune,
+            lora_r=lora_r or DEFAULT_EVAL_LORA_R,
+            lora_alpha=lora_alpha or DEFAULT_EVAL_LORA_ALPHA,
+            lora_dropout=DEFAULT_EVAL_LORA_DROPOUT if lora_dropout is None else lora_dropout,
             use_dagger=use_dagger,
             dagger_episodes=dagger_episodes,
             dagger_max_turns=dagger_max_turns,
@@ -1330,11 +1581,17 @@ def main(
             dagger_every_n_epochs=dagger_every_n_epochs,
             dagger_task_id_base=dagger_task_id_base,
             dagger_split=dagger_split,
+            post_eval_seen_episodes=post_eval_seen_episodes,
+            post_eval_unseen_episodes=post_eval_unseen_episodes,
+            post_eval_max_turns=post_eval_max_turns,
+            post_eval_max_seq_len=post_eval_max_seq_len,
+            post_eval_task_id_base=post_eval_task_id_base,
         )
+        trained_checkpoint_type = str(res.get("checkpoint_type", "full") or "full")
         if action == "train_then_eval":
             eval_res = evaluate_freeform_greedy.remote(
                 adapter_path=res["ckpt_dir"],
-                checkpoint_type="full",
+                checkpoint_type=trained_checkpoint_type,
                 episodes=episodes,
                 task_id_base=task_id_base,
                 run_name=f"{run_name}_freeform_{split}",
@@ -1350,7 +1607,7 @@ def main(
         elif action == "train_then_eval_both":
             seen_res = evaluate_freeform_greedy.remote(
                 adapter_path=res["ckpt_dir"],
-                checkpoint_type="full",
+                checkpoint_type=trained_checkpoint_type,
                 episodes=seen_episodes,
                 task_id_base=0,
                 run_name=f"{run_name}_freeform_seen{seen_episodes}",
@@ -1364,7 +1621,7 @@ def main(
             )
             unseen_res = evaluate_freeform_greedy.remote(
                 adapter_path=res["ckpt_dir"],
-                checkpoint_type="full",
+                checkpoint_type=trained_checkpoint_type,
                 episodes=unseen_episodes,
                 task_id_base=0,
                 run_name=f"{run_name}_freeform_unseen{unseen_episodes}",

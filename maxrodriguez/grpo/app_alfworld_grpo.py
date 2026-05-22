@@ -19,6 +19,8 @@ from __future__ import annotations
 import itertools
 import json
 import os
+import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -35,6 +37,8 @@ from infra.app_train_loop import train_loop_alfworld
 app = modal.App("maxrodriguez-alfworld-grpo")
 
 CONFIG_OUTPUT_DIR = Path("maxrodriguez/configs/generated_grpo")
+VOLUME_NAME = "cs224r-hgpo-vol"
+VOLUME_CONFIG_ROOT = "/maxrodriguez/generated_grpo"
 DEFAULT_SFT_ADAPTER = "/vol/checkpoints/best_full_sft_alfworld"
 DEFAULT_SIGNED_ATTENTION_TRANSFORMER_CKPT = ""
 GRID_DATA_ROOT = "/vol/data/alfworld_grid_subset/json_2.1.1"
@@ -42,6 +46,8 @@ FULL_DATA_ROOT = "$ALFWORLD_DATA/json_2.1.1"
 GRID_NUM_TRAIN_GAMES = 200
 GRID_NUM_EVAL_GAMES = 0
 FULL_NUM_GAMES = -1
+GRID_TASK_ID_STRIDE = 7
+FULL_TASK_ID_STRIDE = 37
 
 
 # Only vary the few hyperparameters most likely to matter at milestone time.
@@ -88,6 +94,8 @@ TURN_REWARD_DEFAULT_CONFIGS: dict[str, dict[str, Any]] = {
         "n_layers": 2,
         "dropout": 0.0,
         "outcome_scale": 1.0,
+        "failure_scale": 0.5,
+        "heuristic_bias_scale": 0.25,
         "transformer_ckpt_path": DEFAULT_SIGNED_ATTENTION_TRANSFORMER_CKPT,
     },
     "admissible_margin": {
@@ -146,6 +154,7 @@ class GRPORunSpec:
     eval_episodes: int = GRID_NUM_EVAL_GAMES
     save_adapter_out: str = ""
     signed_attention_transformer_ckpt: str = ""
+    task_id_stride: int = 1
 
 
 def _name_value(value: object) -> str:
@@ -216,6 +225,7 @@ def iter_grid_run_specs(
             signed_attention_transformer_ckpt=(
                 signed_attention_transformer_ckpt if method == "signed_attention" else ""
             ),
+            task_id_stride=GRID_TASK_ID_STRIDE,
         )
         spec = GRPORunSpec(**{**spec.__dict__, "run_name": make_run_name(spec)})
         specs.append(spec)
@@ -257,6 +267,7 @@ def build_config_for_run(spec: GRPORunSpec) -> dict[str, Any]:
         num_train_games = FULL_NUM_GAMES
         num_eval_games = FULL_NUM_GAMES
         data_root = FULL_DATA_ROOT
+    task_id_stride = max(1, int(spec.task_id_stride))
 
     return {
         "run": {
@@ -354,6 +365,7 @@ def build_config_for_run(spec: GRPORunSpec) -> dict[str, Any]:
             "max_tokens_per_microbatch": spec.max_tokens_per_microbatch,
             "gpu_mem_util": 0.20,
             "kl_warmup_episodes": spec.kl_warmup_episodes,
+            "task_id_stride": task_id_stride,
         },
         "policy": {
             "backbone": "Qwen2.5-1.5B-Instruct",
@@ -402,8 +414,14 @@ def build_manual_run_spec(
     eval_episodes: int = FULL_NUM_GAMES,
     run_name_suffix: str = "final",
     signed_attention_transformer_ckpt: str = DEFAULT_SIGNED_ATTENTION_TRANSFORMER_CKPT,
+    task_id_stride: int = 0,
 ) -> GRPORunSpec:
     """Build one explicit GRPO run spec outside the sweep grid."""
+    resolved_task_id_stride = (
+        int(task_id_stride)
+        if int(task_id_stride) > 0
+        else (FULL_TASK_ID_STRIDE if dataset_size_mode == "full" else GRID_TASK_ID_STRIDE)
+    )
     base = GRPORunSpec(
         run_name="",
         sft_adapter=sft_adapter,
@@ -423,6 +441,7 @@ def build_manual_run_spec(
         signed_attention_transformer_ckpt=(
             signed_attention_transformer_ckpt if turn_reward_method == "signed_attention" else ""
         ),
+        task_id_stride=resolved_task_id_stride,
     )
     run_name = f"{make_run_name(base)}_{run_name_suffix}"
     return GRPORunSpec(**{**base.__dict__, "run_name": run_name})
@@ -441,9 +460,45 @@ def write_config_for_run(
     return str(path)
 
 
+def upload_config_for_run(config_path: str | Path, retries: int = 4) -> str:
+    """Upload a generated config to the Modal volume and return the container path."""
+    local_path = Path(config_path)
+    remote_path = f"{VOLUME_CONFIG_ROOT}/{local_path.name}"
+    last_error = ""
+    for attempt in range(1, max(1, int(retries)) + 1):
+        result = subprocess.run(
+            [
+                "modal",
+                "volume",
+                "put",
+                "--force",
+                VOLUME_NAME,
+                str(local_path),
+                remote_path,
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            env={
+                **os.environ,
+                "PYTHONIOENCODING": "utf-8",
+                "KMP_DUPLICATE_LIB_OK": "TRUE",
+                "CS224R_SKIP_OPENAI_SECRET": "1",
+            },
+            check=False,
+        )
+        if result.returncode == 0:
+            return f"/vol{remote_path}"
+        last_error = result.stderr or result.stdout
+        if attempt < max(1, int(retries)):
+            time.sleep(min(30, 2**attempt))
+    raise RuntimeError(f"modal volume put failed for {local_path.name}: {last_error}")
+
+
 def launch_grpo_run(spec: GRPORunSpec) -> dict[str, Any]:
     """Write one config and launch the matching Modal ALFWorld GRPO run."""
-    config_path = write_config_for_run(spec)
+    config_path = upload_config_for_run(write_config_for_run(spec))
     save_adapter_out = spec.save_adapter_out or f"/vol/checkpoints/grpo/{spec.run_name}"
     return train_loop_alfworld.remote(
         n_episodes=spec.n_episodes,
@@ -456,6 +511,7 @@ def launch_grpo_run(spec: GRPORunSpec) -> dict[str, Any]:
         gpu_mem_util=0.20,
         config=config_path,
         eval_episodes=spec.eval_episodes,
+        train_task_id_stride=spec.task_id_stride,
         save_adapter_out=save_adapter_out,
     )
 
@@ -509,7 +565,7 @@ def main(
     turn_reward_method: str = "trajectory_only",
     learning_rate: float = 1e-6,
     kl_coeff: float = 0.02,
-    n_episodes: int = 300,
+    n_episodes: int = 100,
     k: int = 4,
     max_turns: int = 30,
     clip_eps: float = 0.2,
@@ -519,6 +575,7 @@ def main(
     dataset_size_mode: str = "full",
     eval_episodes: int = FULL_NUM_GAMES,
     run_name_suffix: str = "final",
+    task_id_stride: int = 0,
 ) -> None:
     """Local entrypoint for inspecting configs or launching GRPO runs."""
     limit = max_specs if max_specs > 0 else None
@@ -610,6 +667,7 @@ def main(
             eval_episodes=eval_episodes,
             run_name_suffix=run_name_suffix,
             signed_attention_transformer_ckpt=signed_attention_transformer_ckpt,
+            task_id_stride=task_id_stride,
         )
         print(json.dumps(launch_grpo_run(spec), indent=2, default=str))
         return

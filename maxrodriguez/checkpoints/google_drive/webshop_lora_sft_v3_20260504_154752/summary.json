@@ -1,0 +1,13 @@
+{
+  "ckpt_dir": "/vol/checkpoints/sft_v3_20260504_154752",
+  "n_examples": 169,
+  "epochs": 3,
+  "global_steps": 127,
+  "final_log_row": {
+    "epoch": 2,
+    "epoch_summary": true,
+    "per_token_ce": 0.4806,
+    "n_action_tokens": 3823
+  },
+  "total_elapsed_s": 70.2
+}

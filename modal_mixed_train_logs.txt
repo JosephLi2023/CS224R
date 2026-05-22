@@ -1,0 +1,18 @@
+2026-05-16 01:03:58-07:00 >>> {'epoch': 0, 'global_step': 25000, 'train_loss_last_batch': 0.036073, 'grad_norm': 9.375, 'n_action_tokens': 75, 'n_rows': 4, 'elapsed_s': 6422.9}
+2026-05-16 01:08:12-07:00 >>> {'epoch': 0, 'global_step': 26000, 'train_loss_last_batch': 0.002607, 'grad_norm': 3.3125, 'n_action_tokens': 74, 'n_rows': 4, 'elapsed_s': 6677.5}
+2026-05-16 01:12:27-07:00 >>> {'epoch': 0, 'global_step': 27000, 'train_loss_last_batch': 0.10346, 'grad_norm': 17.75, 'n_action_tokens': 86, 'n_rows': 4, 'elapsed_s': 6932.5}
+2026-05-16 01:16:41-07:00 >>> {'epoch': 0, 'global_step': 28000, 'train_loss_last_batch': 5e-05, 'grad_norm': 0.040527, 'n_action_tokens': 75, 'n_rows': 4, 'elapsed_s': 7185.7}
+2026-05-16 01:20:57-07:00 >>> {'epoch': 0, 'global_step': 29000, 'train_loss_last_batch': 0.077846, 'grad_norm': 9.375, 'n_action_tokens': 76, 'n_rows': 4, 'elapsed_s': 7441.6}
+2026-05-16 01:25:13-07:00 >>> {'epoch': 0, 'global_step': 30000, 'train_loss_last_batch': 0.07098, 'grad_norm': 9.375, 'n_action_tokens': 80, 'n_rows': 4, 'elapsed_s': 7698.0}
+2026-05-16 01:29:29-07:00 >>> {'epoch': 0, 'global_step': 31000, 'train_loss_last_batch': 0.087755, 'grad_norm': 21.375, 'n_action_tokens': 65, 'n_rows': 4, 'elapsed_s': 7954.3}
+2026-05-16 01:33:43-07:00 >>> {'epoch': 0, 'global_step': 32000, 'train_loss_last_batch': 0.000899, 'grad_norm': 0.523438, 'n_action_tokens': 78, 'n_rows': 4, 'elapsed_s': 8208.0}
+2026-05-16 01:37:58-07:00 >>> {'epoch': 0, 'global_step': 33000, 'train_loss_last_batch': 0.106094, 'grad_norm': 11.5, 'n_action_tokens': 87, 'n_rows': 4, 'elapsed_s': 8463.2}
+2026-05-16 01:40:12-07:00 >>> END {'epoch': 0, 'epoch_summary': True, 'train_per_token_ce': 0.078586, 'train_action_tokens': 2480423, 'val': {'n_rows': 2725, 'n_action_tokens': 50848, 'per_token_ce': 0.070388}}
+2026-05-16 01:40:38-07:00 /usr/local/lib/python3.11/site-packages/torch/utils/checkpoint.py:1399: FutureWarning: `torch.cpu.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cpu', args...)` instead.
+2026-05-16 01:40:38-07:00   with device_autocast_ctx, torch.cpu.amp.autocast(**cpu_autocast_kwargs), recompute_context:  # type: ignore[attr-defined]
+2026-05-16 01:43:15-07:00 >>> {'epoch': 1, 'global_step': 34000, 'train_loss_last_batch': 0.056872, 'grad_norm': 6.21875, 'n_action_tokens': 91, 'n_rows': 4, 'elapsed_s': 8779.7}
+2026-05-16 01:47:29-07:00 >>> {'epoch': 1, 'global_step': 35000, 'train_loss_last_batch': 0.064882, 'grad_norm': 8.0625, 'n_action_tokens': 67, 'n_rows': 4, 'elapsed_s': 9033.8}
+2026-05-16 01:51:45-07:00 >>> {'epoch': 1, 'global_step': 36000, 'train_loss_last_batch': 0.000118, 'grad_norm': 0.129883, 'n_action_tokens': 71, 'n_rows': 4, 'elapsed_s': 9290.0}
+2026-05-16 01:56:02-07:00 >>> {'epoch': 1, 'global_step': 37000, 'train_loss_last_batch': 0.009301, 'grad_norm': 18.5, 'n_action_tokens': 78, 'n_rows': 4, 'elapsed_s': 9547.1}
+2026-05-16 02:00:22-07:00 >>> {'epoch': 1, 'global_step': 38000, 'train_loss_last_batch': 0.145673, 'grad_norm': 13.9375, 'n_action_tokens': 85, 'n_rows': 4, 'elapsed_s': 9807.0}
+2026-05-16 02:04:39-07:00 >>> {'epoch': 1, 'global_step': 39000, 'train_loss_last_batch': 0.096441, 'grad_norm': 10.1875, 'n_action_tokens': 86, 'n_rows': 4, 'elapsed_s': 10063.6}

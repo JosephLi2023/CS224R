@@ -105,6 +105,8 @@ def _launch_one_spec(
         str(args.eval_episodes),
         "--eval-task-id-base",
         str(args.eval_task_id_base),
+        "--train-task-id-stride",
+        str(tagged_spec.task_id_stride),
         "--save-adapter-out",
         tagged_spec.save_adapter_out,
     ]

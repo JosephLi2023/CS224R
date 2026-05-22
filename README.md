@@ -6,7 +6,7 @@ RL environments (WebShop, ALFWorld), with a bake-off across **6 methods**:
 | Method | Decomposer | What's different |
 |---|---|---|
 | **SFTOnly** | n/a (eval-only) | No RL update — just the held-out eval pass against the SFT warm-start adapter. Reference floor. |
-| **flatGRPO** | progress (no-op) | H-GRPO with `alpha=1.0` so the per-turn signal is dropped. Trajectory-level GRPO baseline. |
+| **flatGRPO** | progress (no-op) | H-GRPO with `alpha=0.0` so the per-turn signal is dropped under proposal semantics where alpha weights `A_turn`. Trajectory-level GRPO baseline. |
 | **LLMJudge** | judge | OpenAI gpt-4o-mini judge produces per-turn rewards, cached in SQLite. |
 | **TurnRDV1** | turnrd v1 | Original learned [CLS] cross-attention decomposer, causal mask, lean variant. |
 | **TurnRDV2** | turnrd v2 | Bidirectional + Σ α·v identifiable + progress-prior init, with `--carry-policy-across-rounds`. |

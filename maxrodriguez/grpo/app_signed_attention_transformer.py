@@ -20,7 +20,10 @@ from infra.app_alfworld_sft_gen import _build_alfworld_config_dict, _extract_exp
 from infra.common import VOLUME_MOUNT, volume
 from infra.image import ALFWORLD_DATA_DIR, alfworld_image
 from maxrodriguez.grpo.turn_level_reward_methods_todo import (
+    SIGNED_ATTENTION_FEATURE_SIZE,
     SignedAttentionTransformer,
+    _signed_attention_target_tensor,
+    _trajectory_feature_tensor,
     load_signed_attention_transformer_checkpoint,
     save_signed_attention_transformer_checkpoint,
     train_signed_attention_transformer,
@@ -257,6 +260,7 @@ def _collect_expert_groups(
                     prompt_token_count=len(prompt_ids),
                     prompt_token_ids=tuple(prompt_ids[-2048:]),
                     intermediate_reward=intermediate_reward,
+                    valid_actions=tuple(getattr(state, "valid_actions", ()) or ()),
                 )
             )
             history.append(
@@ -314,35 +318,16 @@ def _evaluate_signed_attention_transformer(
                 if not traj.turns:
                     continue
 
-                progress = torch.tensor(
-                    [
-                        float(turn.intermediate_reward)
-                        if turn.intermediate_reward is not None
-                        else float(turn.raw_env_reward)
-                        for turn in traj.turns
-                    ],
+                target = _signed_attention_target_tensor(
+                    traj,
                     device=device,
                     dtype=torch.float32,
-                )
-                centered_progress = progress - progress.mean()
-                scale = centered_progress.abs().max().clamp_min(1e-8)
-                target = (centered_progress / scale).unsqueeze(0)
-
-                features = torch.tensor(
-                    [
-                        [
-                            float(turn.intermediate_reward)
-                            if turn.intermediate_reward is not None
-                            else float(turn.raw_env_reward),
-                            float(turn.raw_env_reward),
-                            float(turn.turn_idx) / max(len(traj.turns) - 1, 1),
-                            float(len(turn.action_token_ids)),
-                            float(turn.prompt_token_count),
-                        ]
-                        for turn in traj.turns
-                    ],
-                    device=device,
+                ).unsqueeze(0)
+                features = _trajectory_feature_tensor(
+                    traj,
+                    device=torch.device(device),
                     dtype=torch.float32,
+                    feature_size=int(model.input_proj.in_features),
                 ).unsqueeze(0)
                 mask = torch.ones((1, features.shape[1]), device=device, dtype=torch.bool)
                 pred = model(features, mask=mask)
@@ -402,7 +387,7 @@ def train_signed_attention_transformer_model(
     )
 
     model = SignedAttentionTransformer(
-        input_size=5,
+        input_size=SIGNED_ATTENTION_FEATURE_SIZE,
         hidden_size=int(hidden_size),
         n_heads=int(n_heads),
         n_layers=int(n_layers),

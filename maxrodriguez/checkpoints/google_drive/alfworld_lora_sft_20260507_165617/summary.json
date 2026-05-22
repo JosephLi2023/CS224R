@@ -1,0 +1,14 @@
+{
+  "ckpt_dir": "/vol/checkpoints/sft_alfworld_v1_20260507_165617",
+  "n_examples": 1903,
+  "epochs": 3,
+  "global_steps": 1428,
+  "final_log_row": {
+    "epoch": 2,
+    "epoch_summary": true,
+    "per_token_ce": 0.0404,
+    "n_action_tokens": 33130
+  },
+  "total_elapsed_s": 753.7,
+  "n_truncated_prompts": 0
+}

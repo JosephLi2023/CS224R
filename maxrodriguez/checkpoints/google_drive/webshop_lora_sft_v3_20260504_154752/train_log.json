@@ -1,0 +1,82 @@
+{
+  "rows": [
+    {
+      "epoch": 0,
+      "global_step": 25,
+      "loss": 1.1382,
+      "grad_norm": 4.2744,
+      "n_action_tokens": 18,
+      "elapsed_s": 15.1
+    },
+    {
+      "epoch": 0,
+      "epoch_summary": true,
+      "per_token_ce": 1.1358,
+      "n_action_tokens": 3823
+    },
+    {
+      "epoch": 1,
+      "global_step": 50,
+      "loss": 0.4417,
+      "grad_norm": 2.6036,
+      "n_action_tokens": 21,
+      "elapsed_s": 28.2
+    },
+    {
+      "epoch": 1,
+      "global_step": 75,
+      "loss": 0.2494,
+      "grad_norm": 4.3416,
+      "n_action_tokens": 18,
+      "elapsed_s": 41.6
+    },
+    {
+      "epoch": 1,
+      "epoch_summary": true,
+      "per_token_ce": 0.5587,
+      "n_action_tokens": 3823
+    },
+    {
+      "epoch": 2,
+      "global_step": 100,
+      "loss": 0.2048,
+      "grad_norm": 1.3657,
+      "n_action_tokens": 32,
+      "elapsed_s": 55.3
+    },
+    {
+      "epoch": 2,
+      "global_step": 125,
+      "loss": 1.0132,
+      "grad_norm": 1.4219,
+      "n_action_tokens": 23,
+      "elapsed_s": 68.7
+    },
+    {
+      "epoch": 2,
+      "epoch_summary": true,
+      "per_token_ce": 0.4806,
+      "n_action_tokens": 3823
+    }
+  ],
+  "config": {
+    "epochs": 3,
+    "learning_rate": 0.0001,
+    "min_reward": 0.5,
+    "max_seq_len": 1024,
+    "grad_accum": 4,
+    "log_every": 25,
+    "run_name": "sft_v3"
+  },
+  "dataset_summary": {
+    "n_examples": 169,
+    "n_trajectories": 32,
+    "by_action_kind": {
+      "search": 32,
+      "click": 137
+    },
+    "reward_min": 0.5,
+    "reward_max": 1.0,
+    "reward_mean": 0.7654832347140041
+  }
+}

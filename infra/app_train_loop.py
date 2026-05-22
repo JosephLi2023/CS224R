@@ -89,6 +89,7 @@ def _train_loop_impl(
     config: str,
     eval_episodes: int,
     eval_task_id_base: int,
+    train_task_id_stride: int,
     round_idx: int,
     save_adapter_out: str = "",
 ) -> dict:
@@ -160,6 +161,11 @@ def _train_loop_impl(
         # single `cfg.run.name` and the per-round log aggregator
         # (`scripts/merge_turnrd_round_logs.py`) couldn't auto-detect
         # rounds.
+
+    train_cfg_block = dict((cfg_dict or {}).get("train", {}) or {})
+    if int(train_task_id_stride) <= 0:
+        train_task_id_stride = int(train_cfg_block.get("task_id_stride", 1) or 1)
+    train_task_id_stride = max(1, int(train_task_id_stride))
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     run_dir = f"/vol/manifests/{run_name}_{timestamp}"
@@ -366,6 +372,8 @@ def _train_loop_impl(
             "env_kwargs": cfg_env_kwargs,
             "n_episodes": n_episodes, "K": k, "max_turns": max_turns,
             "task_id_offset": task_id_offset,
+            "train_task_id_stride": train_task_id_stride,
+            "train_task_id_schedule": "task_id_offset + episode * train_task_id_stride",
             "sync_every": sync_every, "run_name": run_name,
             "sft_adapter": sft_adapter,
             "turnrd_refresh": _turnrd_refresh,
@@ -376,7 +384,7 @@ def _train_loop_impl(
 
     for ep in range(n_episodes):
         ep_t0 = time.time()
-        task_id = task_id_offset + ep
+        task_id = task_id_offset + ep * train_task_id_stride
         try:
             group, cstats = collector.collect_group(
                 task_id=task_id, env_name=env_name, K=k, sampling=sampling
@@ -483,7 +491,7 @@ def _train_loop_impl(
     if eval_episodes > 0:
         print(
             f">>> Eval pass: {eval_episodes} held-out tasks at offset "
-            f"{eval_task_id_base} (greedy sampling)"
+            f"{eval_task_id_base} (greedy sampling; same env_factory split={adapter_task_split!r})"
         )
         # Ensure vLLM has the latest trained weights. The training loop
         # syncs every `sync_every` episodes — if the last episode wasn't
@@ -551,6 +559,18 @@ def _train_loop_impl(
             pct_success = 0.0
             std_R = 0.0
         eval_block = {
+            "eval_type": "inline_same_env_factory_greedy",
+            "eval_scope": (
+                "cheap_train_split_eval"
+                if env_name == "alfworld" and adapter_task_split == "train"
+                else "cheap_eval_on_configured_env_split"
+            ),
+            "env_task_split": adapter_task_split,
+            "claim_note": (
+                "Do not use this inline eval as valid_seen/valid_unseen. "
+                "Use maxrodriguez.supervised_FT.app_alfworld_sft_plus.evaluate_freeform_greedy "
+                "with split=eval_in_distribution / eval_out_of_distribution for benchmark claims."
+            ),
             "n_episodes_attempted": eval_episodes,
             "n_episodes_ok": len(eval_returns),
             "n_episodes_crashed": eval_crashed,
@@ -602,6 +622,22 @@ def _train_loop_impl(
         "K": k,
         "completed_episodes": len(rewards),
         "total_elapsed_s": total_elapsed,
+        "train_task_id_stride": train_task_id_stride,
+        "dead_K_rate": round(
+            sum(int(r.get("dead_K_group", 0)) for r in log if "mean_reward" in r)
+            / max(1, len(rewards)),
+            4,
+        ),
+        "mean_std_reward_group": round(
+            sum(float(r.get("std_reward_group", 0.0)) for r in log if "mean_reward" in r)
+            / max(1, len(rewards)),
+            6,
+        ),
+        "mean_abs_adv_token": round(
+            sum(float(r.get("mean_abs_adv_token", 0.0)) for r in log if "mean_reward" in r)
+            / max(1, len(rewards)),
+            6,
+        ),
         "mean_reward_first_10pct": round(sum(early) / max(1, len(early)), 4),
         "mean_reward_last_10pct": round(sum(late) / max(1, len(late)), 4),
         "mean_grad_norm": round(
@@ -639,6 +675,7 @@ def train_loop_webshop(
     config: str = "",
     eval_episodes: int = 50,
     eval_task_id_base: int = 6500,
+    train_task_id_stride: int = 0,
     round_idx: int = 0,
     save_adapter_out: str = "",
 ) -> dict:
@@ -651,6 +688,7 @@ def train_loop_webshop(
         kl_warmup_episodes=kl_warmup_episodes, gpu_mem_util=gpu_mem_util,
         config=config,
         eval_episodes=eval_episodes, eval_task_id_base=eval_task_id_base,
+        train_task_id_stride=train_task_id_stride,
         round_idx=round_idx,
         save_adapter_out=save_adapter_out,
     )
@@ -677,6 +715,7 @@ def train_loop_alfworld(
     # mirroring WebShop's 6500. Override via --eval-task-id-base.
     eval_episodes: int = 50,
     eval_task_id_base: int = 6500,
+    train_task_id_stride: int = 0,
     round_idx: int = 0,
     save_adapter_out: str = "",
 ) -> dict:
@@ -689,6 +728,7 @@ def train_loop_alfworld(
         kl_warmup_episodes=kl_warmup_episodes, gpu_mem_util=gpu_mem_util,
         config=config,
         eval_episodes=eval_episodes, eval_task_id_base=eval_task_id_base,
+        train_task_id_stride=train_task_id_stride,
         round_idx=round_idx,
         save_adapter_out=save_adapter_out,
     )
@@ -717,6 +757,7 @@ def main(
     config: str = "",
     eval_episodes: int = 50,
     eval_task_id_base: int = 6500,
+    train_task_id_stride: int = 0,
     round_idx: int = 0,
     save_adapter_out: str = "",
 ) -> None:
@@ -747,6 +788,7 @@ def main(
             config=config,
             eval_episodes=eval_episodes,
             eval_task_id_base=eval_task_id_base,
+            train_task_id_stride=train_task_id_stride,
             round_idx=round_idx,
             save_adapter_out=save_adapter_out,
         ),

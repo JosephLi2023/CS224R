@@ -27,17 +27,20 @@ param(
   [double]$FinalGrpoAlpha = -1.0,
   [double]$FinalGrpoLearningRate = 0.0,
   [double]$FinalGrpoKlCoeff = 0.0,
-  [int]$FinalGrpoEpisodes = 300,
+  [int]$FinalGrpoEpisodes = 100,
   [int]$FinalGrpoK = 4,
   [int]$FinalGrpoMaxTurns = 30,
   [double]$FinalGrpoClipEps = 0.2,
   [int]$FinalGrpoGradAccumSteps = 1,
   [int]$FinalGrpoMaxTokensPerMicrobatch = 2048,
   [int]$FinalGrpoKlWarmupEpisodes = 5,
+  [int]$FinalGrpoTaskIdStride = 37,
   [string]$FinalGrpoDatasetSizeMode = "full",
   [int]$FinalGrpoEvalEpisodes = 0,
   [int]$FullSeenEpisodes = 140,
   [int]$FullUnseenEpisodes = 134,
+  [int]$SftPostEvalSeenEpisodes = 0,
+  [int]$SftPostEvalUnseenEpisodes = 0,
   [string]$DownloadDir = "maxrodriguez/results/modal_manifests",
   [string]$LedgerPath = "maxrodriguez/results/milestone_launch_ledger.jsonl"
 )
@@ -166,7 +169,12 @@ function Launch-FinalSft {
     "--base-model-path", $BaseModelPath,
     "--run-name", $runName,
     "--output-dir", $outputDir,
-    "--max-examples", "0"
+    "--max-examples", "0",
+    "--post-eval-seen-episodes", "$SftPostEvalSeenEpisodes",
+    "--post-eval-unseen-episodes", "$SftPostEvalUnseenEpisodes",
+    "--post-eval-max-turns", "30",
+    "--post-eval-max-seq-len", "$BestMaxSeqLen",
+    "--post-eval-task-id-base", "0"
   )
   $modalArgs = Add-DaggerArgs -BaseArgs $modalArgs -UseDagger $UseDagger
   Invoke-DetachedModal -RunName $runName -Kind "sft-final" -ModalArgs $modalArgs
@@ -369,6 +377,7 @@ function Launch-FinalGrpo {
     "--grad-accum-steps", "$FinalGrpoGradAccumSteps",
     "--max-tokens-per-microbatch", "$FinalGrpoMaxTokensPerMicrobatch",
     "--kl-warmup-episodes", "$FinalGrpoKlWarmupEpisodes",
+    "--task-id-stride", "$FinalGrpoTaskIdStride",
     "--dataset-size-mode", $FinalGrpoDatasetSizeMode,
     "--eval-episodes", "$FinalGrpoEvalEpisodes",
     "--run-name-suffix", "final"
