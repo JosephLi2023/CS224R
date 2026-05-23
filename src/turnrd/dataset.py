@@ -84,6 +84,15 @@ class TurnRDRecord:
     # envs (no expert plan available) keeps backward compat for legacy
     # replay buffers.
     progress_signal: Optional[list[float]] = None  # [T_i] or None
+    # Round index (0-based) under the orchestrator's protocol. Producer
+    # writes the parent `train_loop`'s `--round-idx` value here so the
+    # `TurnRDReplayDataset` can apply a recency window at load time
+    # (keep only rows from the last N rounds; see
+    # `TurnRDReplayDataset.__init__(..., recency_window_rounds=N)`).
+    # `None` on legacy replay buffers produced before this field existed;
+    # those rows are dropped when a recency window is requested (treated
+    # as "older than any tracked round"), and kept when no window is set.
+    round_idx: Optional[int] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.task_id, str) or not self.task_id:
@@ -166,6 +175,14 @@ class TurnRDReplayDataset:
               are `None`.
         max_records: optional cap on the number of records to load FROM
               THE START (useful for unit tests + smoke runs).
+
+    NOTE on recency: this dataset deliberately does NOT filter by
+    `round_idx`. The replay buffer is append-only by design — stale rows
+    are kept and the trainer downweights them at loss time via
+    `train_turnrd(..., recency_decay_half_life=N)`. See
+    `src.turnrd.train.train_turnrd` for the per-batch decay-weight
+    implementation. Producers that emit `round_idx` enable that path;
+    legacy rows without `round_idx` get a neutral default weight.
     """
 
     def __init__(
@@ -214,6 +231,7 @@ class TurnRDReplayDataset:
                     # AlfWorld where env.step returns step-rewards).
                     raw_progress = obj.get("progress", obj.get("raw_env_rewards", None))
                     raw_progress_signal = obj.get("progress_signal", None)
+                    raw_round_idx = obj.get("round_idx", None)
                     rec = TurnRDRecord(
                         task_id=str(obj["task_id"]),
                         turn_embeds=turn_embeds,
@@ -228,6 +246,9 @@ class TurnRDReplayDataset:
                             [float(x) for x in raw_progress_signal]
                             if raw_progress_signal is not None
                             else None
+                        ),
+                        round_idx=(
+                            int(raw_round_idx) if raw_round_idx is not None else None
                         ),
                     )
                 except (KeyError, TypeError, ValueError) as e:
@@ -252,6 +273,7 @@ class TurnRDReplayDataset:
                 self.skipped_empty,
                 path,
             )
+
         self._records: list[TurnRDRecord] = records
 
     def __len__(self) -> int:
@@ -323,6 +345,12 @@ def pad_collate(batch: list[TurnRDRecord]) -> dict[str, torch.Tensor]:
     progress_signal: torch.Tensor | None = (
         torch.zeros(B, T_max, dtype=torch.float32) if have_all_progress_signal else None
     )
+    # Round index per record (always emitted; -1 sentinel for legacy rows
+    # that lack it). The trainer's recency-decay path reads this to
+    # compute per-batch loss weights; the all-or-nothing gate is
+    # intentionally absent so mixed legacy + fresh batches still produce
+    # a valid (mostly-fresh-weighted) update instead of crashing.
+    round_idx_t = torch.full((B,), -1, dtype=torch.long)
 
     for i, rec in enumerate(batch):
         T_i = len(rec.turn_embeds)
@@ -340,11 +368,14 @@ def pad_collate(batch: list[TurnRDRecord]) -> dict[str, torch.Tensor]:
             progress_signal[i, :T_i] = torch.tensor(
                 rec.progress_signal, dtype=torch.float32
             )
+        if rec.round_idx is not None:
+            round_idx_t[i] = int(rec.round_idx)
 
     out: dict[str, torch.Tensor] = {
         "turn_embeds": turn_embeds,
         "attention_mask": attention_mask,
         "final_reward": final_reward,
+        "round_idx": round_idx_t,
     }
     if judge_labels is not None:
         out["judge_labels"] = judge_labels

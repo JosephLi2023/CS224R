@@ -1,0 +1,152 @@
+{
+  "run": {
+    "name": "TurnRDV2_alfworld_SOTA_10round_mlpr32_v3",
+    "output_dir": "experiments/manifests",
+    "seed": 31
+  },
+  "env": {
+    "name": "alfworld",
+    "max_steps": 40,
+    "observation_mode": "text",
+    "task_split": "train",
+    "use_textworld_intermediate_reward": true,
+    "use_facts_diff_intermediate_reward": true,
+    "env_kwargs": {
+      "config": {
+        "dataset": {
+          "data_path": "$ALFWORLD_DATA/json_2.1.1/train",
+          "eval_id_data_path": "$ALFWORLD_DATA/json_2.1.1/valid_seen",
+          "eval_ood_data_path": "$ALFWORLD_DATA/json_2.1.1/valid_unseen",
+          "num_train_games": 400,
+          "num_eval_games": 50
+        },
+        "env": {
+          "type": "AlfredTWEnv",
+          "regen_game_files": false,
+          "domain_randomization": false,
+          "task_types": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6
+          ],
+          "expert_timeout_steps": 150,
+          "expert_type": "handcoded",
+          "goal_desc_human_anns_prob": 0.0,
+          "hybrid": {
+            "start_eps": 100000,
+            "thor_prob": 0.5,
+            "eval_mode": "tw"
+          }
+        },
+        "general": {
+          "random_seed": 42,
+          "use_cuda": false,
+          "visdom": false,
+          "task": "alfred",
+          "training_method": "dagger",
+          "save_path": "./training/",
+          "observation_pool_capacity": 3,
+          "hide_init_receptacles": false
+        },
+        "controller": {
+          "type": "oracle",
+          "debug": false,
+          "load_receps": false
+        },
+        "logic": {
+          "domain": "$ALFWORLD_DATA/logic/alfred.pddl",
+          "grammar": "$ALFWORLD_DATA/logic/alfred.twl2"
+        },
+        "dagger": {
+          "training": {
+            "max_nb_steps_per_episode": 50
+          },
+          "fraction_assist": {
+            "fraction_assist_anneal_episodes": 0,
+            "fraction_assist_anneal_from": 1.0,
+            "fraction_assist_anneal_to": 0.01
+          },
+          "fraction_random": {
+            "fraction_random_anneal_episodes": 0,
+            "fraction_random_anneal_from": 0.0,
+            "fraction_random_anneal_to": 0.0
+          },
+          "replay": {
+            "replay_memory_capacity": 0,
+            "replay_memory_priority_fraction": 0.0,
+            "update_per_k_game_steps": 1,
+            "replay_batch_size": 1,
+            "multi_step": 1,
+            "replay_sample_history_length": 1,
+            "replay_sample_update_from": 1
+          }
+        }
+      }
+    }
+  },
+  "train": {
+    "algorithm": "hgpo",
+    "total_episodes": 200,
+    "batch_size": 4,
+    "learning_rate": 5e-06,
+    "checkpoint_every": 50,
+    "eval_every": 25,
+    "K_trajectories_per_task": 8,
+    "kl_coeff": 0.04,
+    "clip_eps": 0.2,
+    "grad_accum_steps": 2,
+    "max_tokens_per_microbatch": 1024,
+    "gpu_mem_util": 0.4,
+    "sync_every": 8
+  },
+  "policy": {
+    "backbone": "Qwen2.5-1.5B-Instruct",
+    "lora": true,
+    "lora_target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj",
+      "gate_proj",
+      "up_proj",
+      "down_proj"
+    ],
+    "lora_rank": 32
+  },
+  "hgpo": {
+    "alpha": 0.5,
+    "lambda_consistency": 0.0,
+    "decomposer": "turnrd",
+    "use_v_projection_for_decomposition": true,
+    "v_projection_clamp": 2.0
+  },
+  "turnrd": {
+    "version": "v2",
+    "mode": 1,
+    "layers": 2,
+    "hidden_size": 128,
+    "n_heads": 4,
+    "max_turns": 50,
+    "dropout": 0.1,
+    "causal": false,
+    "progress_prior_strength": 1.0,
+    "refresh_every_episodes": 10,
+    "turnrd_lr": 0.0005,
+    "lambda_value": 1.0,
+    "lambda_rank": 0.1,
+    "lambda_progress": 0.01,
+    "rank_margin": 0.1,
+    "recency_decay_half_life": 4.0,
+    "legacy_decay_weight": 0.5,
+    "min_batch_weight": 0.001,
+    "replay_buffer_path": "/vol/cache/TurnRDV2_alfworld_SOTA_10round_mlpr32_v3/replay.jsonl",
+    "ckpt_path": "/vol/cache/TurnRDV2_alfworld_SOTA_10round_mlpr32_v3/ckpt.pt"
+  },
+  "logging": {
+    "print_every": 10
+  },
+  "_notes": "10-round baseline (v3) of TurnRDV2_alfworld_SOTA_8round_mlpr32. Differences vs v2 (the parallel 8-round fresh run): (a) rounds=10 (intended geometry; orchestrator must launch with --rounds 10), (b) turnrd.recency_decay_half_life=4.0 enables soft per-batch decay so old replay rows are downweighted rather than physically trimmed. Each batch's loss is scaled by mean(0.5 ** ((max_round_idx - round_idx) / 4)), so a row from R0 contributes weight ~0.21 at R9's train_turnrd, ~0.5 at R4's, and ~1.0 at R0's own train_turnrd. Legacy rows (no round_idx — would only appear if the operator pre-seeds the buffer with an older replay) get a fixed weight 0.5. min_batch_weight=1e-3 floors the per-batch multiplier so pure-stale batches still contribute a tiny gradient. (c) env.env_kwargs.config.dataset.num_train_games bumped 200 → 400 so the 800 H-GRPO episodes (10×80) cycle each game ~2× instead of ~4× — counters the saturation contributor identified after v1's late-round dip while keeping the env-pool construction cost manageable (~+5-10 s per Modal container). (d) seed=31 picks a task-id slice [24800, 25600) for rounds=10/eps=80 that is disjoint from v1 (seed=11 -> [5280, 5760)), v2 (seed=23 -> [14720, 15360)), and eval ([6500, 6600)). (e) turnrd.lambda_value bumped 0.5 → 1.0: doubles the weight on the per-turn V-head loss vs the R-prediction + ranking + progress-prior losses. Justification: AlfWorld populates a dense per-turn `progress_signal` via the alfworld_adapter's intermediate_reward reconciliation chain (TextWorld native → facts_diff → expert-plan fallback). With use_facts_diff_intermediate_reward=true on this run, facts-diff fires for every step that newly satisfies a PDDL fluent (often denser than expert-plan-length). The V-head is what drives α-weights via vProjection, so a stronger V-head fit propagates downstream to better credit-assignment. (f) Launcher default TURNRD_EPOCHS bumped 3 → 5: more gradient steps per train_turnrd round. Combined with recency-decay (which reduces the effective dataset size since older rows contribute less), extra epochs ensure the V-head still receives a strong fit signal per round. Adds ~30 s × 10 = ~5 min wall-time. (g) Deliberately NOT enabled: hgpo.lambda_consistency stays at 0.0 (all TurnRDv2 configs keep it off — vProjection already enforces sum-to-R structurally; the consistency loss would mostly regularize per-position normalization noise). Same arch (rank-32 + MLP targets, vProjection, alpha=0.5) and same SFT warm-start so the experimental variables vs v2 are: rounds, decay, num_train_games, lambda_value, TURNRD_EPOCHS."
+}

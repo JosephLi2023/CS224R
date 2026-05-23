@@ -16,6 +16,23 @@ if TYPE_CHECKING:
     from transformers import AutoTokenizer, PreTrainedTokenizer  # noqa: F401  # type: ignore[import-not-found]
 
 
+class LoRAMergeNonFiniteError(RuntimeError):
+    """Raised by `iter_merged_weights` when a merged LoRA weight contains
+    non-finite entries (inf/NaN).
+
+    This is a distinct subclass of `RuntimeError` so callers can catch it
+    by type and escalate (vs. silently swallowing it as a transient
+    per-episode crash). In particular, the per-episode try/except in
+    `infra/app_train_loop.py` re-raises this class to fail the entire
+    round, because a partial vLLM `load_weights` leaves the engine in a
+    half-updated "split-brain" state where the first N layers carry the
+    new (bad) weights and the remaining layers carry stale weights —
+    every subsequent rollout in the round would then run against a
+    corrupted policy. Failing fast lets `app_aggregate_alfworld` skip the
+    round cleanly via the missing-eval-block path.
+    """
+
+
 @dataclass
 class LoRAPolicyConfig:
     model_name: str = "Qwen/Qwen2.5-1.5B-Instruct"
@@ -142,9 +159,17 @@ class LoRAPolicy:
         copies the data into its own buffer, then the tensor is freed
         before the next iteration.
 
-        Memory profile: peak transient ≈ 3× one LoRA target's weight
-        (~18 MB for a Qwen-1.5B q_proj at hidden=1536), instead of the
-        ~3 GB transient of the deepcopy path.
+        Memory profile: per-layer transient peaks around 5–6× one LoRA
+        target's bf16 weight during the fp32-promoted merge expression
+        (intermediate fp32 base + fp32 sum + bf16 downcast all alive
+        briefly), then drops to ~3× across the `yield` (live: fp32
+        `delta` + bf16 `merged` + the shared bf16 base). Concretely for a
+        Qwen-1.5B `down_proj` (8960×1536, ~14M params): ~165 MB peak
+        during the merge expression, ~83 MB held across `yield`. For a
+        q_proj (1536×1536, ~2.4M params): ~28 MB peak, ~14 MB across
+        yield. Compare to the ~3 GB transient of the deepcopy path.
+        Transients are released before the next layer's merge, so the
+        full-sync cost is bounded by ONE layer, not the sum.
         """
         import torch  # type: ignore[import-not-found]
 
@@ -198,9 +223,33 @@ class LoRAPolicy:
                 lora_A = module.lora_A[adapter_name].weight  # [r, in]
                 lora_B = module.lora_B[adapter_name].weight  # [out, r]
                 scaling = float(module.scaling[adapter_name])
-                # delta = (B @ A) * scaling — one tensor of base_weight shape
-                delta = (lora_B @ lora_A) * scaling
-                merged = base_weight + delta
+                # Promote the matmul accumulator + add to fp32 BEFORE casting
+                # back to the base dtype. Mirrors PEFT's own
+                # `get_delta_weight()` and the codebase's fp32 promotion of
+                # logits before log_softmax
+                # (src/algorithms/grpo/trainer.py:363-365). Without this,
+                # rank-32 MLP+attn produces inf/NaN entries after ~10-20 RL
+                # steps because bf16's ~3 mantissa decimals can't represent
+                # (B @ A) * scaling for large LoRA-B entries; vLLM then
+                # silent-copies the bad tensor and the next forward pass
+                # dies as "CUDA illegal memory access" far from the true
+                # site (root cause of the AlfWorld SOTA 8-round R0 crashes
+                # at ep=9/19/21, 2026-05-21).
+                delta = (lora_B.to(torch.float32) @ lora_A.to(torch.float32)) * scaling
+                merged = (base_weight.to(torch.float32) + delta).to(base_weight.dtype)
+                # Finite-check at the true bug site (the LoRA layer), not
+                # at vLLM's async forward. Cheap (~1µs on-GPU); will not
+                # fire post-fp32 promotion for well-behaved weights. If it
+                # DOES fire, the module name + abs-max value tells us
+                # exactly which layer blew up — invaluable diagnostic for
+                # any residual gradient-explosion issue.
+                if not torch.isfinite(merged).all():
+                    raise LoRAMergeNonFiniteError(
+                        f"iter_merged_weights: non-finite merged weight at "
+                        f"{mod_name} (abs-max={float(merged.abs().max())}); "
+                        f"likely LoRA-B gradient explosion — tighten "
+                        f"max_grad_norm or add per-tensor LoRA-B clip."
+                    )
                 # `mod_name` from named_modules() already carries the full
                 # `base_model.model.<...>` PEFT prefix (since `self.model` IS
                 # the wrapped PeftModel). Don't double-prefix here.
@@ -210,7 +259,110 @@ class LoRAPolicy:
                 # next iteration.
 
     def save_adapter(self, path: str) -> None:
-        self.model.save_pretrained(path)
+        """Save the LoRA adapter to `path`.
+
+        Hardened against the R4 CUDA-illegal-memory bug seen during the
+        AlfWorld SOTA 8-round run (TurnRDV2_alfworld_SOTA_8round, 2026-05-20):
+        after 4 carry-policy rounds of merge-then-load LoRA, the default
+        `model.save_pretrained` path crashes at
+            safetensors.torch._tobytes → tensor.to("cpu")
+        with `CUDA error: an illegal memory access was encountered`.
+
+        The crash is async-reported (the real fault happened earlier in the
+        round), so we:
+          1. `torch.cuda.synchronize()` first — surfaces the real op that
+             corrupted CUDA state in the traceback instead of the .to("cpu")
+             at save time. (No effect if CUDA is clean.)
+          2. `torch.cuda.empty_cache()` — releases inactive blocks; can
+             defuse memory pressure that may be feeding the bug.
+          3. Try `model.save_pretrained(path)` first (fast, the normal path).
+          4. On CUDA failure, fall back to manually moving each LoRA
+             parameter to CPU one-by-one with explicit
+             `.detach().cpu().contiguous().clone()` and write a temporary
+             CPU-only PeftModel state_dict via safetensors directly. This
+             bypasses the bulk-tensor `_flatten` call that triggers the bug.
+
+        The fallback is best-effort: if the underlying CUDA context is
+        actually corrupted (not just memory-pressed), the per-tensor copy
+        will also fail and the original exception is re-raised so the
+        orchestrator's crash-detection patch can fail loudly instead of
+        silently cascading to the next round (the bug we hit twice on R5+).
+        """
+        import torch  # local import: torch is heavy and only present in the runtime image
+
+        try:
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        except Exception:
+            # Synchronize itself can raise the deferred CUDA error here —
+            # that's actually the desired diagnostic. Re-raise so the
+            # caller sees the real source.
+            raise
+
+        try:
+            self.model.save_pretrained(path)
+            return
+        except RuntimeError as e:
+            if "CUDA" not in str(e) and "cuda" not in str(e):
+                raise  # not the CUDA-save bug; bubble up untouched
+            print(
+                f"[save_adapter] FAST path failed with CUDA error: {e!r}. "
+                "Falling back to per-tensor CPU copy."
+            )
+
+        # ---- Fallback path: per-tensor manual CPU copy + direct safetensors write
+        import os
+        import json
+        from safetensors.torch import save_file as _st_save_file
+        os.makedirs(path, exist_ok=True)
+
+        # Collect LoRA + trainable params with explicit per-tensor moves.
+        # `.detach().clone().contiguous().cpu()` order matters: detach first
+        # (no grad fn), clone (independent storage so partial fault doesn't
+        # corrupt others), contiguous (safetensors requires it), .cpu() last.
+        cpu_state: dict[str, "torch.Tensor"] = {}
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:  # LoRA-A, LoRA-B, modules_to_save
+                try:
+                    cpu_state[name] = (
+                        param.data.detach().clone().contiguous().cpu()
+                    )
+                except RuntimeError as e:
+                    # If this also fails, the CUDA context is truly cooked.
+                    # Re-raise so the orchestrator gets a clean failure
+                    # instead of writing a half-baked adapter dir.
+                    raise RuntimeError(
+                        f"[save_adapter] fallback per-tensor copy also "
+                        f"failed at param '{name}': {e!r}"
+                    ) from e
+
+        # Persist via safetensors (matches the format PEFT writes).
+        adapter_file = os.path.join(path, "adapter_model.safetensors")
+        _st_save_file(cpu_state, adapter_file)
+
+        # Write adapter_config.json so peft.load_adapter() recognizes the
+        # directory as a LoRA adapter (not an HF Hub repo id — which is
+        # exactly the cascading failure mode that bit R5..R7).
+        # peft writes this via PeftConfig.save_pretrained; we mimic the
+        # JSON-only path here without touching CUDA again.
+        try:
+            self.model.peft_config["default"].save_pretrained(path)
+        except Exception as e:
+            print(
+                f"[save_adapter] WARN: peft_config.save_pretrained failed "
+                f"({e!r}); writing minimal adapter_config.json fallback."
+            )
+            # Minimal fallback so load_adapter doesn't fall back to HF Hub.
+            minimal = {
+                "peft_type": "LORA",
+                "base_model_name_or_path": str(self.cfg.model_name),
+                "r": int(self.cfg.lora_r),
+                "lora_alpha": int(self.cfg.lora_alpha),
+                "target_modules": list(self.cfg.lora_target_modules),
+            }
+            with open(os.path.join(path, "adapter_config.json"), "w") as fh:
+                json.dump(minimal, fh)
+        print(f"[save_adapter] fallback CPU-write succeeded → {path}")
 
     def load_adapter(self, path: str) -> None:
         self.model.load_adapter(path, adapter_name="default")

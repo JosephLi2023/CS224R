@@ -91,6 +91,26 @@ def train_turnrd(
     lambda_rank: float = 0.1,
     lambda_progress: float = 0.01,
     rank_margin: float = 0.1,
+    # Optional replay-buffer **recency decay**. When set to H > 0, each
+    # batch's loss is multiplied by a per-batch scalar equal to the
+    # mean over its records of `0.5 ** ((max_round_idx - round_idx) / H)`,
+    # where `max_round_idx` is the highest `round_idx` present in the
+    # full dataset. Concretely: a record from the current round gets
+    # weight 1.0, one H rounds older gets weight 0.5, one 2H rounds
+    # older gets 0.25, etc. The buffer is NEVER physically trimmed —
+    # stale rows are kept and downweighted, preserving information
+    # while reducing their gradient contribution. Legacy rows missing
+    # `round_idx` (None / -1 sentinel) receive a fixed default weight
+    # of `legacy_decay_weight` so they neither dominate nor disappear.
+    # `None` or a non-positive value disables the decay entirely (every
+    # batch contributes unscaled) — preserves backward compat.
+    recency_decay_half_life: float | None = None,
+    legacy_decay_weight: float = 0.5,
+    # Numerical floor on the per-batch weight so a batch of pure-stale
+    # records still produces a small (but non-zero) gradient. Prevents
+    # the optimizer from no-op'ing on highly-stale batches when the
+    # half-life is aggressive.
+    min_batch_weight: float = 1e-3,
 ) -> dict[str, Any]:
     """Train TurnRD on a replay JSONL.
 
@@ -165,6 +185,44 @@ def train_turnrd(
     else:
         target_device = torch.device(device)
     model.to(target_device)
+
+    # ---- Recency-decay setup --------------------------------------------
+    # Compute `max_round_idx` once over the dataset; reused per batch.
+    # Disabled (decay_half_life=None) means every batch carries unit
+    # weight (no behavior change).
+    decay_half_life: float | None = (
+        float(recency_decay_half_life)
+        if recency_decay_half_life is not None and float(recency_decay_half_life) > 0.0
+        else None
+    )
+    decay_max_round_idx: int | None = None
+    decay_n_with_round_idx = 0
+    decay_n_without_round_idx = 0
+    if decay_half_life is not None:
+        tracked = [r.round_idx for r in dataset if r.round_idx is not None]
+        decay_n_with_round_idx = len(tracked)
+        decay_n_without_round_idx = len(dataset) - decay_n_with_round_idx
+        if tracked:
+            decay_max_round_idx = max(tracked)
+            print(
+                f"[turnrd train] recency-decay enabled: half_life={decay_half_life} "
+                f"rounds, max_round_idx={decay_max_round_idx}, "
+                f"{decay_n_with_round_idx} rows w/ round_idx, "
+                f"{decay_n_without_round_idx} legacy rows (weight={legacy_decay_weight}).",
+                flush=True,
+            )
+        else:
+            # All-legacy buffer: cannot compute a meaningful per-round
+            # weight. Disable the decay path entirely to avoid a misleading
+            # uniform scaling.
+            print(
+                "[turnrd train] recency-decay requested but no rows carry "
+                "`round_idx` (legacy replay buffer); decay disabled.",
+                flush=True,
+            )
+            decay_half_life = None
+    decay_batch_weights: list[float] = []
+    # ---------------------------------------------------------------------
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(lr))
 
@@ -314,6 +372,39 @@ def train_turnrd(
                 loss = loss_mode_2(out, judge_labels, final_reward, attention_mask)
                 cls_loss_v = float(loss.detach().item())
 
+            # ---- Apply recency decay (per-batch scalar) ----------------
+            # When enabled, scale the batch's total loss by the mean
+            # decay weight over its records. Recent rows pull the mean
+            # toward 1.0; old rows pull it toward 0. Legacy rows (no
+            # round_idx) get a fixed `legacy_decay_weight`. Final
+            # multiplier is floored at `min_batch_weight` so a batch of
+            # pure-stale records still contributes a tiny gradient.
+            if decay_half_life is not None and decay_max_round_idx is not None:
+                round_idx_batch = collated["round_idx"].to(target_device)
+                # legacy (-1 sentinel) → use `legacy_decay_weight`; otherwise
+                # 0.5 ** ((max - round_idx) / half_life).
+                legacy_mask = (round_idx_batch < 0)
+                age = (
+                    torch.full_like(round_idx_batch, decay_max_round_idx)
+                    - round_idx_batch
+                ).to(dtype=loss.dtype)
+                # Avoid negative ages (a fresh row in a later round): clamp.
+                age = age.clamp(min=0.0)
+                weights = torch.pow(
+                    torch.tensor(0.5, dtype=loss.dtype, device=target_device),
+                    age / float(decay_half_life),
+                )
+                weights = torch.where(
+                    legacy_mask,
+                    torch.full_like(weights, float(legacy_decay_weight)),
+                    weights,
+                )
+                batch_weight = weights.mean()
+                batch_weight = torch.clamp(batch_weight, min=float(min_batch_weight))
+                decay_batch_weights.append(float(batch_weight.detach().item()))
+                loss = loss * batch_weight
+            # -------------------------------------------------------------
+
             loss.backward()
             optimizer.step()
             n_steps += 1
@@ -350,6 +441,26 @@ def train_turnrd(
         "ckpt_path": saved_ckpt,
         "skipped_records": int(dataset.skipped_empty + dataset.skipped_missing_judge),
         "version": version_norm,
+        "recency_decay": {
+            "half_life": (
+                float(decay_half_life) if decay_half_life is not None else None
+            ),
+            "max_round_idx": decay_max_round_idx,
+            "legacy_decay_weight": float(legacy_decay_weight),
+            "min_batch_weight": float(min_batch_weight),
+            "n_rows_with_round_idx": int(decay_n_with_round_idx),
+            "n_rows_legacy": int(decay_n_without_round_idx),
+            "batch_weight_mean": (
+                float(sum(decay_batch_weights) / len(decay_batch_weights))
+                if decay_batch_weights else None
+            ),
+            "batch_weight_min": (
+                float(min(decay_batch_weights)) if decay_batch_weights else None
+            ),
+            "batch_weight_max": (
+                float(max(decay_batch_weights)) if decay_batch_weights else None
+            ),
+        },
         "final_loss_breakdown": {
             "cls_loss": cls_loss_v,
             "value_loss": value_loss_v,

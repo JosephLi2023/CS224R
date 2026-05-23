@@ -91,6 +91,7 @@ def _train_loop_impl(
     eval_task_id_base: int,
     round_idx: int,
     save_adapter_out: str = "",
+    rollout_temperature: float = 1.0,
 ) -> dict:
     """Env-agnostic training loop body. Both `train_loop_webshop` and
     `train_loop_alfworld` delegate here so the loop body lives in one
@@ -136,7 +137,7 @@ def _train_loop_impl(
         HGPOTrainerConfig,
         progress_decomposer,
     )
-    from src.policy.lora_policy import LoRAPolicy, LoRAPolicyConfig
+    from src.policy.lora_policy import LoRAMergeNonFiniteError, LoRAPolicy, LoRAPolicyConfig
     from src.policy.vllm_runner import SamplingParams, VLLMRunner, VLLMRunnerConfig
 
     adapter_cls, prompt_renderer, action_parser = _resolve_env_bindings(env_name)
@@ -166,7 +167,25 @@ def _train_loop_impl(
     os.makedirs(run_dir, exist_ok=True)
 
     print(">>> Loading LoRAPolicy")
-    policy = LoRAPolicy(LoRAPolicyConfig(cache_dir="/vol/hf_cache"))
+    # Plumb-through of LoRA arch knobs from JSON config.
+    # Without this, policy.lora_rank / policy.lora_target_modules in the
+    # JSON were silently ignored (the dataclass defaults — rank 16,
+    # attention-only — were always used). See plan
+    # alfworld_8round_mlp_rank32_restart.plan.md for context.
+    _lora_kwargs: dict = {}
+    if cfg_dict is not None:
+        _pol = cfg_dict.get("policy") or {}
+        if "lora_rank" in _pol:
+            _r = int(_pol["lora_rank"])
+            _lora_kwargs["lora_r"] = _r
+            # Keep the standard 2:1 alpha:rank convention used by both SFT
+            # and RL paths (matches the dataclass default 16/32).
+            _lora_kwargs["lora_alpha"] = 2 * _r
+        if "lora_target_modules" in _pol and _pol["lora_target_modules"]:
+            _lora_kwargs["lora_target_modules"] = list(_pol["lora_target_modules"])
+        if _lora_kwargs:
+            print(f">>> Applying LoRA arch overrides from config: {_lora_kwargs}")
+    policy = LoRAPolicy(LoRAPolicyConfig(cache_dir="/vol/hf_cache", **_lora_kwargs))
 
     sft_loaded = False
     if sft_adapter:
@@ -174,11 +193,33 @@ def _train_loop_impl(
         policy.load_adapter(sft_adapter)
         sft_loaded = True
 
+    # Pre-vLLM cleanup. Without this, PyTorch's caching allocator
+    # holds ~14 GB after the (base + LoRA + adapter) load, then vLLM's
+    # probe forward at init time can't grow memory above that baseline
+    # → `_assert_memory_footprint_increased_during_profiling` fires.
+    # This was the root cause of the rank-32 MLP+attn R0 crash on the
+    # AlfWorld SOTA 8round (see plan
+    # ~/.llms/plans/alfworld_8round_mlp_rank32_restart.plan.md).
+    # gc + empty_cache releases the unused blocks back to CUDA so the
+    # baseline drops to its true value (~6 GB for base + LoRA).
+    import gc as _gc_pre
+    import torch as _torch_pre
+    _gc_pre.collect()
+    if _torch_pre.cuda.is_available():
+        _torch_pre.cuda.synchronize()
+        _torch_pre.cuda.empty_cache()
+        _mem_alloc = _torch_pre.cuda.memory_allocated() / (1024 ** 3)
+        _mem_reserv = _torch_pre.cuda.memory_reserved() / (1024 ** 3)
+        print(
+            f">>> Pre-vLLM CUDA memory snapshot: "
+            f"allocated={_mem_alloc:.2f} GB, reserved={_mem_reserv:.2f} GB"
+        )
+
     print(">>> Booting VLLMRunner")
     runner = VLLMRunner(
         VLLMRunnerConfig(
             gpu_memory_utilization=gpu_mem_util,
-            max_model_len=4096,
+            max_model_len=2048,
             download_dir="/vol/hf_cache",
             enforce_eager=True,
             seed=0,
@@ -290,6 +331,7 @@ def _train_loop_impl(
             turnrd_emit_path=turnrd_emit_path,
             turnrd_embedder=turnrd_embedder,
             judge_decomposer=judge_decomposer,
+            round_idx=int(round_idx),
         )
     else:
         collector = RolloutCollector(
@@ -312,8 +354,13 @@ def _train_loop_impl(
             ),
         )
 
+    # `rollout_temperature` controls only the K-trajectory rollouts used
+    # for training. Eval (`eval_sampling`, T=0.0) stays greedy regardless.
+    # Default 1.0 preserves the legacy behavior for every existing launcher;
+    # lower values (e.g. 0.7) reduce mode-collapse / dead-K on saturated
+    # policies where K=8 rollouts at T=1.0 often produce all-same outcomes.
     sampling = SamplingParams(
-        n=1, temperature=1.0, top_p=0.95, max_tokens=48,
+        n=1, temperature=rollout_temperature, top_p=0.95, max_tokens=48,
         return_logprobs=True, seed=None,  # fresh sampling each call → diverse K trajectories
     )
 
@@ -426,6 +473,24 @@ def _train_loop_impl(
                 json.dump({"rows": log, "config": _config_snapshot()}, f, indent=2)
             volume.commit()
         except Exception as exc:
+            # LoRA merge produced a non-finite weight → vLLM is now in a
+            # half-updated state (the first N layers carry new fp32-promoted
+            # weights, the remaining layers carry stale weights from the
+            # prior sync). Continuing the loop would run every subsequent
+            # rollout against a split-brain policy, silently corrupting the
+            # round. Re-raise so the round entrypoint exits without writing
+            # the eval block; `app_aggregate_alfworld` then correctly skips
+            # this round via the missing-eval-block path. The assertion
+            # message (with module name + abs-max) reaches the operator
+            # logs verbatim — that's exactly the diagnostic the finite check
+            # was added to produce.
+            if isinstance(exc, LoRAMergeNonFiniteError):
+                print(f"ep={ep} FATAL (LoRA merge): {exc!r}; aborting round.")
+                log.append({"episode": ep, "task_id": task_id, "fatal_error": repr(exc)})
+                with open(os.path.join(run_dir, "train_log.json"), "w") as f:
+                    json.dump({"rows": log, "config": _config_snapshot()}, f, indent=2)
+                volume.commit()
+                raise
             print(f"ep={ep} CRASHED: {exc!r}")
             log.append({"episode": ep, "task_id": task_id, "error": repr(exc)})
             # When an episode crashes mid-step (typical: CUDA OOM
@@ -460,15 +525,132 @@ def _train_loop_impl(
             f">>> Eval pass: {eval_episodes} held-out tasks at offset "
             f"{eval_task_id_base} (greedy sampling)"
         )
-        # Ensure vLLM has the latest trained weights. The training loop
-        # syncs every `sync_every` episodes — if the last episode wasn't
-        # a sync boundary, do one more so eval reflects the final state.
-        if sync_every > 0 and (n_episodes % sync_every) != 0:
-            print(">>> Final weight sync before eval")
-            try:
-                runner.sync_weights(policy.iter_merged_weights())
-            except Exception as exc:  # pragma: no cover
-                print(f">>> WARNING: final weight sync failed: {exc!r}")
+        # FIX #3 (Modal-bug bypass): instead of reusing the train-phase vLLM
+        # instance for eval (which has accumulated state corruption after
+        # ~30+ sync_weights cycles → "CUDA illegal memory access" in
+        # prepare_model_input, seen consistently at K=8 after R4-R5), we:
+        #   1. Shutdown the train-phase vLLM (frees + un-poisons CUDA state)
+        #   2. GC + empty_cache + synchronize (clear cached allocator state)
+        #   3. Save the LoRA adapter to disk (preserves training state) —
+        #      now runs on a clean CUDA context
+        #   4. Merge LoRA into the base on /tmp (yields full HF model)
+        #   5. Boot a FRESH vLLM with the merged model — no sync_weights ever
+        #   6. Run eval on the fresh vLLM
+        # LoRA adapter is preserved on disk → next round's train_loop will
+        # reload it via load_adapter(save_adapter_out) for continued PPO.
+        #
+        # ⚠ ORDERING FIX (2026-05-20, after R4 cascade):
+        # The original FIX #3 ran `save_adapter` BEFORE `runner.shutdown()`.
+        # That is exactly when the bug bites — `.to("cpu")` on adapter
+        # tensors inherits the same poisoned CUDA context that already
+        # killed `prepare_model_input`. We hit this twice on R4 of the
+        # AlfWorld SOTA 8-round run (R0..R3 clean, R4 crashes deterministic-
+        # ally at `safetensors.torch._tobytes → tensor.to("cpu")`). The
+        # save also writes only README.md before crashing, which breaks
+        # peft.load_adapter on the next round with HFValidationError
+        # (path-as-Hub-repo cascade). Solution: shutdown vLLM FIRST, then
+        # save. Adapter save then runs on a fresh CUDA state.
+        # Merge order is preserved: merge_and_unload operates on
+        # policy.model (the PEFT-wrapped HF model), not vLLM, so it works
+        # both before and after shutdown — we keep it AFTER save for the
+        # same atomicity reason as before (save first so the disk-side
+        # adapter is durable even if merge fails).
+        print(">>> [pre-merge] Shutting down train-phase vLLM (FIRST, before save_adapter — un-poisons CUDA)")
+        try:
+            runner.shutdown()
+        except Exception as exc:
+            print(f">>> WARNING: vLLM shutdown raised {exc!r}; proceeding anyway")
+        # Force GC + CUDA cache flush BEFORE we touch CUDA again for save.
+        import gc
+        gc.collect()
+        try:
+            import torch as _torch
+            if _torch.cuda.is_available():
+                _torch.cuda.empty_cache()
+                _torch.cuda.synchronize()
+        except Exception:
+            pass
+        if save_adapter_out:
+            print(f">>> [pre-merge] Saving trained LoRA adapter to {save_adapter_out}")
+            os.makedirs(save_adapter_out, exist_ok=True)
+            policy.save_adapter(save_adapter_out)
+            volume.commit()  # persist to Modal volume so next round can load it
+            adapter_saved_early = True
+        else:
+            adapter_saved_early = False
+        # Merge LoRA into base and save to /tmp/eval_merged for vLLM.
+        # This destroys policy.model's PEFT structure — only safe because
+        # we're done training for this round.
+        import shutil
+        eval_merged_dir = "/tmp/eval_merged"
+        if os.path.exists(eval_merged_dir):
+            shutil.rmtree(eval_merged_dir)
+        os.makedirs(eval_merged_dir, exist_ok=True)
+        print(f">>> [pre-merge] Merging LoRA into base for eval-vLLM (fresh-state bypass)")
+        merged_model = policy.model.merge_and_unload(progressbar=False)
+        merged_model.save_pretrained(eval_merged_dir, safe_serialization=True)
+        policy.tokenizer.save_pretrained(eval_merged_dir)
+        print(f">>> [pre-merge] Merged model saved to {eval_merged_dir}")
+        del merged_model
+        # Another GC + empty_cache before booting the fresh eval vLLM,
+        # since merge_and_unload + save_pretrained materialized a full
+        # merged model on GPU temporarily.
+        gc.collect()
+        # Drop the shut-down train-vLLM reference so its GPU resources can
+        # actually be reclaimed before the new vLLM's profile_run measures
+        # memory. Without this, `runner` (with .llm=None) plus any vLLM
+        # internals not yet GC'd keep tens of GB allocated on the device,
+        # which makes vLLM's profile assertion below trip.
+        runner = None  # type: ignore[assignment]
+        gc.collect()
+        try:
+            import torch as _torch
+            if _torch.cuda.is_available():
+                _torch.cuda.empty_cache()
+                _torch.cuda.synchronize()
+                # vLLM 0.6.3.post1's profile_run trips
+                # `assert peak_memory > 0` (vllm/worker/worker.py:232)
+                # when `torch.cuda.mem_get_info()` reports the same
+                # `free` value before and after the profile-time fake
+                # forward. That happens whenever the fake forward is
+                # satisfied out of cached blocks instead of growing
+                # the device footprint — exactly the state the
+                # allocator ends up in after a vLLM shutdown +
+                # merge_and_unload + save_pretrained sequence. Reset
+                # the peak/accumulated stats and force one real
+                # alloc+free so the next mem_get_info() registers a
+                # non-zero delta.
+                _torch.cuda.reset_peak_memory_stats()
+                _torch.cuda.reset_accumulated_memory_stats()
+                _dummy = _torch.empty(64 * 1024 * 1024, dtype=_torch.uint8, device="cuda")
+                del _dummy
+                _torch.cuda.empty_cache()
+                _torch.cuda.synchronize()
+                _free_b, _total_b = _torch.cuda.mem_get_info()
+                print(
+                    f">>> [pre-merge] post-cleanup CUDA "
+                    f"free={_free_b / 1e9:.2f} GB / "
+                    f"total={_total_b / 1e9:.2f} GB"
+                )
+        except Exception as _exc:
+            print(f">>> [pre-merge] post-cleanup raised {_exc!r}; proceeding anyway")
+        # Boot fresh vLLM with merged model. Uses same config except points
+        # to the merged dir on local disk instead of HF cache.
+        # `num_gpu_blocks_override=8000` bypasses vLLM 0.6.3.post1's
+        # `peak_memory > 0` profile assertion that fires on the
+        # train→eval vLLM handoff (see VLLMRunnerConfig docstring).
+        print(">>> [pre-merge] Booting fresh eval-vLLM with merged weights")
+        runner = VLLMRunner(
+            VLLMRunnerConfig(
+                model_name=eval_merged_dir,
+                gpu_memory_utilization=gpu_mem_util,
+                max_model_len=2048,
+                download_dir="/vol/hf_cache",
+                enforce_eager=True,
+                seed=42,
+                num_gpu_blocks_override=8000,
+            )
+        )
 
         eval_sampling = SamplingParams(
             n=1, temperature=0.0, top_p=1.0, max_tokens=48,
@@ -564,7 +746,11 @@ def _train_loop_impl(
     # re-loading the SFT warm-start. The orchestrator passes this when
     # `--carry-policy-across-rounds` is set; default `""` preserves the
     # legacy behavior (each round resets to SFT).
-    if save_adapter_out:
+    if save_adapter_out and not (eval_episodes > 0):
+        # Only save here if we DIDN'T already save pre-merge above. When
+        # eval_episodes > 0, the pre-merge step already wrote the adapter
+        # to disk and merge_and_unload() has since destroyed policy.model's
+        # PEFT structure, so save_adapter would fail.
         print(f">>> Saving trained LoRA adapter to {save_adapter_out}")
         os.makedirs(save_adapter_out, exist_ok=True)
         policy.save_adapter(save_adapter_out)
@@ -616,6 +802,7 @@ def train_loop_webshop(
     eval_task_id_base: int = 6500,
     round_idx: int = 0,
     save_adapter_out: str = "",
+    rollout_temperature: float = 1.0,
 ) -> dict:
     return _train_loop_impl(
         env_name="webshop",
@@ -628,6 +815,7 @@ def train_loop_webshop(
         eval_episodes=eval_episodes, eval_task_id_base=eval_task_id_base,
         round_idx=round_idx,
         save_adapter_out=save_adapter_out,
+        rollout_temperature=rollout_temperature,
     )
 
 
@@ -654,6 +842,7 @@ def train_loop_alfworld(
     eval_task_id_base: int = 6500,
     round_idx: int = 0,
     save_adapter_out: str = "",
+    rollout_temperature: float = 1.0,
 ) -> dict:
     return _train_loop_impl(
         env_name="alfworld",
@@ -666,6 +855,7 @@ def train_loop_alfworld(
         eval_episodes=eval_episodes, eval_task_id_base=eval_task_id_base,
         round_idx=round_idx,
         save_adapter_out=save_adapter_out,
+        rollout_temperature=rollout_temperature,
     )
 
 
@@ -694,6 +884,7 @@ def main(
     eval_task_id_base: int = 6500,
     round_idx: int = 0,
     save_adapter_out: str = "",
+    rollout_temperature: float = 1.0,
 ) -> None:
     """Local entrypoint: dispatches to the right `@app.function` based
     on `--env-name`. Default `webshop` preserves backward compat with
@@ -724,6 +915,7 @@ def main(
             eval_task_id_base=eval_task_id_base,
             round_idx=round_idx,
             save_adapter_out=save_adapter_out,
+            rollout_temperature=rollout_temperature,
         ),
         indent=2, default=str,
     ))

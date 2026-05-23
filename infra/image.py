@@ -108,7 +108,21 @@ def _make_base_image() -> modal.Image:
 
 def _add_workspace(img: modal.Image) -> modal.Image:
     return (
-        img.env({"PYTHONPATH": "/workspace", "HF_HOME": "/vol/hf_cache"})
+        img.env({
+            "PYTHONPATH": "/workspace",
+            "HF_HOME": "/vol/hf_cache",
+            # Use PyTorch's expandable-segments CUDA caching allocator.
+            # Forces `torch.cuda.mem_get_info()` to reflect actual OS-level
+            # free memory honestly across alloc → empty_cache cycles.
+            # Workaround for vLLM 0.6.3.post1's
+            # `assert peak_memory > 0` (vllm/worker/worker.py:232) which
+            # fires on the train→eval vLLM handoff in
+            # `infra/app_train_loop._train_loop_impl` because the default
+            # caching allocator returns transient profile-run blocks to a
+            # pool that mem_get_info no longer sees as "free" → delta == 0.
+            # See PyTorch 2.4 release notes ("expandable_segments").
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        })
         .add_local_dir(
             local_path=".",
             remote_path="/workspace",

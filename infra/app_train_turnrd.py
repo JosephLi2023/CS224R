@@ -67,6 +67,14 @@ def train_turnrd_run(
     lambda_rank: float = 0.1,
     lambda_progress: float = 0.01,
     rank_margin: float = 0.1,
+    # Optional replay-buffer recency decay (per-batch loss scaling). When
+    # > 0, each batch's loss is multiplied by the mean over its records
+    # of `0.5 ** ((max_round_idx - round_idx) / recency_decay_half_life)`.
+    # 0.0 (default) disables the path and preserves legacy behavior.
+    # See `src.turnrd.train.train_turnrd` for the algorithm + edge cases.
+    recency_decay_half_life: float = 0.0,
+    legacy_decay_weight: float = 0.5,
+    min_batch_weight: float = 1e-3,
     # The producer pre-embeds turns; the standalone trainer doesn't need
     # the LoRA policy. We DO need the embedding width D, which the
     # producer wrote into the replay (we read it off the first record).
@@ -157,6 +165,13 @@ def train_turnrd_run(
         lambda_rank=lambda_rank,
         lambda_progress=lambda_progress,
         rank_margin=rank_margin,
+        recency_decay_half_life=(
+            float(recency_decay_half_life)
+            if float(recency_decay_half_life) > 0.0
+            else None
+        ),
+        legacy_decay_weight=float(legacy_decay_weight),
+        min_batch_weight=float(min_batch_weight),
     )
     elapsed = round(time.time() - t0, 2)
     summary["elapsed_s"] = elapsed
@@ -192,6 +207,9 @@ def main(
     lambda_rank: float = 0.1,
     lambda_progress: float = 0.01,
     rank_margin: float = 0.1,
+    recency_decay_half_life: float = 0.0,
+    legacy_decay_weight: float = 0.5,
+    min_batch_weight: float = 1e-3,
 ) -> None:
     import json as _json
 
@@ -221,6 +239,9 @@ def main(
             lambda_rank=lambda_rank,
             lambda_progress=lambda_progress,
             rank_margin=rank_margin,
+            recency_decay_half_life=recency_decay_half_life,
+            legacy_decay_weight=legacy_decay_weight,
+            min_batch_weight=min_batch_weight,
         ),
         indent=2,
         default=str,

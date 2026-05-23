@@ -101,6 +101,13 @@ class RolloutCollector:
         # records have judge_labels=None which the dataset reader keeps
         # for Mode 1 and drops for Mode 2).
         judge_decomposer: TurnRewardDecomposerLike | None = None,
+        # Round index (0-based) under the orchestrator's protocol. When
+        # set, the value is written into every emitted TurnRD replay row
+        # as `round_idx`, enabling the recency-decay path in
+        # `src.turnrd.train.train_turnrd`. `None` preserves legacy
+        # behavior (rows lack the field; loaders treat them as legacy
+        # and apply a fixed default weight when decay is enabled).
+        round_idx: int | None = None,
     ) -> None:
         """K-trajectory rollout collector.
 
@@ -149,6 +156,9 @@ class RolloutCollector:
             self._turnrd_emit_path.parent.mkdir(parents=True, exist_ok=True)
         self._turnrd_embedder: TurnEmbedder | None = turnrd_embedder
         self._judge_decomposer: TurnRewardDecomposerLike | None = judge_decomposer
+        self._round_idx: int | None = (
+            int(round_idx) if round_idx is not None else None
+        )
 
     def _acquire_envs(self, K: int) -> list[Any]:
         """Return K env instances, growing the pool lazily when reuse is on."""
@@ -417,6 +427,7 @@ class RolloutCollector:
                     judge_labels=judge_labels,
                     progress=progress,
                     progress_signal=progress_signal,
+                    round_idx=self._round_idx,
                 )
                 fh.write(json.dumps(asdict(rec)) + "\n")
                 fh.flush()

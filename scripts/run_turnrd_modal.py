@@ -139,6 +139,13 @@ class OrchestrationConfig:
     #   instead of 8 independent shots from SFT.
     carry_policy_across_rounds: bool = False
     adapter_dir: str = "/vol/checkpoints"
+    # vLLM SamplingParams temperature for the K-trajectory training rollouts
+    # (eval stays greedy at T=0.0). Default 1.0 preserves legacy behavior
+    # for every existing launcher. Lower values (e.g. 0.7) reduce mode-
+    # collapse / dead-K on saturated policies where K=8 rollouts at T=1.0
+    # often produce all-same outcomes (so groups have zero advantage variance
+    # and contribute zero gradient).
+    rollout_temperature: float = 1.0
     extra_turnrd_args: list[str] = field(default_factory=list)
 
     @property
@@ -327,6 +334,18 @@ def _parse_args(argv: Sequence[str]) -> OrchestrationConfig:
              "Default '/vol/checkpoints'.",
     )
     parser.add_argument(
+        "--rollout-temperature",
+        type=float,
+        default=1.0,
+        help="vLLM SamplingParams temperature for the K-trajectory training "
+             "rollouts (eval stays greedy at T=0.0 regardless). Default 1.0 "
+             "preserves the legacy behavior for every existing launcher; "
+             "lower values (e.g. 0.7) reduce mode-collapse / dead-K on "
+             "saturated policies where K=8 rollouts at T=1.0 often produce "
+             "all-same outcomes (so groups have zero advantage variance and "
+             "contribute zero gradient).",
+    )
+    parser.add_argument(
         "--extra-train-loop-args",
         nargs=argparse.REMAINDER,
         default=[],
@@ -356,6 +375,7 @@ def _parse_args(argv: Sequence[str]) -> OrchestrationConfig:
         extra_train_loop_args=list(args.extra_train_loop_args or []),
         carry_policy_across_rounds=bool(args.carry_policy_across_rounds),
         adapter_dir=str(args.adapter_dir),
+        rollout_temperature=float(args.rollout_temperature),
     )
 
 
@@ -516,14 +536,19 @@ def _parse_app_id(modal_run_stdout: str) -> str | None:
 
 
 def _wait_for_app_finish(
-    app_id: str, *, label: str, poll_interval_s: float = 5.0,
-    timeout_s: float = 60 * 60,
+    app_id: str,
+    label: str,
+    poll_interval_s: float = 10.0,
+    timeout_s: float = 3 * 60 * 60,
 ) -> int:
     """Poll `modal app list` until `app_id` leaves the running state.
 
     Returns 0 if the app finished cleanly, non-zero on timeout / unknown
     state. Streams a heartbeat every `poll_interval_s` seconds so the
     user sees progress.
+
+    Default timeout is 3 hours, sufficient for AlfWorld K=8 with 200-eps
+    eval (~70-90 min/round) and WebShop K=8 (~30-40 min/round).
     """
     print(f"   ↻ polling {app_id} ({label})…")
     t0 = time.time()
@@ -580,6 +605,52 @@ def _wait_for_app_finish(
         time.sleep(poll_interval_s)
 
 
+def _has_app_traceback(app_id: str) -> bool:
+    """Best-effort detection of an unhandled exception inside the app.
+
+    Modal marks a function as "stopped" even when its Python process raised
+    — the `_wait_for_app_finish` polling above just checks the lifecycle
+    state and can't tell crashed apart from clean exit. That's exactly the
+    bug that bit the AlfWorld SOTA 8-round run twice: R4's `save_adapter`
+    raised `RuntimeError: CUDA error: an illegal memory access`, but the
+    container exited cleanly so the orchestrator treated R4 as success and
+    cascaded into R5/R6/R7 (each loading a half-written adapter dir and
+    failing identically with `HFValidationError`).
+
+    We grep `modal app logs <app_id>` for a Python traceback. False
+    positives are unlikely — train_loop and train_turnrd don't normally
+    print "Traceback (most recent call last)" on success. False negatives
+    (a non-Python crash or a swallowed exception that still rewrites state)
+    are possible but acceptable; the per-tensor CPU fallback in
+    `save_adapter` is the primary defense.
+
+    Returns True iff a traceback or known cascade-failure signature was
+    found in the cloud-side logs. Returns False on any error fetching the
+    logs (we prefer to NOT block on log fetch issues).
+    """
+    try:
+        res = subprocess.run(
+            ["modal", "app", "logs", app_id],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+    if res.returncode != 0:
+        return False
+    blob = (res.stdout or "") + (res.stderr or "")
+    # Conservative set of crash signatures we know cascade silently.
+    needles = (
+        "Traceback (most recent call last)",
+        "RuntimeError: CUDA error",
+        "HFValidationError",
+        "[save_adapter] fallback per-tensor copy also failed",
+    )
+    return any(n in blob for n in needles)
+
+
 def _train_loop_cmd(cfg: OrchestrationConfig, round_idx: int) -> list[str]:
     """`modal run --detach infra/app_train_loop.py --config <cfg> --n-episodes M ...`
 
@@ -633,6 +704,17 @@ def _train_loop_cmd(cfg: OrchestrationConfig, round_idx: int) -> list[str]:
     gpu_mem_util_cfg = (cfg_json.get("train", {}) or {}).get("gpu_mem_util")
     if gpu_mem_util_cfg is not None:
         cmd.extend(["--gpu-mem-util", str(float(gpu_mem_util_cfg))])
+    # `sync_every` from the JSON's train block. Default in app_train_loop
+    # is 1 (sync vLLM after every episode), which uploads weights on EVERY
+    # episode even when the optimizer didn't step (wasted cycles that
+    # consume vLLM's ~30-sync state-corruption budget per
+    # src/policy/vllm_runner.py). Setting sync_every = K_trajectories_per_task
+    # = 8 aligns syncs to actual optimizer steps and reduces in-round
+    # sync count by 8× — critical for the rank-32 MLP+attn experiment
+    # where larger per-sync payload accelerates the corruption.
+    sync_every_cfg = (cfg_json.get("train", {}) or {}).get("sync_every")
+    if sync_every_cfg is not None:
+        cmd.extend(["--sync-every", str(int(sync_every_cfg))])
     # Adapter routing:
     # - Legacy (carry_policy_across_rounds=False): every round loads the
     #   same `cfg.sft_adapter`, resetting the policy to SFT each round.
@@ -660,6 +742,11 @@ def _train_loop_cmd(cfg: OrchestrationConfig, round_idx: int) -> list[str]:
         cmd.extend(["--sft-adapter", cfg.sft_adapter])
     cmd.extend(["--eval-episodes", str(cfg.eval_episodes)])
     cmd.extend(["--eval-task-id-base", str(cfg.eval_task_id_base)])
+    # Forward `rollout_temperature` to the modal entrypoint. Modal's CLI
+    # auto-derives `--rollout-temperature` from the entrypoint's kwarg, so
+    # no additional plumbing is required on the modal side beyond the
+    # train_loop_{webshop,alfworld} signature exposing the kwarg.
+    cmd.extend(["--rollout-temperature", str(float(cfg.rollout_temperature))])
     cmd.extend(cfg.extra_train_loop_args)
     return cmd
 
@@ -720,6 +807,15 @@ def _train_turnrd_cmd(cfg: OrchestrationConfig) -> list[str]:
         ("--lambda-rank", "lambda_rank", None),
         ("--lambda-progress", "lambda_progress", None),
         ("--rank-margin", "rank_margin", None),
+        # Recency-decay knobs. Forwarded only when present in the JSON's
+        # turnrd block so existing configs without these keys preserve
+        # legacy behavior (decay disabled). When `recency_decay_half_life`
+        # > 0, the standalone trainer's per-batch loss-scaling path
+        # activates; rows from older rounds contribute proportionally
+        # less to each optimizer step instead of being physically dropped.
+        ("--recency-decay-half-life", "recency_decay_half_life", None),
+        ("--legacy-decay-weight", "legacy_decay_weight", None),
+        ("--min-batch-weight", "min_batch_weight", None),
     ]:
         if jkey in turnrd_block:
             cmd.extend([cli, str(turnrd_block[jkey])])
@@ -772,6 +868,22 @@ def _run(cmd: list[str], *, dry_run: bool, label: str) -> int:
         return 0
     t0 = time.time()
     # Phase 1: submit detached. Capture stdout so we can parse the app ID.
+    #
+    # NOTE: We use blocking subprocess.run rather than Popen+SIGTERM
+    # because Modal's --detach mode does NOT actually decouple the
+    # cloud function from the local CLI. The cloud functions in
+    # infra/app_train_loop.py use `.remote()` internally, which Modal
+    # warns "may be canceled when the local caller disconnects."
+    # Killing the local CLI subprocess (e.g. via SIGTERM after parsing
+    # app_id) propagates a cancel to the cloud function — the cloud
+    # app shows up as "stopped" with no work done.
+    #
+    # Proper fix would be in infra/app_*.py: use `.spawn()` + manual
+    # polling for results. That's a separate refactor.
+    #
+    # For now, accept the blocking behavior. The trade-off: if Modal
+    # heartbeat drops mid-call, subprocess.run hangs forever. The
+    # workaround is manual kill + resume from the latest saved adapter.
     submit = subprocess.run(
         cmd, cwd=REPO_ROOT, capture_output=True, text=True
     )
@@ -799,6 +911,21 @@ def _run(cmd: list[str], *, dry_run: bool, label: str) -> int:
     # Phase 2: poll for completion.
     rc = _wait_for_app_finish(app_id, label=label)
     elapsed = round(time.time() - t0, 2)
+    # Phase 3 (added 2026-05-20 after the AlfWorld SOTA R4 cascade):
+    # `_wait_for_app_finish` only checks the lifecycle state, so a crashed
+    # cloud function returns rc=0 just like a clean run. Inspect the cloud
+    # logs for an unhandled traceback / known-bad signature; promote to a
+    # non-zero rc so the orchestration loop aborts instead of silently
+    # marching into the next round (which then fails to load a partial
+    # adapter and cascades).
+    if rc == 0 and _has_app_traceback(app_id):
+        print(
+            f"⚠ {app_id} state=stopped but logs contain a Python traceback "
+            "or known crash signature. Treating this round as FAILED to "
+            "prevent silent cascade. Inspect with:\n"
+            f"   modal app logs {app_id}"
+        )
+        rc = 2  # distinct from timeout (124) and submission failure
     print(f"({label} exited {rc} after {elapsed}s)")
     return rc
 

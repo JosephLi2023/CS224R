@@ -37,6 +37,28 @@ class VLLMRunnerConfig:
     # is never entered. Safe for our workload (K≤8, max_tokens≤48,
     # gpu_memory_utilization≤0.30 leaves >50% GPU headroom for KV).
     swap_space_gib: int = 0
+    # Cap concurrent sequences in vLLM scheduler. Default vLLM = 256.
+    # At K=8 with 40 episodes per round, vLLM's scheduler can put 8+
+    # concurrent sequences in flight, which exposes another flavor of
+    # the same state-corruption bug class: "CUDA error: illegal memory
+    # access" during `prepare_model_input` after multiple rounds. Capping
+    # to 8 (matches our K=8) forces vLLM to serialize batch processing
+    # → reduces concurrent KV cache pressure → bypasses the bug.
+    max_num_seqs: int = 8
+    # Optional hard-override for vLLM's KV-cache block count. When set,
+    # vLLM SKIPS its `determine_num_available_blocks()` memory profile
+    # and uses this number directly. Needed to work around the
+    # vLLM 0.6.3.post1 assertion `peak_memory > 0`
+    # (vllm/worker/worker.py:232) that fires whenever
+    # `torch.cuda.mem_get_info()` reports the same `free` value before
+    # and after the profile-time fake forward — exactly the state the
+    # allocator ends up in when booting a fresh vLLM right after a
+    # shutdown + merge_and_unload + save_pretrained sequence (the
+    # train→eval handoff in `app_train_loop._train_loop_impl`).
+    # Sizing: blocks × 16 tokens/block × ~3.5 KB/token ≈ 56 KB per
+    # block; 8000 blocks = 128k tokens of KV cache, ample for greedy
+    # eval with serial 100-episode rollouts at max_model_len=2048.
+    num_gpu_blocks_override: int | None = None
 
 
 @dataclass
@@ -83,6 +105,8 @@ class VLLMRunner:
             enforce_eager=cfg.enforce_eager,
             download_dir=cfg.download_dir,
             swap_space=cfg.swap_space_gib,
+            max_num_seqs=cfg.max_num_seqs,
+            num_gpu_blocks_override=cfg.num_gpu_blocks_override,
         )
 
     # ------------------------------------------------------------------
@@ -162,6 +186,33 @@ class VLLMRunner:
     # Weight sync
     # ------------------------------------------------------------------
 
+    def shutdown(self) -> None:
+        """Cleanly tear down vLLM to free GPU memory.
+
+        Used by the train_loop orchestrator between train and eval phases:
+        a fresh vLLM instance for eval avoids the state-corruption bugs
+        that accumulate after many `sync_weights` cycles during training
+        (CUDA illegal memory access in `prepare_model_input`, AssertionError
+        in scheduler, etc.).
+        """
+        import gc
+        try:
+            import torch  # type: ignore[import-not-found]
+        except Exception:
+            torch = None  # type: ignore[assignment]
+        try:
+            del self.llm
+        except Exception:
+            pass
+        self.llm = None  # type: ignore[assignment]
+        gc.collect()
+        if torch is not None and torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+
     def sync_weights(self, state_dict) -> dict[str, int]:
         """Push merged-LoRA weights into the running vLLM model.
 
@@ -170,6 +221,22 @@ class VLLMRunner:
         policies can use `iter_merged_weights()` without materializing the
         full merged state-dict in memory (fixes sync_weights OOM at scale).
         """
+        # Surface deferred CUDA errors at the correct site instead of
+        # letting them masquerade as a vLLM `load_weights` bug. CUDA errors
+        # are async-reported: a bad kernel launched several steps ago can
+        # only manifest at the next synchronization point. Forcing a
+        # synchronize here means any latent error is raised with the
+        # `sync_weights` stack (not buried inside vLLM's load_weights copy).
+        # Mirrors the synchronize-first pattern in
+        # `LoRAPolicy.save_adapter` (src/policy/lora_policy.py:244-251).
+        import torch  # type: ignore[import-not-found]
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            # Synchronize itself can raise the deferred CUDA error here —
+            # that's the desired diagnostic. Re-raise so the caller sees
+            # the real source.
+            raise
         worker = self._get_driver_worker()
         model_runner = worker.model_runner  # type: ignore[attr-defined]
         model = model_runner.model
