@@ -382,6 +382,82 @@ def load_jsonl_trajectory(path: str) -> list[dict[str, Any]]:
     return rows
 
 
+def load_sft_examples_from_jsonl(
+    path: str,
+    *,
+    min_reward: float = 0.0,
+) -> list[SFTExample]:
+    """Load pre-rendered SFT examples from a single JSONL file.
+
+    Mirrors `src/datasets/sft_alfworld.py::load_sft_examples_from_jsonl`
+    and is the consumer side of the schema written by
+    `infra/app_webshop_sft_gen.py` (one row per turn):
+
+        {"prompt": str, "action": str, "instruction": str,
+         "step_idx": int, "trajectory_id": str, "final_reward": float}
+
+    Unlike `load_sft_examples_from_directory` (which parses raw
+    upstream WebShop human-trajectory JSONLs and renders prompts at
+    load time), this loader expects rows whose `prompt` is already
+    rendered by the runtime ReAct renderer at gen time — so SFT
+    prompts are byte-identical to the prompts the model sees during
+    GRPO rollouts.
+
+    Args:
+        path: path to the JSONL file.
+        min_reward: drop rows with `final_reward < min_reward`.
+                    Default 0.0 keeps everything.
+
+    Returns:
+        List of SFTExample. Malformed rows (JSON decode failure or
+        missing required keys) are silently skipped — matches the
+        defensive pattern in `load_jsonl_trajectory`.
+    """
+    out: list[SFTExample] = []
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(row, dict):
+                continue
+            prompt = row.get("prompt")
+            action = row.get("action")
+            if not isinstance(prompt, str) or not isinstance(action, str):
+                continue
+            try:
+                final_reward = float(row.get("final_reward", 0.0))
+            except (TypeError, ValueError):
+                final_reward = 0.0
+            if final_reward < min_reward:
+                continue
+            try:
+                step_idx = int(row.get("step_idx", 0))
+            except (TypeError, ValueError):
+                step_idx = 0
+            instruction = row.get("instruction", "")
+            if not isinstance(instruction, str):
+                instruction = ""
+            traj_id = row.get("trajectory_id", "")
+            if not isinstance(traj_id, str):
+                traj_id = str(traj_id)
+            out.append(
+                SFTExample(
+                    prompt=prompt,
+                    action=action,
+                    instruction=instruction,
+                    step_idx=step_idx,
+                    trajectory_id=traj_id,
+                    final_reward=final_reward,
+                )
+            )
+    return out
+
+
 def load_sft_examples_from_directory(
     directory: str,
     *,

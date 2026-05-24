@@ -1,0 +1,55 @@
+{
+  "run": {
+    "name": "flatGRPO_webshop_SOTA_10round_mlpr32_v1",
+    "output_dir": "experiments/manifests",
+    "seed": 23
+  },
+  "env": {
+    "name": "webshop",
+    "max_steps": 15,
+    "observation_mode": "text",
+    "task_split": "train",
+    "use_textworld_intermediate_reward": false,
+    "use_facts_diff_intermediate_reward": false,
+    "use_attribute_progress_intermediate_reward": true,
+    "env_kwargs": {}
+  },
+  "train": {
+    "algorithm": "hgpo",
+    "total_episodes": 200,
+    "batch_size": 4,
+    "learning_rate": 5e-06,
+    "checkpoint_every": 50,
+    "eval_every": 25,
+    "K_trajectories_per_task": 8,
+    "kl_coeff": 0.04,
+    "clip_eps": 0.2,
+    "grad_accum_steps": 2,
+    "max_tokens_per_microbatch": 1024,
+    "gpu_mem_util": 0.4,
+    "sync_every": 8
+  },
+  "policy": {
+    "backbone": "Qwen2.5-1.5B-Instruct",
+    "lora": true,
+    "lora_target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj",
+      "gate_proj",
+      "up_proj",
+      "down_proj"
+    ],
+    "lora_rank": 32
+  },
+  "hgpo": {
+    "alpha": 1.0,
+    "lambda_consistency": 0.0,
+    "decomposer": "progress"
+  },
+  "logging": {
+    "print_every": 10
+  },
+  "_notes": "WebShop Flat GRPO on the AlfWorld SOTA recipe (rank-32 + MLP target modules, K=8, kl=0.04, lr=5e-6, T=1.0 launcher) PLUS the new WebShop-specific dense signal (env.use_attribute_progress_intermediate_reward=true). With hgpo.alpha=1.0 the choice of decomposer is mathematically inert (only the trajectory advantage survives) — decomposer=progress is the parameter-free baseline; turnrd block and vProjection knobs are intentionally dropped. The dense signal still benefits Flat GRPO via the per-turn raw_env_reward field being non-zero on intermediate progress turns (vs all-zeros-then-terminal-spike on Phase 0 WebShop), giving the policy a sharper gradient at trajectory-level. seed=23 (NOT 11) so the train task-id slice is disjoint from the HGPO-Attention run. Launcher: scripts/run_webshop_SOTA_flatGRPO_v1.sh. Plan: webshop_sota_recipe_transplant_dense_signal."
+}

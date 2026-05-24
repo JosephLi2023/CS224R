@@ -1,0 +1,79 @@
+{
+  "run": {
+    "name": "TurnRDV2_webshop_SOTA_10round_mlpr32_v1",
+    "output_dir": "experiments/manifests",
+    "seed": 11
+  },
+  "env": {
+    "name": "webshop",
+    "max_steps": 15,
+    "observation_mode": "text",
+    "task_split": "train",
+    "use_textworld_intermediate_reward": false,
+    "use_facts_diff_intermediate_reward": false,
+    "use_attribute_progress_intermediate_reward": true,
+    "env_kwargs": {}
+  },
+  "train": {
+    "algorithm": "hgpo",
+    "total_episodes": 200,
+    "batch_size": 4,
+    "learning_rate": 5e-06,
+    "checkpoint_every": 50,
+    "eval_every": 25,
+    "K_trajectories_per_task": 8,
+    "kl_coeff": 0.04,
+    "clip_eps": 0.2,
+    "grad_accum_steps": 2,
+    "max_tokens_per_microbatch": 1024,
+    "gpu_mem_util": 0.4,
+    "sync_every": 8
+  },
+  "policy": {
+    "backbone": "Qwen2.5-1.5B-Instruct",
+    "lora": true,
+    "lora_target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj",
+      "gate_proj",
+      "up_proj",
+      "down_proj"
+    ],
+    "lora_rank": 32
+  },
+  "hgpo": {
+    "alpha": 0.5,
+    "lambda_consistency": 0.0,
+    "decomposer": "turnrd",
+    "use_v_projection_for_decomposition": true,
+    "v_projection_clamp": 2.0
+  },
+  "turnrd": {
+    "version": "v2",
+    "mode": 1,
+    "layers": 2,
+    "hidden_size": 128,
+    "n_heads": 4,
+    "max_turns": 16,
+    "dropout": 0.1,
+    "causal": false,
+    "progress_prior_strength": 1.0,
+    "refresh_every_episodes": 10,
+    "turnrd_lr": 0.0005,
+    "lambda_value": 0.5,
+    "lambda_rank": 0.1,
+    "lambda_progress": 0.01,
+    "rank_margin": 0.1,
+    "recency_decay_half_life": 4.0,
+    "legacy_decay_weight": 0.5,
+    "min_batch_weight": 0.001,
+    "replay_buffer_path": "/vol/cache/TurnRDV2_webshop_SOTA_10round_mlpr32_v1/replay.jsonl",
+    "ckpt_path": "/vol/cache/TurnRDV2_webshop_SOTA_10round_mlpr32_v1/ckpt.pt"
+  },
+  "logging": {
+    "print_every": 10
+  },
+  "_notes": "WebShop HGPO-Attention (TurnRDv2) on the AlfWorld SOTA recipe (rank-32 + MLP target modules, K=8, kl=0.04, lr=5e-6, vProjection alpha=0.5, recency-decay half-life=4, T=1.0 launcher) PLUS the new WebShop-specific dense signal (env.use_attribute_progress_intermediate_reward=true). Key WebShop adaptations vs AlfWorld SOTA: max_steps=15 (vs 40), turnrd.max_turns=16 mirrors max_steps, turnrd.lambda_value=0.5 (NOT 1.0 like AlfWorld) because the attribute-progress signal is at most 1/n_attrs per turn vs AlfWorld's denser facts-diff. All other knobs transfer 1:1 from configs/TurnRDV2_alfworld_SOTA_10round_mlpr32_v3.json. Launcher: scripts/run_webshop_SOTA_attention_v1.sh. Plan: webshop_sota_recipe_transplant_dense_signal."
+}

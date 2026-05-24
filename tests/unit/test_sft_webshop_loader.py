@@ -10,6 +10,7 @@ from src.datasets.sft_webshop import (
     _path_segments,
     default_render_prompt,
     load_sft_examples_from_directory,
+    load_sft_examples_from_jsonl,
     summarize_sft_dataset,
     trajectory_to_sft_examples,
 )
@@ -360,3 +361,97 @@ def test_synthesize_sft_target_special_actions():
     assert "Action: click[B0123ABCDE]" in synthesize_sft_target("click[B0123ABCDE]")
     assert "Action: click[Description]" in synthesize_sft_target("click[Description]")
     assert "description" in synthesize_sft_target("click[Description]").lower()
+
+
+# ---- load_sft_examples_from_jsonl (pre-rendered oracle/AlfWorld-style) ----
+
+
+def _write_jsonl(path, rows):
+    with open(path, "w") as fh:
+        for r in rows:
+            fh.write(json.dumps(r) + "\n")
+
+
+def test_load_jsonl_parses_well_formed_rows(tmp_path):
+    """Round-trips the schema written by `infra/app_webshop_sft_gen.py`."""
+    rows = [
+        {"prompt": "P1", "action": "search[red dress]", "instruction": "buy red dress",
+         "step_idx": 0, "trajectory_id": "oracle_000001", "final_reward": 1.0},
+        {"prompt": "P2", "action": "click[B07ABCD123]", "instruction": "buy red dress",
+         "step_idx": 1, "trajectory_id": "oracle_000001", "final_reward": 1.0},
+        {"prompt": "P3", "action": "click[Buy Now]", "instruction": "buy red dress",
+         "step_idx": 2, "trajectory_id": "oracle_000001", "final_reward": 1.0},
+    ]
+    p = tmp_path / "oracle.jsonl"
+    _write_jsonl(p, rows)
+    ex = load_sft_examples_from_jsonl(str(p))
+    assert len(ex) == 3
+    assert [e.action for e in ex] == ["search[red dress]", "click[B07ABCD123]", "click[Buy Now]"]
+    assert [e.step_idx for e in ex] == [0, 1, 2]
+    assert all(e.trajectory_id == "oracle_000001" for e in ex)
+    assert all(e.final_reward == 1.0 for e in ex)
+    summary = summarize_sft_dataset(ex)
+    assert summary["n_examples"] == 3
+    assert summary["n_trajectories"] == 1
+    assert summary["by_action_kind"] == {"search": 1, "click": 2}
+
+
+def test_load_jsonl_min_reward_filter(tmp_path):
+    """`min_reward` drops rows from failed trajectories."""
+    rows = [
+        {"prompt": "P_lose", "action": "search[x]", "instruction": "i", "step_idx": 0,
+         "trajectory_id": "t_lose", "final_reward": 0.2},
+        {"prompt": "P_lose2", "action": "click[Buy Now]", "instruction": "i", "step_idx": 1,
+         "trajectory_id": "t_lose", "final_reward": 0.2},
+        {"prompt": "P_win", "action": "search[y]", "instruction": "i", "step_idx": 0,
+         "trajectory_id": "t_win", "final_reward": 1.0},
+    ]
+    p = tmp_path / "mixed.jsonl"
+    _write_jsonl(p, rows)
+    keep = load_sft_examples_from_jsonl(str(p), min_reward=0.5)
+    assert len(keep) == 1
+    assert keep[0].trajectory_id == "t_win"
+    assert keep[0].action == "search[y]"
+    # Boundary: min_reward=0.0 keeps everything.
+    all_rows = load_sft_examples_from_jsonl(str(p), min_reward=0.0)
+    assert len(all_rows) == 3
+
+
+def test_load_jsonl_handles_malformed_rows(tmp_path):
+    """Malformed lines + rows missing required keys are silently skipped."""
+    p = tmp_path / "noisy.jsonl"
+    with open(p, "w") as fh:
+        # Valid row.
+        fh.write(json.dumps({
+            "prompt": "good", "action": "click[Buy Now]",
+            "instruction": "i", "step_idx": 0, "trajectory_id": "t1",
+            "final_reward": 1.0,
+        }) + "\n")
+        # Blank line — skipped.
+        fh.write("\n")
+        # Not JSON — skipped.
+        fh.write("this is not json{\n")
+        # JSON but not a dict — skipped.
+        fh.write(json.dumps(["array", "not", "dict"]) + "\n")
+        # Missing `prompt` — skipped.
+        fh.write(json.dumps({
+            "action": "search[x]", "step_idx": 0,
+            "trajectory_id": "t2", "final_reward": 1.0,
+        }) + "\n")
+        # Missing `action` — skipped.
+        fh.write(json.dumps({
+            "prompt": "p_only", "step_idx": 0,
+            "trajectory_id": "t3", "final_reward": 1.0,
+        }) + "\n")
+        # Garbage `final_reward` — coerced to 0.0 so still kept under
+        # min_reward=0.0 default.
+        fh.write(json.dumps({
+            "prompt": "p_norew", "action": "click[Next >]",
+            "instruction": "i", "step_idx": 0, "trajectory_id": "t4",
+            "final_reward": "not-a-number",
+        }) + "\n")
+    ex = load_sft_examples_from_jsonl(str(p))
+    # 1 valid + 1 reward-coerced-to-0 = 2.
+    assert len(ex) == 2
+    assert {e.trajectory_id for e in ex} == {"t1", "t4"}
+    assert all(isinstance(e.final_reward, float) for e in ex)

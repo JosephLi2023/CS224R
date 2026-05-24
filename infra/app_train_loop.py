@@ -276,16 +276,35 @@ def _train_loop_impl(
     adapter_use_facts_diff_ir = bool(
         env_block.get("use_facts_diff_intermediate_reward", False)
     )
+    # WebShop dense-signal opt-in (plan
+    # `webshop_sota_recipe_transplant_dense_signal`): synth a per-step
+    # attribute-progress + ASIN-landing intermediate reward from the
+    # upstream env's goal payload, so the V-head sees a non-degenerate
+    # supervision target instead of the all-zeros-then-terminal-spike
+    # raw_env_reward signal. Default False keeps every WebShop run
+    # made before this plan byte-for-byte unchanged. Only threaded into
+    # the WebShop adapter branch below; AlfWorld adapter doesn't accept
+    # this kwarg.
+    adapter_use_attr_progress_ir = bool(
+        env_block.get("use_attribute_progress_intermediate_reward", False)
+    )
 
     def env_factory():
         # Both adapters share the same constructor signature shape
         # (max_steps, observation_mode, task_split, env_kwargs). The
-        # ALFWorld adapter additionally accepts the Phase 2 opt-in
-        # `use_textworld_intermediate_reward` kwarg; WebShop does not.
+        # ALFWorld adapter additionally accepts the Phase 2/3 opt-ins
+        # (`use_textworld_intermediate_reward`,
+        # `use_facts_diff_intermediate_reward`). The WebShop adapter
+        # accepts its own `use_attribute_progress_intermediate_reward`
+        # opt-in. Other adapters take none of these.
         extra_kwargs: dict = {}
         if env_name == "alfworld":
             extra_kwargs["use_textworld_intermediate_reward"] = adapter_use_tw_ir
             extra_kwargs["use_facts_diff_intermediate_reward"] = adapter_use_facts_diff_ir
+        elif env_name == "webshop":
+            extra_kwargs["use_attribute_progress_intermediate_reward"] = (
+                adapter_use_attr_progress_ir
+            )
         return adapter_cls(
             max_steps=adapter_max_steps,
             observation_mode=adapter_obs_mode,

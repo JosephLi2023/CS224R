@@ -1,0 +1,79 @@
+{
+  "run": {
+    "name": "LLMJudge_webshop_SOTA_10round_mlpr32_v1",
+    "output_dir": "experiments/manifests",
+    "seed": 31
+  },
+  "env": {
+    "name": "webshop",
+    "max_steps": 15,
+    "observation_mode": "text",
+    "task_split": "train",
+    "use_textworld_intermediate_reward": false,
+    "use_facts_diff_intermediate_reward": false,
+    "use_attribute_progress_intermediate_reward": true,
+    "env_kwargs": {}
+  },
+  "train": {
+    "algorithm": "hgpo",
+    "total_episodes": 200,
+    "batch_size": 4,
+    "learning_rate": 5e-06,
+    "checkpoint_every": 50,
+    "eval_every": 25,
+    "K_trajectories_per_task": 8,
+    "kl_coeff": 0.04,
+    "clip_eps": 0.2,
+    "grad_accum_steps": 2,
+    "max_tokens_per_microbatch": 1024,
+    "gpu_mem_util": 0.4,
+    "sync_every": 8
+  },
+  "policy": {
+    "backbone": "Qwen2.5-1.5B-Instruct",
+    "lora": true,
+    "lora_target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj",
+      "gate_proj",
+      "up_proj",
+      "down_proj"
+    ],
+    "lora_rank": 32
+  },
+  "hgpo": {
+    "alpha": 0.5,
+    "lambda_consistency": 0.0,
+    "decomposer": "judge"
+  },
+  "judge": {
+    "backend": "openai",
+    "vllm": {
+      "endpoint": "https://REPLACE-WITH-MODAL-URL/score_turns",
+      "model": "qwen2.5-7b-instruct",
+      "timeout_s": 60.0,
+      "max_concurrency": 4,
+      "api_token": ""
+    },
+    "openai": {
+      "model": "gpt-4o-mini",
+      "max_retries": 3,
+      "temperature": 0.0,
+      "timeout_s": 30.0,
+      "max_concurrency": 8
+    },
+    "cache": {
+      "path": "/vol/cache/judge.sqlite"
+    },
+    "limits": {
+      "max_judge_calls_per_run": 5000,
+      "warn_at_calls": 4000
+    }
+  },
+  "logging": {
+    "print_every": 10
+  },
+  "_notes": "WebShop HGPO-LLMJudge on the AlfWorld SOTA recipe (rank-32 + MLP target modules, K=8, kl=0.04, lr=5e-6, T=1.0 launcher) PLUS the new WebShop-specific dense signal (env.use_attribute_progress_intermediate_reward=true). Judge config (backend=openai, gpt-4o-mini, cache=/vol/cache/judge.sqlite, max_judge_calls_per_run=5000) clones configs/LLMJudge.json verbatim — the dedup cache makes subsequent runs mostly cache-hit so the 5000-call budget should easily cover a 10-round 80-eps run. The dense signal is the main beneficiary for the LLM judge path: the judge sees richer per-turn raw_env_reward context (intermediate_reward fills in non-terminal turns), so its preference scoring chain has more signal to attach to. seed=31 (NOT 11 or 23) — disjoint training task slice from the other two methods. Launcher: scripts/run_webshop_SOTA_LLMJudge_v1.sh. Plan: webshop_sota_recipe_transplant_dense_signal."
+}
