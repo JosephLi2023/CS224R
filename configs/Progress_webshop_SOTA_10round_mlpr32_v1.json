@@ -1,0 +1,55 @@
+{
+  "run": {
+    "name": "Progress_webshop_SOTA_10round_mlpr32_v1",
+    "output_dir": "experiments/manifests",
+    "seed": 41
+  },
+  "env": {
+    "name": "webshop",
+    "max_steps": 15,
+    "observation_mode": "text",
+    "task_split": "train",
+    "use_textworld_intermediate_reward": false,
+    "use_facts_diff_intermediate_reward": false,
+    "use_attribute_progress_intermediate_reward": true,
+    "env_kwargs": {}
+  },
+  "train": {
+    "algorithm": "hgpo",
+    "total_episodes": 200,
+    "batch_size": 4,
+    "learning_rate": 5e-06,
+    "checkpoint_every": 50,
+    "eval_every": 25,
+    "K_trajectories_per_task": 8,
+    "kl_coeff": 0.04,
+    "clip_eps": 0.2,
+    "grad_accum_steps": 2,
+    "max_tokens_per_microbatch": 1024,
+    "gpu_mem_util": 0.4,
+    "sync_every": 8
+  },
+  "policy": {
+    "backbone": "Qwen2.5-1.5B-Instruct",
+    "lora": true,
+    "lora_target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj",
+      "gate_proj",
+      "up_proj",
+      "down_proj"
+    ],
+    "lora_rank": 32
+  },
+  "hgpo": {
+    "alpha": 0.5,
+    "lambda_consistency": 0.1,
+    "decomposer": "progress"
+  },
+  "logging": {
+    "print_every": 10
+  },
+  "_notes": "WebShop HGPO-Progress (Method C) on the AlfWorld SOTA recipe (rank-32 + MLP target modules, K=8, kl=0.04, lr=5e-6, T=1.0 launcher) PLUS the new WebShop-specific dense signal (env.use_attribute_progress_intermediate_reward=true). Unlike flatGRPO which sets alpha=1.0 (decomposer mathematically inert; only trajectory-level advantage survives), Progress sets alpha=0.5 so the per-turn signal from the `progress` decomposer (which reads TurnRecord.raw_env_reward — i.e. the populated intermediate_reward field) ACTUALLY CONTRIBUTES to the per-turn advantage. lambda_consistency=0.1 matches the AlfWorld Progress reference (configs/method_hgpo_progress_alfworld.json). With the goal_options + user_sessions adapter fixes landed (verified via infra/app_webshop_sft_gen.py::validate_dense_signal: mean_ir on click_option = 0.0384, Pearson r(cum_IR, final_reward) = 0.9651), Progress is now a real per-turn-supervision baseline for WebShop — it's the parameter-free version of TurnRDv2 (TurnRD learns a model to attribute credit; Progress just uses the raw dense signal as the per-turn credit). seed=41 — disjoint from attention(11), flatGRPO(23), and LLMJudge(31). base_task_id_offset = 41×10×80 = 32800; train range [32800, 33600); eval range [6500, 6600) (disjoint). Launcher: scripts/run_webshop_SOTA_Progress_v1.sh. Plan: webshop_sft_mlpr32_oracle_baseline."
+}

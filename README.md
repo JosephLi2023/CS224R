@@ -32,14 +32,15 @@ bash scripts/run_webshop_sft_v3_mlpr32.sh --full
 # Phase 5: wire the new adapter into the 3 RL launchers
 sed -i '' "s/REPLACE_WITH_TS_FROM_PHASE4/<TS>/g" scripts/run_webshop_SOTA_*.sh
 
-# Phase 6: launch the 3 RL methods in parallel
+# Phase 6: launch the 4 RL methods in parallel
 bash scripts/run_webshop_SOTA_attention_v1.sh
 bash scripts/run_webshop_SOTA_flatGRPO_v1.sh
 bash scripts/run_webshop_SOTA_LLMJudge_v1.sh
+bash scripts/run_webshop_SOTA_Progress_v1.sh
 ```
 
 Total wall-clock: ~10-15 hr Modal + ~30 min local. Total cost:
-~$60-90 (SFT ~$25 + 3 RL methods × ~$20).
+~$75-105 (SFT ~$25 + 4 RL methods × ~$20).
 
 ---
 
@@ -224,16 +225,17 @@ config doesn't match the adapter — halt and re-check Phase 3
 
 ---
 
-## Phase 6 — launch the 3 RL methods (parallel-safe)
+## Phase 6 — launch the 4 RL methods (parallel-safe)
 
 Each launcher backgrounds via `nohup` + writes its own PID/log file.
-The 3 are parallel-safe (disjoint task ranges, disjoint cache dirs,
+All 4 are parallel-safe (disjoint task ranges, disjoint cache dirs,
 disjoint run-name prefixes).
 
 ```bash
 bash scripts/run_webshop_SOTA_attention_v1.sh
 bash scripts/run_webshop_SOTA_flatGRPO_v1.sh
 bash scripts/run_webshop_SOTA_LLMJudge_v1.sh
+bash scripts/run_webshop_SOTA_Progress_v1.sh
 ```
 
 | Launcher        | Recipe                                       | Seed | Train range       | Eval range     | Cost / wall-clock |
@@ -241,6 +243,7 @@ bash scripts/run_webshop_SOTA_LLMJudge_v1.sh
 | attention v1    | TurnRD-V2 (turn-level decomposer), α=0.5     | 11   | [8800, 9600)      | [6500, 6600)   | ~$20 / 3-4 hr     |
 | flatGRPO v1     | Flat GRPO + attribute-progress dense signal  | 23   | [18400, 19200)    | [6500, 6600)   | ~$15 / 2.5-3 hr   |
 | LLMJudge v1     | LLM judge (OpenAI gpt-4o-mini), α=0.5        | 31   | [24800, 25600)    | [6500, 6600)   | ~$25 / 3 hr       |
+| Progress v1     | Method C: decomposer=progress, α=0.5         | 41   | [32800, 33600)    | [6500, 6600)   | ~$15 / 2.5-3 hr   |
 
 Tunable per-launcher (env vars, defaults shown):
 
@@ -291,6 +294,7 @@ scripts/
   run_webshop_SOTA_attention_v1.sh — Phase 6: attention RL launcher
   run_webshop_SOTA_flatGRPO_v1.sh  — Phase 6: flat GRPO RL launcher
   run_webshop_SOTA_LLMJudge_v1.sh  — Phase 6: LLM judge RL launcher
+  run_webshop_SOTA_Progress_v1.sh  — Phase 6: HGPO-Progress RL launcher
 src/datasets/
   sft_webshop.py            — both loaders + ReAct prompt renderer
 src/envs/
@@ -312,7 +316,7 @@ tests/unit/
 | 3: SFT train (6 ep × ~15k ex)    | ~$15-30   | ~3-5 hr         |
 | 4: SFT eval (200 eps)            | ~$3-5     | ~30 min         |
 | 5: R0 smoke × 3 RL configs       | ~$10      | ~30 min         |
-| 6: 3 RL methods × 10 rounds      | ~$60      | ~3-4 hr each    |
+| 6: 4 RL methods × 10 rounds      | ~$75      | ~3-4 hr each    |
 | **Total**                        | **~$90**  | **~6-8 hr**     |
 
 (RL methods run in parallel so wall-clock is bounded by the slowest.)
