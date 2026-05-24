@@ -70,6 +70,14 @@ GRAD_ACCUM=${GRAD_ACCUM:-8}
 MIN_REWARD=${MIN_REWARD:-0.5}
 EVAL_EPS=${EVAL_EPS:-200}
 EVAL_TASK_BASE=${EVAL_TASK_BASE:-6500}
+# LoRA arch knobs (Phase 1 plumb-through, see
+# ~/.llms/plans/alfworld_8round_mlp_rank32_restart.plan.md).
+# Defaults preserve the original v2 baseline (rank-16 attention-only).
+# Override for the rank-32 MLP+attn experiment with:
+#   LORA_RANK=32 LORA_TARGETS=q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj \
+#     bash scripts/run_alfworld_sft_v2.sh --full
+LORA_RANK=${LORA_RANK:-16}
+LORA_TARGETS=${LORA_TARGETS:-q_proj,k_proj,v_proj,o_proj}
 
 RUN_TS=${RUN_TS:-$(date +%Y%m%d_%H%M%S)}
 RUN_NAME=${RUN_NAME:-sft_alfworld_v2_${RUN_TS}}
@@ -131,6 +139,10 @@ echo "  learning_rate      : ${LR}     (v1: 1e-4)"
 echo "  max_seq_len        : ${MAX_SEQ_LEN}     (v1: 1024)"
 echo "  grad_accum         : ${GRAD_ACCUM}        (v1: 4)"
 echo "  min_reward         : ${MIN_REWARD}      (v1: 0.5)"
+echo "  ─── LoRA arch ─────────────────"
+echo "  lora_rank          : ${LORA_RANK}       (default: 16)"
+echo "  lora_target_mods   : ${LORA_TARGETS}"
+echo "                       (default: q_proj,k_proj,v_proj,o_proj)"
 echo "  ─── eval ──────────────────────"
 echo "  eval_episodes      : ${EVAL_EPS}      (v1: 50)"
 echo "  eval_task_id_base  : ${EVAL_TASK_BASE}"
@@ -199,6 +211,8 @@ if [[ "${MODE}" == "--full" || "${MODE}" == "--skip-install" || "${MODE}" == "--
             --grad-accum "${GRAD_ACCUM}" \
             --run-name "${RUN_NAME}" \
             --data-path "${DATA_PATH}" \
+            --lora-rank "${LORA_RANK}" \
+            --lora-target-modules "${LORA_TARGETS}" \
         || exit $?
 fi
 

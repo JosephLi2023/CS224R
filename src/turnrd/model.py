@@ -622,6 +622,7 @@ class TurnRDv2(nn.Module):
                 torch.ones(T, T, dtype=torch.bool, device=h.device),
                 diagonal=1,
             )
+
         h = self.encoder(
             h,
             mask=causal_attn_mask,

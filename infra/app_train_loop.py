@@ -322,6 +322,15 @@ def _train_loop_impl(
         # v6 BUG 2 fix plumbing: tell the trainer which round we're in
         # so the V-baseline annealing schedule can compute β.
         trainer.cfg.v_baseline_round_idx = int(round_idx)
+        # Goal-aware-supervision integration: when the new config flag
+        # is set, the producer emits `goal_text` + `goal_match_signal`
+        # on every record so the per-round `train_turnrd` step can
+        # blend the goal-aware target into the V-head loss (per plan
+        # `turnrd_goalsup_rl_loop_integration`). Default False keeps
+        # all existing runs byte-for-byte unchanged.
+        _emit_goal_text = bool(
+            (cfg_dict.get("turnrd") or {}).get("emit_goal_text", False)
+        )
         collector = RolloutCollector(
             runner=runner,
             env_factory=env_factory,
@@ -332,6 +341,7 @@ def _train_loop_impl(
             turnrd_embedder=turnrd_embedder,
             judge_decomposer=judge_decomposer,
             round_idx=int(round_idx),
+            turnrd_emit_goal_text=_emit_goal_text,
         )
     else:
         collector = RolloutCollector(

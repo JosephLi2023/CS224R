@@ -37,7 +37,7 @@ app = modal.App("cs224r-hgpo-sft-train-alfworld")
 DEFAULT_SFT_DATA_PATH = "/vol/data/alfworld/sft_trajs.jsonl"
 
 
-@app.function(image=image, gpu="A100-80GB", volumes={VOLUME_MOUNT: volume}, timeout=60 * 60)
+@app.function(image=image, gpu="A100-80GB", volumes={VOLUME_MOUNT: volume}, timeout=4 * 60 * 60)
 def sft_train(
     epochs: int = 3,
     learning_rate: float = 1e-4,
@@ -47,6 +47,8 @@ def sft_train(
     log_every: int = 25,
     run_name: str = "sft_alfworld_v1",
     data_path: str = DEFAULT_SFT_DATA_PATH,
+    lora_rank: int = 16,
+    lora_target_modules: str = "q_proj,k_proj,v_proj,o_proj",
 ) -> dict:
     import json
     import os
@@ -82,7 +84,18 @@ def sft_train(
         )
 
     print(">>> Loading LoRAPolicy")
-    policy = LoRAPolicy(LoRAPolicyConfig(cache_dir="/vol/hf_cache"))
+    # LoRA arch knobs propagated from CLI. Defaults preserve v1 behavior
+    # (rank 16, attention-only). The 2:1 alpha:rank convention is kept
+    # in lockstep with the dataclass default (16/32) and the train_loop
+    # plumb-through in infra/app_train_loop.py.
+    _targets = [t.strip() for t in lora_target_modules.split(",") if t.strip()]
+    print(f">>> LoRA arch: rank={lora_rank} target_modules={_targets}")
+    policy = LoRAPolicy(LoRAPolicyConfig(
+        cache_dir="/vol/hf_cache",
+        lora_r=lora_rank,
+        lora_alpha=2 * lora_rank,
+        lora_target_modules=_targets,
+    ))
     tokenizer = policy.tokenizer
 
     print(">>> Tokenizing", len(examples), "examples")
@@ -183,6 +196,8 @@ def sft_train(
             "min_reward": min_reward, "max_seq_len": max_seq_len,
             "grad_accum": grad_accum, "log_every": log_every,
             "run_name": run_name, "data_path": data_path,
+            "lora_rank": lora_rank,
+            "lora_target_modules": _targets,
             "n_truncated_prompts": n_truncated_prompts,
         }, "dataset_summary": summary}, f, indent=2, default=str)
 
@@ -211,11 +226,14 @@ def main(
     log_every: int = 25,
     run_name: str = "sft_alfworld_v1",
     data_path: str = DEFAULT_SFT_DATA_PATH,
+    lora_rank: int = 16,
+    lora_target_modules: str = "q_proj,k_proj,v_proj,o_proj",
 ) -> None:
     import json as _json
     res = sft_train.remote(
         epochs=epochs, learning_rate=learning_rate, min_reward=min_reward,
         max_seq_len=max_seq_len, grad_accum=grad_accum,
         log_every=log_every, run_name=run_name, data_path=data_path,
+        lora_rank=lora_rank, lora_target_modules=lora_target_modules,
     )
     print(_json.dumps(res, indent=2, default=str))

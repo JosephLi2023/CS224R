@@ -111,6 +111,15 @@ def train_turnrd(
     # the optimizer from no-op'ing on highly-stale batches when the
     # half-life is aggressive.
     min_batch_weight: float = 1e-3,
+    # Goal-aware-supervision blend coefficient (plan
+    # `turnrd_goal_aware_supervision`). When > 0 AND the batch carries
+    # both `progress_signal` and `goal_match_signal`, the V-head target
+    # becomes `(1 - β) * progress_signal + β * goal_match_signal`.
+    # β=0 (default) preserves legacy behaviour byte-for-byte. β=1.0
+    # uses goal_match_signal alone (when present). On batches that lack
+    # `goal_match_signal` the blend is skipped (falls back to the
+    # existing preference chain) regardless of β.
+    goal_match_blend: float = 0.0,
 ) -> dict[str, Any]:
     """Train TurnRD on a replay JSONL.
 
@@ -222,6 +231,9 @@ def train_turnrd(
             )
             decay_half_life = None
     decay_batch_weights: list[float] = []
+    # Goal-aware-supervision blend diagnostics.
+    n_batches_with_goal_match: int = 0
+    n_batches_total: int = 0
     # ---------------------------------------------------------------------
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(lr))
@@ -318,6 +330,35 @@ def train_turnrd(
                                 "[turnrd train] v2 value-head target = "
                                 "R/T_i fallback (no `progress` field in "
                                 "batch \u2014 legacy replay buffer).",
+                                flush=True,
+                            )
+                    # ---- Goal-aware-supervision blend ----------------
+                    # When β > 0 AND the batch carries `goal_match_signal`,
+                    # blend it into the baseline target_v computed above:
+                    #   target_v = (1 - β) * target_v + β * goal_match
+                    # When the batch lacks `goal_match_signal` (legacy /
+                    # non-AlfWorld) OR β == 0, the blend is skipped and
+                    # the existing chain stands unchanged. β == 1.0 means
+                    # the goal-match signal fully replaces the baseline
+                    # for those batches.
+                    n_batches_total += 1
+                    if (
+                        float(goal_match_blend) > 0.0
+                        and "goal_match_signal" in collated
+                    ):
+                        beta = float(goal_match_blend)
+                        gm_target = collated["goal_match_signal"].to(
+                            target_device
+                        ).to(dtype=final_reward.dtype) * fmask
+                        target_v = (1.0 - beta) * target_v + beta * gm_target
+                        n_batches_with_goal_match += 1
+                        if not getattr(train_turnrd, "_goal_match_seen", False):
+                            train_turnrd._goal_match_seen = True  # type: ignore[attr-defined]
+                            print(
+                                f"[turnrd train] v2 value-head target = "
+                                f"blend (β={beta:.2f}) of baseline + "
+                                "goal_match_signal "
+                                "(goal_match_signal field present in batch).",
                                 flush=True,
                             )
                     value_loss = loss_v2_value(out, target_v, attention_mask)
@@ -441,6 +482,11 @@ def train_turnrd(
         "ckpt_path": saved_ckpt,
         "skipped_records": int(dataset.skipped_empty + dataset.skipped_missing_judge),
         "version": version_norm,
+        "goal_aware_supervision": {
+            "blend_beta": float(goal_match_blend),
+            "n_batches_with_goal_match": int(n_batches_with_goal_match),
+            "n_batches_total": int(n_batches_total),
+        },
         "recency_decay": {
             "half_life": (
                 float(decay_half_life) if decay_half_life is not None else None

@@ -816,6 +816,11 @@ def _train_turnrd_cmd(cfg: OrchestrationConfig) -> list[str]:
         ("--recency-decay-half-life", "recency_decay_half_life", None),
         ("--legacy-decay-weight", "legacy_decay_weight", None),
         ("--min-batch-weight", "min_batch_weight", None),
+        # Goal-aware-supervision blend coefficient (plan
+        # `turnrd_goalsup_rl_loop_integration`). When > 0 and the
+        # replay carries `goal_match_signal` on every row, the V-head
+        # target becomes (1-β)*progress_signal + β*goal_match_signal.
+        ("--goal-match-blend", "goal_match_blend", None),
     ]:
         if jkey in turnrd_block:
             cmd.extend([cli, str(turnrd_block[jkey])])

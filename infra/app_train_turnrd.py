@@ -75,6 +75,10 @@ def train_turnrd_run(
     recency_decay_half_life: float = 0.0,
     legacy_decay_weight: float = 0.5,
     min_batch_weight: float = 1e-3,
+    # Goal-aware-supervision blend coefficient (plan
+    # `turnrd_goalsup_rl_loop_integration`). 0.0 (default) preserves
+    # legacy behaviour; 0.5 blends progress_signal with goal_match_signal.
+    goal_match_blend: float = 0.0,
     # The producer pre-embeds turns; the standalone trainer doesn't need
     # the LoRA policy. We DO need the embedding width D, which the
     # producer wrote into the replay (we read it off the first record).
@@ -172,6 +176,7 @@ def train_turnrd_run(
         ),
         legacy_decay_weight=float(legacy_decay_weight),
         min_batch_weight=float(min_batch_weight),
+        goal_match_blend=float(goal_match_blend),
     )
     elapsed = round(time.time() - t0, 2)
     summary["elapsed_s"] = elapsed
@@ -210,6 +215,7 @@ def main(
     recency_decay_half_life: float = 0.0,
     legacy_decay_weight: float = 0.5,
     min_batch_weight: float = 1e-3,
+    goal_match_blend: float = 0.0,
 ) -> None:
     import json as _json
 
@@ -242,6 +248,7 @@ def main(
             recency_decay_half_life=recency_decay_half_life,
             legacy_decay_weight=legacy_decay_weight,
             min_batch_weight=min_batch_weight,
+            goal_match_blend=goal_match_blend,
         ),
         indent=2,
         default=str,

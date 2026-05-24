@@ -108,6 +108,16 @@ class RolloutCollector:
         # behavior (rows lack the field; loaders treat them as legacy
         # and apply a fixed default weight when decay is enabled).
         round_idx: int | None = None,
+        # When True (and `turnrd_emit_path` is set), the producer parses
+        # the AlfWorld goal substring from each trajectory's Turn 0
+        # observation (via `src.turnrd.goal_extractor.extract_goal_text`)
+        # and writes it as `goal_text` on the emitted record. Used by the
+        # goal-aware-supervision V-head target generator
+        # (see plan `turnrd_goal_aware_supervision`). No-op (goal_text
+        # stays None) on non-AlfWorld envs or when the Turn 0 obs
+        # doesn't contain the canonical "Your task is to: ..." pattern.
+        # Default False preserves byte-for-byte legacy producer output.
+        turnrd_emit_goal_text: bool = False,
     ) -> None:
         """K-trajectory rollout collector.
 
@@ -159,6 +169,7 @@ class RolloutCollector:
         self._round_idx: int | None = (
             int(round_idx) if round_idx is not None else None
         )
+        self._turnrd_emit_goal_text: bool = bool(turnrd_emit_goal_text)
 
     def _acquire_envs(self, K: int) -> list[Any]:
         """Return K env instances, growing the pool lazily when reuse is on."""
@@ -315,6 +326,24 @@ class RolloutCollector:
         # Local import keeps the collector module torch-free at import time.
         from src.turnrd.dataset import TurnRDRecord  # type: ignore[import-not-found]
 
+        # The goal extractor is pure-Python (no torch / no heavy deps); import
+        # once up front when goal-text emission is enabled, rather than
+        # re-importing for every trajectory in every group.
+        extract_goal_text = None
+        parse_goal_object = None
+        score_action_against_goal = None
+        if self._turnrd_emit_goal_text:
+            from src.turnrd.goal_extractor import (  # type: ignore[import-not-found]
+                extract_goal_text as _extract_goal_text,
+            )
+            from src.turnrd.goal_target import (  # type: ignore[import-not-found]
+                parse_goal_object as _parse_goal_object,
+                score_action_against_goal as _score_action_against_goal,
+            )
+            extract_goal_text = _extract_goal_text
+            parse_goal_object = _parse_goal_object
+            score_action_against_goal = _score_action_against_goal
+
         assert self._turnrd_emit_path is not None  # narrowed
         assert self._turnrd_embedder is not None   # narrowed (validated in __init__)
 
@@ -418,6 +447,43 @@ class RolloutCollector:
                     judge_labels = [float(x) for x in raw]
                 else:
                     judge_labels = None
+                # Goal text (plan `turnrd_goal_aware_supervision`). When
+                # the collector is configured to emit goal text AND the
+                # AlfWorld goal-extractor finds a "Your task is to: ..."
+                # line in the Turn 0 observation, populate `goal_text`.
+                # Otherwise stays None — back-compat for non-AlfWorld
+                # envs and malformed prompts.
+                goal_text_v: str | None = None
+                goal_match_signal_v: list[float] | None = None
+                if (
+                    self._turnrd_emit_goal_text
+                    and extract_goal_text is not None
+                    and traj.turns
+                ):
+                    goal_text_v = extract_goal_text(
+                        traj.turns[0].observation_text or ""
+                    )
+                    # Goal-aware per-turn target (plan
+                    # `turnrd_goal_aware_supervision`). Compute only when
+                    # the goal parsed into a (target, secondary) tuple;
+                    # otherwise leave goal_match_signal as None so the
+                    # trainer's per-batch all-or-nothing gate excludes
+                    # the batch from the goal-blend path cleanly.
+                    if (
+                        goal_text_v is not None
+                        and parse_goal_object is not None
+                        and score_action_against_goal is not None
+                    ):
+                        target_obj, secondary_obj = parse_goal_object(goal_text_v)
+                        if target_obj is not None:
+                            goal_match_signal_v = [
+                                float(score_action_against_goal(
+                                    turn.action_text or "",
+                                    target_obj,
+                                    secondary_obj,
+                                ))
+                                for turn in traj.turns
+                            ]
                 # Round-trip through TurnRDRecord so producer-side schema
                 # bugs surface here, not at the next trainer launch.
                 rec = TurnRDRecord(
@@ -428,6 +494,8 @@ class RolloutCollector:
                     progress=progress,
                     progress_signal=progress_signal,
                     round_idx=self._round_idx,
+                    goal_text=goal_text_v,
+                    goal_match_signal=goal_match_signal_v,
                 )
                 fh.write(json.dumps(asdict(rec)) + "\n")
                 fh.flush()

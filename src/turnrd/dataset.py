@@ -93,6 +93,26 @@ class TurnRDRecord:
     # those rows are dropped when a recency window is requested (treated
     # as "older than any tracked round"), and kept when no window is set.
     round_idx: Optional[int] = None
+    # Optional per-trajectory AlfWorld goal text, populated by the rollout
+    # collector when configured with `turnrd_emit_goal_text=True`. Parsed
+    # from the Turn 0 observation via `src.turnrd.goal_extractor
+    # .extract_goal_text`. None for non-AlfWorld envs (WebShop, FakeWebShop)
+    # and for AlfWorld trajectories whose Turn 0 observation didn't contain
+    # the canonical "Your task is to: ..." pattern. Consumed by the
+    # goal-aware-supervision V-head target generator (see plan
+    # `turnrd_goal_aware_supervision`).
+    goal_text: Optional[str] = None
+    # Optional per-turn goal-aware supervision target in `[0, 1]`. Populated
+    # by the rollout collector when `turnrd_emit_goal_text=True` AND the
+    # goal-target parser succeeds (see
+    # `src.turnrd.goal_target.score_action_against_goal`). When present
+    # and the trainer is configured with `goal_match_blend > 0`, the
+    # V-head target is blended:
+    #   target = (1 - β) · progress_signal + β · goal_match_signal
+    # `None` for non-AlfWorld envs and trajectories whose goal didn't
+    # parse cleanly. All-or-nothing batch gate in `pad_collate` parallel
+    # to `progress_signal`.
+    goal_match_signal: Optional[list[float]] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.task_id, str) or not self.task_id:
@@ -151,6 +171,22 @@ class TurnRDRecord:
             if len(self.progress_signal) != T:
                 raise ValueError(
                     f"TurnRDRecord.progress_signal has length {len(self.progress_signal)}; "
+                    f"expected T={T} (must match turn_embeds)."
+                )
+        if self.goal_text is not None and not isinstance(self.goal_text, str):
+            raise ValueError(
+                f"TurnRDRecord.goal_text must be str or None; "
+                f"got {type(self.goal_text).__name__}."
+            )
+        if self.goal_match_signal is not None:
+            if not isinstance(self.goal_match_signal, list):
+                raise ValueError(
+                    f"TurnRDRecord.goal_match_signal must be list[float] or None; "
+                    f"got {type(self.goal_match_signal).__name__}."
+                )
+            if len(self.goal_match_signal) != T:
+                raise ValueError(
+                    f"TurnRDRecord.goal_match_signal has length {len(self.goal_match_signal)}; "
                     f"expected T={T} (must match turn_embeds)."
                 )
 
@@ -232,6 +268,8 @@ class TurnRDReplayDataset:
                     raw_progress = obj.get("progress", obj.get("raw_env_rewards", None))
                     raw_progress_signal = obj.get("progress_signal", None)
                     raw_round_idx = obj.get("round_idx", None)
+                    raw_goal_text = obj.get("goal_text", None)
+                    raw_goal_match_signal = obj.get("goal_match_signal", None)
                     rec = TurnRDRecord(
                         task_id=str(obj["task_id"]),
                         turn_embeds=turn_embeds,
@@ -249,6 +287,14 @@ class TurnRDReplayDataset:
                         ),
                         round_idx=(
                             int(raw_round_idx) if raw_round_idx is not None else None
+                        ),
+                        goal_text=(
+                            str(raw_goal_text) if raw_goal_text is not None else None
+                        ),
+                        goal_match_signal=(
+                            [float(x) for x in raw_goal_match_signal]
+                            if raw_goal_match_signal is not None
+                            else None
                         ),
                     )
                 except (KeyError, TypeError, ValueError) as e:
@@ -345,6 +391,14 @@ def pad_collate(batch: list[TurnRDRecord]) -> dict[str, torch.Tensor]:
     progress_signal: torch.Tensor | None = (
         torch.zeros(B, T_max, dtype=torch.float32) if have_all_progress_signal else None
     )
+    # Goal-aware per-turn supervision target. Same all-or-nothing semantics
+    # as `progress_signal` so the trainer's `goal_match_blend` path can fire
+    # safely without zero-padding masquerading as a real "this turn didn't
+    # engage the goal" signal. See plan `turnrd_goal_aware_supervision`.
+    have_all_goal_match = all(rec.goal_match_signal is not None for rec in batch)
+    goal_match_signal: torch.Tensor | None = (
+        torch.zeros(B, T_max, dtype=torch.float32) if have_all_goal_match else None
+    )
     # Round index per record (always emitted; -1 sentinel for legacy rows
     # that lack it). The trainer's recency-decay path reads this to
     # compute per-batch loss weights; the all-or-nothing gate is
@@ -368,6 +422,11 @@ def pad_collate(batch: list[TurnRDRecord]) -> dict[str, torch.Tensor]:
             progress_signal[i, :T_i] = torch.tensor(
                 rec.progress_signal, dtype=torch.float32
             )
+        if goal_match_signal is not None:
+            assert rec.goal_match_signal is not None
+            goal_match_signal[i, :T_i] = torch.tensor(
+                rec.goal_match_signal, dtype=torch.float32
+            )
         if rec.round_idx is not None:
             round_idx_t[i] = int(rec.round_idx)
 
@@ -383,4 +442,6 @@ def pad_collate(batch: list[TurnRDRecord]) -> dict[str, torch.Tensor]:
         out["progress"] = progress
     if progress_signal is not None:
         out["progress_signal"] = progress_signal
+    if goal_match_signal is not None:
+        out["goal_match_signal"] = goal_match_signal
     return out
