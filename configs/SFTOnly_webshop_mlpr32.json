@@ -6,7 +6,7 @@
   },
   "env": {
     "name": "webshop",
-    "max_steps": 40,
+    "max_steps": 15,
     "observation_mode": "text",
     "task_split": "train",
     "env_kwargs": {}
