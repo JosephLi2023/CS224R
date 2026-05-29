@@ -47,13 +47,16 @@
 #   RUN_TS=$(date +%Y%m%d_%H%M%S)
 #   RUN_NAME=sft_webshop_v3_mlpr32_${RUN_TS}
 #   DATA_PATH=/vol/data/webshop/oracle_trajs.jsonl
+#   SAVE_EVERY_STEPS=500                # periodic checkpoints on the volume
+#   RESUME_FROM=                        # e.g. /vol/checkpoints/sft_webshop_v3_mlpr32_<ts>
 #   LOG_DIR=/tmp
 #
 # Resume after partial failure
 # ============================
 #   - Install crashed:    re-run --full (install is idempotent on the volume).
 #   - Gen crashed:        re-run --skip-install (gen overwrites the JSONL fresh).
-#   - Train crashed:      re-run --train-only (data file is preserved).
+#   - Train crashed:      RESUME_FROM=/vol/checkpoints/<run>_<ts> bash ... --train-only
+#   - Train finished:     --eval-only ADAPTER_PATH=/vol/checkpoints/<run>_<ts>/latest
 #   - Eval crashed:       re-run --eval-only ADAPTER_PATH=/vol/checkpoints/<run_name>.
 
 set -uo pipefail
@@ -72,6 +75,11 @@ esac
 # ---------- Tunable knobs (env-var overrides) ---------------------------------
 N_SESSIONS=${N_SESSIONS:-2000}
 INCLUDE_HUMAN_TRAJS=${INCLUDE_HUMAN_TRAJS:-true}
+# Modal bool flags: --include-human-trajs / --no-include-human-trajs (no "=true").
+case "${INCLUDE_HUMAN_TRAJS}" in
+    0|false|False|FALSE|no|No|NO) INCLUDE_HUMAN_TRAJS_FLAG=(--no-include-human-trajs) ;;
+    *) INCLUDE_HUMAN_TRAJS_FLAG=(--include-human-trajs) ;;
+esac
 HUMAN_TRAJS_MIN_REWARD=${HUMAN_TRAJS_MIN_REWARD:-0.5}
 MAX_RESULT_PAGES=${MAX_RESULT_PAGES:-5}
 MAX_STEPS_PER_EP=${MAX_STEPS_PER_EP:-25}
@@ -84,6 +92,10 @@ GRAD_ACCUM=${GRAD_ACCUM:-8}
 MIN_REWARD=${MIN_REWARD:-0.5}
 EVAL_EPS=${EVAL_EPS:-200}
 EVAL_TASK_BASE=${EVAL_TASK_BASE:-6500}
+# Must match configs/SFTOnly_webshop_mlpr32.json env.max_steps (and WebShop
+# SOTA RL configs). train_loop_webshop defaults to --max-turns 6 otherwise,
+# which truncates almost every episode before Buy Now (bogus ~0.5% success).
+EVAL_MAX_TURNS=${EVAL_MAX_TURNS:-15}
 
 # LoRA arch knobs. Defaults match the rank-32 + 7-MLP-target recipe used
 # by the 3 WebShop SOTA RL launchers (transplant from AlfWorld SOTA).
@@ -93,6 +105,8 @@ LORA_TARGETS=${LORA_TARGETS:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_
 RUN_TS=${RUN_TS:-$(date +%Y%m%d_%H%M%S)}
 RUN_NAME=${RUN_NAME:-sft_webshop_v3_mlpr32_${RUN_TS}}
 DATA_PATH=${DATA_PATH:-/vol/data/webshop/oracle_trajs.jsonl}
+SAVE_EVERY_STEPS=${SAVE_EVERY_STEPS:-500}
+RESUME_FROM=${RESUME_FROM:-}
 ADAPTER_PATH=${ADAPTER_PATH:-/vol/checkpoints/${RUN_NAME}}
 LOG_DIR=${LOG_DIR:-/tmp}
 LOG_FILE="${LOG_DIR}/sft_webshop_v3_mlpr32_${RUN_TS}.log"
@@ -152,12 +166,15 @@ echo "  learning_rate      : ${LR}"
 echo "  max_seq_len        : ${MAX_SEQ_LEN}"
 echo "  grad_accum         : ${GRAD_ACCUM}"
 echo "  min_reward         : ${MIN_REWARD}"
+echo "  save_every_steps   : ${SAVE_EVERY_STEPS}"
+echo "  resume_from        : ${RESUME_FROM:-<none>}"
 echo "  ─── LoRA arch ─────────────────"
 echo "  lora_rank          : ${LORA_RANK}"
 echo "  lora_target_mods   : ${LORA_TARGETS}"
 echo "  ─── eval ──────────────────────"
 echo "  eval_episodes      : ${EVAL_EPS}"
 echo "  eval_task_id_base  : ${EVAL_TASK_BASE}"
+echo "  eval_max_turns     : ${EVAL_MAX_TURNS}"
 echo "═══════════════════════════════════════════════════════════════════════"
 
 run_step () {
@@ -212,7 +229,7 @@ if [[ "${MODE}" == "--full" || "${MODE}" == "--skip-install" || "${MODE}" == "--
             --max-result-pages "${MAX_RESULT_PAGES}" \
             --max-steps-per-episode "${MAX_STEPS_PER_EP}" \
             --reward-threshold "${REWARD_THRESHOLD}" \
-            --include-human-trajs "${INCLUDE_HUMAN_TRAJS}" \
+            "${INCLUDE_HUMAN_TRAJS_FLAG[@]}" \
             --human-trajs-min-reward "${HUMAN_TRAJS_MIN_REWARD}" \
         || exit $?
 fi
@@ -221,24 +238,36 @@ fi
 if [[ "${MODE}" == "--full" || "${MODE}" == "--skip-install" || "${MODE}" == "--skip-gen" || "${MODE}" == "--train-only" || "${MODE}" == "--dry-run" ]]; then
     echo ""
     echo "═══ Step 3/4: train SFT v3 (${EPOCHS} epochs, lr=${LR}, seq_len=${MAX_SEQ_LEN}) ═══"
-    echo "  Writes adapter to ${ADAPTER_PATH} on the Modal volume."
-    echo "  Wall-clock ~3-5 hr on A100-80GB."
+    echo "  Submits with modal run --detach (remote fn; safe to close laptop)."
+    echo "  Checkpoints every ${SAVE_EVERY_STEPS} steps + each epoch under /vol/checkpoints/<run>_<ts>/."
+    echo "  Wall-clock ~6 hr on A100-80GB for 16.9k examples."
     run_step "step3_train" \
-        modal run --detach infra/app_sft_train.py \
+        modal run --detach infra/app_sft_train.py::sft_train \
             --epochs "${EPOCHS}" \
             --learning-rate "${LR}" \
             --min-reward "${MIN_REWARD}" \
             --max-seq-len "${MAX_SEQ_LEN}" \
             --grad-accum "${GRAD_ACCUM}" \
+            --save-every-steps "${SAVE_EVERY_STEPS}" \
             --run-name "${RUN_NAME}" \
             --data-path "${DATA_PATH}" \
             --lora-rank "${LORA_RANK}" \
             --lora-target-modules "${LORA_TARGETS}" \
+            ${RESUME_FROM:+--resume-from} \
+            ${RESUME_FROM:+"${RESUME_FROM}"} \
         || exit $?
+    echo ""
+    echo "  Train submitted. Monitor: https://modal.com/apps"
+    echo "  After it finishes, list checkpoints:"
+    echo "    modal volume ls cs224r-hgpo-vol /checkpoints | grep ${RUN_NAME}"
+    echo "  Then eval (use the run dir or its latest/ subdir):"
+    echo "    ADAPTER_PATH=/vol/checkpoints/${RUN_NAME}_<ts>/latest \\"
+    echo "      bash scripts/run_webshop_sft_v3_mlpr32.sh --eval-only"
 fi
 
 # ---------- Step 4: eval the new SFT v3 ckpt ----------------------------------
-if [[ "${MODE}" == "--full" || "${MODE}" == "--skip-install" || "${MODE}" == "--skip-gen" || "${MODE}" == "--train-only" || "${MODE}" == "--eval-only" || "${MODE}" == "--dry-run" ]]; then
+# Eval is manual after train finishes (step 3 submits asynchronously).
+if [[ "${MODE}" == "--eval-only" || "${MODE}" == "--dry-run" ]]; then
     echo ""
     echo "═══ Step 4/4: eval SFT v3 on ${EVAL_EPS} held-out sessions ═══"
     echo "  total_episodes=0 in SFTOnly_webshop_mlpr32.json skips RL and goes"
@@ -250,6 +279,7 @@ if [[ "${MODE}" == "--full" || "${MODE}" == "--skip-install" || "${MODE}" == "--
             --n-episodes 0 \
             --eval-episodes "${EVAL_EPS}" \
             --eval-task-id-base "${EVAL_TASK_BASE}" \
+            --max-turns "${EVAL_MAX_TURNS}" \
             --sft-adapter "${ADAPTER_PATH}" \
             --gpu-mem-util 0.30 \
             --run-name "SFTOnly_webshop_mlpr32_eval_${RUN_TS}" \

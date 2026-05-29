@@ -57,6 +57,10 @@ esac
 # ---------- Tunable knobs (env-var overrides; same names as local sibling) ----
 N_SESSIONS=${N_SESSIONS:-2000}
 INCLUDE_HUMAN_TRAJS=${INCLUDE_HUMAN_TRAJS:-true}
+case "${INCLUDE_HUMAN_TRAJS}" in
+    0|false|False|FALSE|no|No|NO) INCLUDE_HUMAN_TRAJS_FLAG=(--no-include-human-trajs) ;;
+    *) INCLUDE_HUMAN_TRAJS_FLAG=(--include-human-trajs) ;;
+esac
 HUMAN_TRAJS_MIN_REWARD=${HUMAN_TRAJS_MIN_REWARD:-0.5}
 MAX_RESULT_PAGES=${MAX_RESULT_PAGES:-5}
 MAX_STEPS_PER_EP=${MAX_STEPS_PER_EP:-25}
@@ -168,7 +172,7 @@ modal run --detach infra/app_orchestrator.py::orchestrate_sft_pipeline \
   --run-name "${RUN_NAME}" \
   --mode "${MODE}" \
   --n-sessions "${N_SESSIONS}" \
-  --include-human-trajs "${INCLUDE_HUMAN_TRAJS}" \
+  "${INCLUDE_HUMAN_TRAJS_FLAG[@]}" \
   --human-trajs-min-reward "${HUMAN_TRAJS_MIN_REWARD}" \
   --max-result-pages "${MAX_RESULT_PAGES}" \
   --max-steps-per-episode "${MAX_STEPS_PER_EP}" \

@@ -685,6 +685,12 @@ def _train_loop_cmd(cfg: OrchestrationConfig, round_idx: int) -> list[str]:
     k_per_task = int(
         (cfg_json.get("train", {}) or {}).get("K_trajectories_per_task", 4)
     )
+    # RolloutCollector uses CLI --max-turns (train_loop_webshop default 6).
+    # When the JSON specifies env.max_steps (WebShop SOTA: 15), forward it so
+    # eval/train rollouts are not truncated at 6 turns.
+    env_block = cfg_json.get("env") if isinstance(cfg_json.get("env"), dict) else {}
+    env_max_steps = env_block.get("max_steps")
+    max_turns_cli: int | None = int(env_max_steps) if env_max_steps is not None else None
 
     cmd = [
         "modal", "run", "--detach",
@@ -698,6 +704,8 @@ def _train_loop_cmd(cfg: OrchestrationConfig, round_idx: int) -> list[str]:
         "--run-name", f"{cfg.effective_run_name_prefix}_round{round_idx:02d}",
         "--round-idx", str(round_idx),
     ]
+    if max_turns_cli is not None:
+        cmd.extend(["--max-turns", str(max_turns_cli)])
     # `gpu_mem_util` from the JSON's train block, when present. This
     # caps vLLM's KV cache so the trainer has enough activation room
     # for grad-tracking forward passes (OOM mitigation).

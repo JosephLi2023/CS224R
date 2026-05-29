@@ -382,18 +382,22 @@ def _oracle_episode(
     return [], reward, "lost"
 
 
+# 1k-product dev split — must match `build_index_1k` + `reset_smoke`.
+WEBSHOP_NUM_PRODUCTS = 1000
+
+
 def _add_local_render_paths():
     """Append the WebShop pyuser site-packages + repo dir to sys.path.
 
-    Needed inside the gen container so `import web_agent_site...`
-    resolves against the editable install dropped by
-    `app_webshop_install.py::pip_install_webshop`.
+    Mirrors `app_webshop_install.py::reset_smoke` so `import web_agent_site`
+    and the volume-resident spaCy model resolve the same way as Phase 0.
     """
     import os
     import sys
 
     pyuser = "/vol/webshop_pyuser"
     repo = "/vol/code/webshop"
+    os.environ["PYTHONUSERBASE"] = pyuser
     if repo not in sys.path:
         sys.path.insert(0, repo)
     pyver = f"python{sys.version_info.major}.{sys.version_info.minor}"
@@ -469,7 +473,7 @@ def generate_sft_trajectories(
         max_steps=max_steps_per_episode,
         observation_mode="text",
         task_split="train",
-        env_kwargs={},
+        env_kwargs={"num_products": WEBSHOP_NUM_PRODUCTS},
     )
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
@@ -691,7 +695,7 @@ def diagnose_oracle(
         max_steps=max_result_pages + 2,
         observation_mode="text",
         task_split="train",
-        env_kwargs={},
+        env_kwargs={"num_products": WEBSHOP_NUM_PRODUCTS},
     )
 
     report: list[dict] = []
@@ -864,7 +868,7 @@ def validate_dense_signal(
         max_steps=max_steps_per_episode,
         observation_mode="text",
         task_split="train",
-        env_kwargs={},
+        env_kwargs={"num_products": WEBSHOP_NUM_PRODUCTS},
         use_attribute_progress_intermediate_reward=True,
     )
 

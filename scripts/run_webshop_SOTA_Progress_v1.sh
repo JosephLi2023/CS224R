@@ -40,12 +40,12 @@ cd "$(dirname "$0")/.."
 # `scripts/run_webshop_sft_v3_mlpr32.sh` (see
 # ~/.llms/plans/webshop_sft_mlpr32_oracle_baseline.plan.md).
 #
-# PLACEHOLDER — replace `REPLACE_WITH_TS_FROM_PHASE4` with the
+# PLACEHOLDER — replace `20260527_083426_20260527_153446` with the
 # timestamp suffix of the actual adapter dir produced by Phase 4,
 # or override at invocation time:
 #   SFT_ADAPTER=/vol/checkpoints/sft_webshop_v3_mlpr32_<ts> \
 #     bash scripts/run_webshop_SOTA_Progress_v1.sh
-SFT_ADAPTER="${SFT_ADAPTER:-/vol/checkpoints/sft_webshop_v3_mlpr32_REPLACE_WITH_TS_FROM_PHASE4}"
+SFT_ADAPTER="${SFT_ADAPTER:-/vol/checkpoints/sft_webshop_v3_mlpr32_20260527_083426_20260527_153446}"
 
 CONFIG=${CONFIG:-configs/Progress_webshop_SOTA_10round_mlpr32_v1.json}
 RUN_PREFIX=${RUN_PREFIX:-webshop_Progress_v1}
@@ -76,15 +76,18 @@ TRAIN_HI=$(( BASE_OFFSET + ROUNDS * EPS_PER_ROUND ))
 # directly in a per-round bash for-loop. This matches the orchestrator's
 # error-message guidance: "non-TurnRD configs should run directly via
 # `modal run infra/app_train_loop.py --config ...`.")
-read -r K_PER_TASK GPU_MEM_UTIL SYNC_EVERY < <(python -c "
-import json, sys
+read -r K_PER_TASK GPU_MEM_UTIL SYNC_EVERY MAX_TURNS_CFG < <(python -c "
+import json
 with open('${CONFIG}') as f: c = json.load(f)
 tr = c.get('train', {}) or {}
+env = c.get('env', {}) or {}
 k = int(tr.get('K_trajectories_per_task', 4))
 gmu = tr.get('gpu_mem_util')
 se = tr.get('sync_every')
-print(k, '' if gmu is None else float(gmu), '' if se is None else int(se))
+ms = int(env.get('max_steps', 15))
+print(k, '' if gmu is None else float(gmu), '' if se is None else int(se), ms)
 ")
+MAX_TURNS=${MAX_TURNS:-${MAX_TURNS_CFG}}
 
 echo "═══════════════════════════════════════════════════════════════════════"
 echo "WebShop SOTA — HGPO-Progress (Method C) v1 (seed=${SEED}, eps=${EPS_PER_ROUND}, T=${ROLLOUT_TEMP})"
@@ -98,6 +101,7 @@ echo "  seed               : ${SEED}"
 echo "  K per task         : ${K_PER_TASK}    (from config)"
 echo "  gpu_mem_util       : ${GPU_MEM_UTIL:-<unset>}    (from config)"
 echo "  sync_every         : ${SYNC_EVERY:-<unset>}    (from config)"
+echo "  max_turns          : ${MAX_TURNS}    (from config env.max_steps; forwarded to train_loop)"
 echo "  rollout temperature: ${ROLLOUT_TEMP}"
 echo "  base_task_id_offset: ${BASE_OFFSET}"
 echo "  train task range   : [${BASE_OFFSET}, ${TRAIN_HI})"
@@ -154,6 +158,7 @@ run_rounds () {
             --save-adapter-out "${save_adapter}"
             --eval-episodes "${EVAL_EPS}"
             --eval-task-id-base "${EVAL_TASK_BASE}"
+            --max-turns "${MAX_TURNS}"
             --rollout-temperature "${ROLLOUT_TEMP}"
         )
         if [[ -n "${GPU_MEM_UTIL}" ]]; then
@@ -187,7 +192,7 @@ EPS_PER_ROUND=${EPS_PER_ROUND} EVAL_EPS=${EVAL_EPS} \
 EVAL_TASK_BASE=${EVAL_TASK_BASE} BASE_OFFSET=${BASE_OFFSET} \
 CONFIG='${CONFIG}' K_PER_TASK='${K_PER_TASK}' \
 GPU_MEM_UTIL='${GPU_MEM_UTIL}' SYNC_EVERY='${SYNC_EVERY}' \
-ROLLOUT_TEMP='${ROLLOUT_TEMP}' \
+MAX_TURNS='${MAX_TURNS}' ROLLOUT_TEMP='${ROLLOUT_TEMP}' \
 run_rounds
 " > "$LOG" 2>&1 < /dev/null &
 ORCH_PID=$!

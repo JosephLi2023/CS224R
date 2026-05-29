@@ -6,12 +6,16 @@ from src.envs.webshop_adapter import WebShopAdapter
 
 
 class _FakeWebShopEnv:
-    def __init__(self) -> None:
+    def __init__(self, n_goals: int = 0) -> None:
         self.last_action = None
+        self.session = None
+        if n_goals > 0:
+            self.server = type("Server", (), {"goals": [{}] * n_goals})()
 
-    def reset(self):
+    def reset(self, session=None, **_kwargs):
+        self.session = session
         return (
-            {"obs": "initial page"},
+            {"obs": f"initial page session={session}"},
             {"valid_actions": ["search[laptop]", "click[item_1]"]},
         )
 
@@ -26,8 +30,12 @@ class _FakeWebShopEnv:
 
 
 class _TestableWebShopAdapter(WebShopAdapter):
+    def __init__(self, *args, n_goals: int = 0, **kwargs) -> None:
+        self._n_goals = n_goals
+        super().__init__(*args, **kwargs)
+
     def _build_webshop_env(self):
-        return _FakeWebShopEnv()
+        return _FakeWebShopEnv(n_goals=self._n_goals)
 
 
 class TestWebShopAdapter(unittest.TestCase):
@@ -36,7 +44,7 @@ class TestWebShopAdapter(unittest.TestCase):
 
         state = adapter.reset()
 
-        self.assertEqual(state.observation_text, "initial page")
+        self.assertIn("initial page", state.observation_text)
         self.assertEqual(state.valid_actions, ["search[laptop]", "click[item_1]"])
         self.assertEqual(state.step_index, 0)
 
@@ -61,6 +69,13 @@ class TestWebShopAdapter(unittest.TestCase):
 
         self.assertTrue(done)
         self.assertTrue(info["timeout"])
+
+    def test_reset_task_id_wraps_modulo_goal_pool(self) -> None:
+        """Large per-seed offsets (e.g. 32800) must not IndexError upstream."""
+        adapter = _TestableWebShopAdapter(max_steps=3, n_goals=6910)
+        state = adapter.reset(task_id=32800)
+        self.assertEqual(adapter._last_session, 32800 % 6910)
+        self.assertIn(f"session={adapter._last_session}", state.observation_text)
 
     def test_index_action_without_valid_actions_raises(self) -> None:
         class _NoActionEnv(_FakeWebShopEnv):

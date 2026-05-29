@@ -1,14 +1,19 @@
 """Modal A100 app: SFT warm-start of Qwen2.5-1.5B + LoRA on WebShop human trajectories.
 
-  modal run --detach infra/app_sft_train.py --epochs 3 --min-reward 0.5
+  # Fire-and-forget (keeps running after local CLI exits):
+  modal run --detach infra/app_sft_train.py::sft_train --epochs 6 --run-name my_run ...
+
+  # Block until finished (local terminal streams logs):
+  modal run infra/app_sft_train.py::main --wait --epochs 6 ...
+
+  # Resume after a partial run:
+  modal run --detach infra/app_sft_train.py::sft_train \
+      --resume-from /vol/checkpoints/my_run_<ts> ...
 
 Tokenizes (prompt, action) SFT examples loaded via src.datasets.sft_webshop,
 runs masked cross-entropy (only action tokens contribute to the loss),
-saves the LoRA adapter to /vol/checkpoints/<run_name>_<ts>/. The adapter
-can then be loaded by infra/app_train_loop.py via
-LoRAPolicy.load_adapter(...) to seed GRPO with a non-trivial init.
-
-Cost: ~$0.50 for 3 epochs over ~745 examples on A100.
+saves the LoRA adapter to /vol/checkpoints/<run_name>_<ts>/ with periodic
+checkpoints under step_*/epoch_*/latest/.
 """
 from __future__ import annotations
 
@@ -19,16 +24,10 @@ from infra.image import image
 
 app = modal.App("cs224r-hgpo-sft-train")
 
-
-# Legacy default data path. Directory of upstream WebShop gdown human
-# trajectories — consumed by `load_sft_examples_from_directory`. The
-# new oracle-gen single-JSONL path is
-# `/vol/data/webshop/oracle_trajs.jsonl`; dispatch happens on suffix
-# in the loader site below.
 DEFAULT_SFT_DATA_PATH = "/vol/data/webshop/human_trajs"
 
 
-@app.function(image=image, gpu="A100-80GB", volumes={VOLUME_MOUNT: volume}, timeout=4 * 60 * 60)
+@app.function(image=image, gpu="A100-80GB", volumes={VOLUME_MOUNT: volume}, timeout=8 * 60 * 60)
 def sft_train(
     epochs: int = 3,
     learning_rate: float = 1e-4,
@@ -36,10 +35,12 @@ def sft_train(
     max_seq_len: int = 1024,
     grad_accum: int = 4,
     log_every: int = 25,
+    save_every_steps: int = 500,
     run_name: str = "sft_v1",
     data_path: str = DEFAULT_SFT_DATA_PATH,
     lora_rank: int = 16,
     lora_target_modules: str = "q_proj,k_proj,v_proj,o_proj",
+    resume_from: str = "",
 ) -> dict:
     import json
     import os
@@ -60,26 +61,85 @@ def sft_train(
     )
     from src.policy.lora_policy import LoRAPolicy, LoRAPolicyConfig
 
+    def _write_json(path: str, obj: dict) -> None:
+        with open(path, "w") as f:
+            json.dump(obj, f, indent=2, default=str)
+
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     ckpt_dir = f"/vol/checkpoints/{run_name}_{timestamp}"
+    start_epoch = 0
+    global_step = 0
+    micro = 0
+    adapter_path = ""
+
+    if resume_from.strip():
+        resume_from = resume_from.strip().rstrip("/")
+        base = os.path.basename(resume_from)
+        if base in {"latest",} or base.startswith(("step_", "epoch_")):
+            ckpt_dir = os.path.dirname(resume_from)
+            adapter_path = resume_from
+        else:
+            ckpt_dir = resume_from
+            adapter_path = os.path.join(ckpt_dir, "latest")
+            if not os.path.isdir(adapter_path):
+                adapter_path = ckpt_dir
+        state_path = os.path.join(ckpt_dir, "training_state.json")
+        if not os.path.isfile(state_path):
+            raise FileNotFoundError(
+                f"No training_state.json under {ckpt_dir}; cannot resume."
+            )
+        with open(state_path) as f:
+            train_state = json.load(f)
+        start_epoch = int(train_state.get("epoch", 0))
+        if train_state.get("epoch_finished"):
+            start_epoch += 1
+        global_step = int(train_state.get("global_step", 0))
+        micro = int(train_state.get("micro", 0))
+        run_name = str(train_state.get("run_name", run_name))
+        print(
+            f">>> Resuming from {adapter_path} "
+            f"(epoch {start_epoch}/{epochs}, step {global_step})"
+        )
+    else:
+        train_state = {
+            "run_name": run_name,
+            "ckpt_dir": ckpt_dir,
+            "created_at": timestamp,
+            "epoch": 0,
+            "global_step": 0,
+            "micro": 0,
+            "epoch_finished": False,
+            "epochs_total": epochs,
+            "last_checkpoint": None,
+        }
+
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    # Dispatch loader on the data path's suffix. A single `.jsonl` file
-    # is the AlfWorld-style pre-rendered format produced by the new
-    # `infra/app_webshop_sft_gen.py` oracle generator; a directory is
-    # the legacy upstream-gdown human-trajs layout consumed by
-    # `load_sft_examples_from_directory`. Default keeps legacy behavior
-    # byte-identical when `--data-path` is not passed.
+    def _persist_checkpoint(tag: str, *, epoch_finished: bool) -> None:
+        nonlocal train_state, epoch, global_step, micro
+        train_state["epoch"] = epoch
+        train_state["global_step"] = global_step
+        train_state["micro"] = micro
+        train_state["epoch_finished"] = epoch_finished
+        train_state["last_checkpoint"] = tag
+        for sub in (tag, "latest"):
+            subdir = os.path.join(ckpt_dir, sub)
+            os.makedirs(subdir, exist_ok=True)
+            policy.save_adapter(subdir)
+        _write_json(os.path.join(ckpt_dir, "training_state.json"), train_state)
+        _write_json(
+            os.path.join(ckpt_dir, "train_log.json"),
+            {"rows": log, "config": train_config, "dataset_summary": summary},
+        )
+        print(f">>> Checkpoint saved: {os.path.join(ckpt_dir, tag)}/ (+ latest/)")
+        volume.commit()
+
     print(">>> Loading SFT dataset (min_reward=", min_reward,
           ", data_path=", data_path, ")")
     if data_path.endswith(".jsonl"):
-        examples = load_sft_examples_from_jsonl(
-            data_path, min_reward=min_reward
-        )
+        examples = load_sft_examples_from_jsonl(data_path, min_reward=min_reward)
     else:
-        examples = load_sft_examples_from_directory(
-            data_path, min_reward=min_reward
-        )
+        examples = load_sft_examples_from_directory(data_path, min_reward=min_reward)
     summary = summarize_sft_dataset(examples)
     print(">>> Dataset summary:", summary)
     if not examples:
@@ -89,12 +149,6 @@ def sft_train(
             "successful trajectories. Try lowering --min-reward."
         )
 
-    # LoRA arch knobs propagated from CLI. Defaults preserve v1
-    # behavior (rank 16, attention-only). The 2:1 alpha:rank convention
-    # is kept in lockstep with `infra/app_sft_train_alfworld.py` so the
-    # two trainers stay binary-compatible against the same
-    # `LoRAPolicyConfig` dataclass defaults (16/32) and the
-    # `infra/app_train_loop.py` plumb-through.
     _targets = [t.strip() for t in lora_target_modules.split(",") if t.strip()]
     print(f">>> LoRA arch: rank={lora_rank} target_modules={_targets}")
     policy = LoRAPolicy(LoRAPolicyConfig(
@@ -103,6 +157,8 @@ def sft_train(
         lora_alpha=2 * lora_rank,
         lora_target_modules=_targets,
     ))
+    if resume_from.strip():
+        policy.load_adapter(adapter_path)
     tokenizer = policy.tokenizer
 
     print(">>> Tokenizing", len(examples), "examples")
@@ -110,9 +166,6 @@ def sft_train(
     n_truncated_prompts = 0
     for ex in examples:
         prompt_ids = tokenizer(ex.prompt, add_special_tokens=False).input_ids
-        # Target is the full ReAct emission ` <thought>\nAction: <body>` so
-        # the SFT model learns to produce Thought + Action together — the
-        # exact format the runtime ReAct loop expects.
         target_str = synthesize_sft_target(ex.action) + tokenizer.eos_token
         action_ids = tokenizer(target_str, add_special_tokens=False).input_ids
         if len(prompt_ids) + len(action_ids) > max_seq_len:
@@ -125,21 +178,42 @@ def sft_train(
         })
     if n_truncated_prompts:
         print(f">>> WARNING: {n_truncated_prompts}/{len(rows)} prompts were "
-              f"left-truncated to fit max_seq_len={max_seq_len}. WebShop "
-              "item-page observations grow with option count; if this "
-              "is >10% bump --max-seq-len to 2048.")
+              f"left-truncated to fit max_seq_len={max_seq_len}.")
 
     trainable = list(policy.trainable_parameters())
     optimizer = torch.optim.AdamW(trainable, lr=learning_rate)
     device = next(policy.model.parameters()).device
 
     log: list[dict] = []
+    if resume_from.strip():
+        log_path = os.path.join(ckpt_dir, "train_log.json")
+        if os.path.isfile(log_path):
+            with open(log_path) as f:
+                log = json.load(f).get("rows", [])
+    train_config = {
+        "epochs": epochs,
+        "learning_rate": learning_rate,
+        "min_reward": min_reward,
+        "max_seq_len": max_seq_len,
+        "grad_accum": grad_accum,
+        "log_every": log_every,
+        "save_every_steps": save_every_steps,
+        "run_name": run_name,
+        "data_path": data_path,
+        "lora_rank": lora_rank,
+        "lora_target_modules": _targets,
+        "resume_from": resume_from.strip() or None,
+    }
     t0 = time.time()
-    global_step = 0
-    micro = 0
     optimizer.zero_grad(set_to_none=True)
 
-    for epoch in range(epochs):
+    if start_epoch >= epochs:
+        print(f">>> Already completed {epochs} epochs; saving final manifest.")
+        policy.save_adapter(ckpt_dir)
+        volume.commit()
+        return {"ckpt_dir": ckpt_dir, "global_steps": global_step, "resumed": True}
+
+    for epoch in range(start_epoch, epochs):
         order = torch.randperm(len(rows)).tolist()
         ep_loss_sum, ep_tok_sum = 0.0, 0
         for ri in order:
@@ -180,14 +254,27 @@ def sft_train(
                         f"gn={row_log['grad_norm']:.3f} "
                         f"t={row_log['elapsed_s']}s"
                     )
+                if (
+                    save_every_steps > 0
+                    and global_step > 0
+                    and global_step % save_every_steps == 0
+                ):
+                    _persist_checkpoint(
+                        f"step_{global_step:05d}",
+                        epoch_finished=False,
+                    )
             ep_loss_sum += float(loss.detach().item()) * n_tok
             ep_tok_sum += n_tok
 
         per_tok = ep_loss_sum / max(1, ep_tok_sum)
         print(f">>> END epoch={epoch} per_token_ce={per_tok:.4f}")
-        log.append({"epoch": epoch, "epoch_summary": True,
-                    "per_token_ce": round(per_tok, 4),
-                    "n_action_tokens": ep_tok_sum})
+        log.append({
+            "epoch": epoch,
+            "epoch_summary": True,
+            "per_token_ce": round(per_tok, 4),
+            "n_action_tokens": ep_tok_sum,
+        })
+        _persist_checkpoint(f"epoch_{epoch}", epoch_finished=True)
 
     if micro % grad_accum != 0:
         torch.nn.utils.clip_grad_norm_(trainable, 1.0)
@@ -195,27 +282,29 @@ def sft_train(
         optimizer.zero_grad(set_to_none=True)
         global_step += 1
 
-    print(">>> Saving adapter to", ckpt_dir)
+    print(">>> Saving final adapter to", ckpt_dir)
     policy.save_adapter(ckpt_dir)
-    with open(os.path.join(ckpt_dir, "train_log.json"), "w") as f:
-        json.dump({"rows": log, "config": {
-            "epochs": epochs, "learning_rate": learning_rate,
-            "min_reward": min_reward, "max_seq_len": max_seq_len,
-            "grad_accum": grad_accum, "log_every": log_every,
-            "run_name": run_name, "data_path": data_path,
-            "lora_rank": lora_rank,
-            "lora_target_modules": _targets,
-            "n_truncated_prompts": n_truncated_prompts,
-        }, "dataset_summary": summary}, f, indent=2, default=str)
+    train_state["epoch"] = epochs
+    train_state["global_step"] = global_step
+    train_state["epoch_finished"] = True
+    train_state["last_checkpoint"] = "final"
+    train_config["n_truncated_prompts"] = n_truncated_prompts
+    _write_json(os.path.join(ckpt_dir, "training_state.json"), train_state)
+    _write_json(
+        os.path.join(ckpt_dir, "train_log.json"),
+        {"rows": log, "config": train_config, "dataset_summary": summary},
+    )
 
     final = {
         "ckpt_dir": ckpt_dir,
+        "latest_checkpoint": os.path.join(ckpt_dir, "latest"),
         "n_examples": len(rows),
         "epochs": epochs,
         "global_steps": global_step,
         "final_log_row": log[-1] if log else None,
         "total_elapsed_s": round(time.time() - t0, 1),
         "n_truncated_prompts": n_truncated_prompts,
+        "resumed": bool(resume_from.strip()),
     }
     with open(os.path.join(ckpt_dir, "summary.json"), "w") as f:
         json.dump(final, f, indent=2, default=str)
@@ -231,16 +320,40 @@ def main(
     max_seq_len: int = 1024,
     grad_accum: int = 4,
     log_every: int = 25,
+    save_every_steps: int = 500,
     run_name: str = "sft_v1",
     data_path: str = DEFAULT_SFT_DATA_PATH,
     lora_rank: int = 16,
     lora_target_modules: str = "q_proj,k_proj,v_proj,o_proj",
+    resume_from: str = "",
+    wait: bool = False,
 ) -> None:
+    """Local entrypoint. Prefer `modal run --detach ...::sft_train` for long jobs."""
     import json as _json
-    res = sft_train.remote(
-        epochs=epochs, learning_rate=learning_rate, min_reward=min_reward,
-        max_seq_len=max_seq_len, grad_accum=grad_accum,
-        log_every=log_every, run_name=run_name, data_path=data_path,
-        lora_rank=lora_rank, lora_target_modules=lora_target_modules,
+
+    kwargs = dict(
+        epochs=epochs,
+        learning_rate=learning_rate,
+        min_reward=min_reward,
+        max_seq_len=max_seq_len,
+        grad_accum=grad_accum,
+        log_every=log_every,
+        save_every_steps=save_every_steps,
+        run_name=run_name,
+        data_path=data_path,
+        lora_rank=lora_rank,
+        lora_target_modules=lora_target_modules,
+        resume_from=resume_from,
     )
-    print(_json.dumps(res, indent=2, default=str))
+    if wait:
+        res = sft_train.remote(**kwargs)
+        print(_json.dumps(res, indent=2, default=str))
+        return
+
+    call = sft_train.spawn(**kwargs)
+    print(_json.dumps({
+        "submitted": True,
+        "function_call_id": call.object_id,
+        "run_name": run_name,
+        "hint": "Use: modal run --detach infra/app_sft_train.py::sft_train ...",
+    }, indent=2))

@@ -25,7 +25,7 @@ cd "$(dirname "$0")/.."
 # `scripts/run_webshop_sft_v3_mlpr32.sh` (see
 # ~/.llms/plans/webshop_sft_mlpr32_oracle_baseline.plan.md).
 #
-# PLACEHOLDER — replace `REPLACE_WITH_TS_FROM_PHASE4` with the
+# PLACEHOLDER — replace `20260527_083426_20260527_153446` with the
 # timestamp suffix of the actual adapter dir produced by Phase 4
 # (look at the `ckpt_dir` field printed at the end of the SFT
 # train step's Modal log; format: YYYYMMDD_HHMMSS).
@@ -38,7 +38,7 @@ cd "$(dirname "$0")/.."
 # is left in place AND no env override is supplied; we DO NOT default
 # to the legacy path because doing so would silently revert to the
 # rank-16 → rank-32 arch mismatch the new SFT was created to fix.
-SFT_ADAPTER="${SFT_ADAPTER:-/vol/checkpoints/sft_webshop_v3_mlpr32_REPLACE_WITH_TS_FROM_PHASE4}"
+SFT_ADAPTER="${SFT_ADAPTER:-/vol/checkpoints/sft_webshop_v3_mlpr32_20260527_083426_20260527_153446}"
 
 CONFIG=${CONFIG:-configs/TurnRDV2_webshop_SOTA_10round_mlpr32_v1.json}
 RUN_PREFIX=${RUN_PREFIX:-webshop_attention_v1}

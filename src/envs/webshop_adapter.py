@@ -302,8 +302,36 @@ class WebShopAdapter:
         # the orchestrator log: warn once per process if the upstream
         # env doesn't expose the goal attrs we expected.
         self._introspect_warning_emitted: bool = False
+        # Last resolved upstream `session` index after `reset(task_id=...)`.
+        self._last_session: int | None = None
 
         self._env = self._build_webshop_env()
+
+    def _goal_pool_len(self) -> int:
+        """Number of WebShop goals/sessions, when introspectable.
+
+        Upstream `web_agent_text_env` holds ~6910 goals at
+        `num_products=1000`. Per-seed training offsets from the SOTA
+        launchers (e.g. seed×rounds×eps=32800) exceed that pool unless
+        we wrap — see `_select_session`.
+        """
+        env = self._env
+        for holder in (getattr(env, "server", None), env):
+            if holder is None:
+                continue
+            goals = getattr(holder, "goals", None)
+            if isinstance(goals, list):
+                return len(goals)
+            if isinstance(goals, dict):
+                return len(goals)
+        return 0
+
+    def _select_session(self, task_id: int) -> int:
+        """Map collector `task_id` → valid upstream `session` index."""
+        n = self._goal_pool_len()
+        if n > 0:
+            return int(task_id) % n
+        return int(task_id)
 
     def _build_webshop_env(self):
         """
@@ -318,9 +346,13 @@ class WebShopAdapter:
 
             module = import_module("web_agent_site.envs.web_agent_text_env")
             env_cls = getattr(module, "WebAgentTextEnv")
+            kwargs = dict(self.env_kwargs)
+            # Upstream `init_search_engine` maps 1000 → indexes_1k; None →
+            # indexes (full split), which we don't build on the Modal volume.
+            kwargs.setdefault("num_products", 1000)
             return env_cls(
                 observation_mode=self.observation_mode,
-                **self.env_kwargs,
+                **kwargs,
             )
         except Exception as exc:  # pragma: no cover - depends on install
             import_error = exc
@@ -411,8 +443,8 @@ class WebShopAdapter:
         kwarg (which seeds goal selection); absorbs other unknown kwargs."""
         self._steps = 0
         if "task_id" in kwargs:
-            session = kwargs.pop("task_id")
-            kwargs.setdefault("session", session)
+            self._last_session = self._select_session(int(kwargs.pop("task_id")))
+            kwargs.setdefault("session", self._last_session)
         raw_obs, raw_info = self._normalize_reset(self._env.reset(**kwargs))
 
         # Dense-signal: snapshot target attrs + asin AFTER reset() so

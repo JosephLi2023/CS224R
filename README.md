@@ -129,8 +129,8 @@ What it does (defaults in parentheses):
 | `--full`         | Run all 4 steps (default).                                  |
 | `--skip-install` | Phase 0 already done.                                       |
 | `--skip-gen`     | JSONL already exists at `DATA_PATH`.                        |
-| `--train-only`   | Only step 3.                                                |
-| `--eval-only`    | Only step 4 (requires `ADAPTER_PATH=/vol/checkpoints/...`). |
+| `--train-only`   | Submit step 3 only (returns immediately; no eval).            |
+| `--eval-only`    | Only step 4 (`ADAPTER_PATH=/vol/checkpoints/<run>_<ts>/latest`). |
 
 ### Tunable env-var knobs (defaults shown)
 
@@ -142,6 +142,8 @@ LORA_RANK=32  LORA_TARGETS=q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_pr
 RUN_TS=$(date +%Y%m%d_%H%M%S)
 RUN_NAME=sft_webshop_v3_mlpr32_${RUN_TS}
 DATA_PATH=/vol/data/webshop/oracle_trajs.jsonl
+SAVE_EVERY_STEPS=500
+RESUME_FROM=/vol/checkpoints/sft_webshop_v3_mlpr32_<ts>   # optional resume
 ```
 
 ### Resume after partial failure
@@ -150,8 +152,9 @@ DATA_PATH=/vol/data/webshop/oracle_trajs.jsonl
 |--------------------|------------------------------------------------------------|
 | Install            | `--full` (install is idempotent).                          |
 | Gen mid-way        | `--skip-install` (gen overwrites the JSONL fresh).         |
-| Train              | `--train-only` (data file is preserved).                   |
-| Eval               | `--eval-only ADAPTER_PATH=/vol/checkpoints/<run_name>`.    |
+| Train (partial)    | `RESUME_FROM=/vol/checkpoints/<run>_<ts> bash ... --train-only` |
+| Train (finished)   | `--eval-only ADAPTER_PATH=/vol/checkpoints/<run>_<ts>/latest` |
+| Eval               | `--eval-only ADAPTER_PATH=/vol/checkpoints/<run>_<ts>/latest` |
 
 ### Sanity gates (block Phase 5-6 if any fail)
 

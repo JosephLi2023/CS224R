@@ -1,0 +1,16 @@
+{
+  "run_dir": "/vol/manifests/webshop_Progress_v1_seed41_round09_20260528_073307",
+  "env_name": "webshop",
+  "n_episodes": 80,
+  "K": 8,
+  "completed_episodes": 80,
+  "total_elapsed_s": 2096.96,
+  "mean_reward_first_10pct": 0.5876,
+  "mean_reward_last_10pct": 0.7954,
+  "mean_grad_norm": 0.0365,
+  "mean_kl_coef_final": 0.0001,
+  "log_path": "/vol/manifests/webshop_Progress_v1_seed41_round09_20260528_073307/train_log.json",
+  "eval_avg_return": 0.7961,
+  "eval_pct_success": 0.88,
+  "eval_n_episodes_ok": 100
+}

@@ -515,6 +515,12 @@ def main() -> None:
              "filter independently.",
     )
     ap.add_argument(
+        "--title",
+        type=str,
+        default="TurnRD Per-Turn Credit Assignment",
+        help="Section title in the generated LaTeX document.",
+    )
+    ap.add_argument(
         "--failure-diversify", action="store_true",
         help="Pick failures with diverse fatal-turn positions (early / "
              "mid / late give-up patterns) instead of top-N by "
@@ -591,9 +597,7 @@ def main() -> None:
     parts.extend(color_defs)
     if not args.snippet_only:
         parts.append(r"\begin{document}")
-    parts.append(
-        r"\section*{TurnRD Per-Turn Credit Assignment --- v3 R9 Policy}"
-    )
+    parts.append(r"\section*{" + _latex_escape(args.title, 500) + "}")
     parts.append(
         r"\noindent{\small\textit{Greedy K=1 rollouts on AlfWorld held-out "
         r"tasks. Each turn shows the observation on the first line and the "

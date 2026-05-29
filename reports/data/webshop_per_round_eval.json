@@ -1,0 +1,250 @@
+{
+  "Attention (TurnRD)": [
+    {
+      "round": 0,
+      "pct_success": 0.66,
+      "avg_R": 0.622,
+      "manifest": "manifests/webshop_attention_v1_seed11_round00_20260528_001843"
+    },
+    {
+      "round": 1,
+      "pct_success": 0.75,
+      "avg_R": 0.7052,
+      "manifest": "manifests/webshop_attention_v1_seed11_round01_20260528_011111"
+    },
+    {
+      "round": 2,
+      "pct_success": 0.78,
+      "avg_R": 0.7231,
+      "manifest": "manifests/webshop_attention_v1_seed11_round02_20260528_020749"
+    },
+    {
+      "round": 3,
+      "pct_success": 0.78,
+      "avg_R": 0.7051,
+      "manifest": "manifests/webshop_attention_v1_seed11_round03_20260528_031122"
+    },
+    {
+      "round": 4,
+      "pct_success": 0.8,
+      "avg_R": 0.6865,
+      "manifest": "manifests/webshop_attention_v1_seed11_round04_20260528_035643"
+    },
+    {
+      "round": 5,
+      "pct_success": 0.79,
+      "avg_R": 0.7217,
+      "manifest": "manifests/webshop_attention_v1_seed11_round05_20260528_045527"
+    },
+    {
+      "round": 6,
+      "pct_success": 0.82,
+      "avg_R": 0.7478,
+      "manifest": "manifests/webshop_attention_v1_seed11_round06_20260528_053836"
+    },
+    {
+      "round": 7,
+      "pct_success": 0.85,
+      "avg_R": 0.7318,
+      "manifest": "manifests/webshop_attention_v1_seed11_round07_20260528_065617"
+    },
+    {
+      "round": 8,
+      "pct_success": 0.8,
+      "avg_R": 0.7183,
+      "manifest": "manifests/webshop_attention_v1_seed11_round08_20260528_073908"
+    },
+    {
+      "round": 9,
+      "pct_success": 0.8,
+      "avg_R": 0.7261,
+      "manifest": "manifests/webshop_attention_v1_seed11_round09_20260528_084745"
+    }
+  ],
+  "flatGRPO": [
+    {
+      "round": 0,
+      "pct_success": 0.69,
+      "avg_R": 0.6497,
+      "manifest": "manifests/webshop_flatGRPO_v1_seed23_round00_20260528_001845"
+    },
+    {
+      "round": 1,
+      "pct_success": 0.73,
+      "avg_R": 0.6785,
+      "manifest": "manifests/webshop_flatGRPO_v1_seed23_round01_20260528_012206"
+    },
+    {
+      "round": 2,
+      "pct_success": 0.74,
+      "avg_R": 0.6914,
+      "manifest": "manifests/webshop_flatGRPO_v1_seed23_round02_20260528_020139"
+    },
+    {
+      "round": 3,
+      "pct_success": 0.78,
+      "avg_R": 0.7173,
+      "manifest": "manifests/webshop_flatGRPO_v1_seed23_round03_20260528_024428"
+    },
+    {
+      "round": 4,
+      "pct_success": 0.8,
+      "avg_R": 0.7397,
+      "manifest": "manifests/webshop_flatGRPO_v1_seed23_round04_20260528_032315"
+    },
+    {
+      "round": 5,
+      "pct_success": 0.76,
+      "avg_R": 0.7284,
+      "manifest": "manifests/webshop_flatGRPO_v1_seed23_round05_20260528_040608"
+    },
+    {
+      "round": 6,
+      "pct_success": 0.79,
+      "avg_R": 0.7426,
+      "manifest": "manifests/webshop_flatGRPO_v1_seed23_round06_20260528_050306"
+    },
+    {
+      "round": 7,
+      "pct_success": 0.81,
+      "avg_R": 0.7488,
+      "manifest": "manifests/webshop_flatGRPO_v1_seed23_round07_20260528_060733"
+    },
+    {
+      "round": 8,
+      "pct_success": 0.84,
+      "avg_R": 0.7697,
+      "manifest": "manifests/webshop_flatGRPO_v1_seed23_round08_20260528_064316"
+    },
+    {
+      "round": 9,
+      "pct_success": 0.81,
+      "avg_R": 0.7566,
+      "manifest": "manifests/webshop_flatGRPO_v1_seed23_round09_20260528_071512"
+    }
+  ],
+  "LLM Judge": [
+    {
+      "round": 0,
+      "pct_success": 0.73,
+      "avg_R": 0.6884,
+      "manifest": "manifests/webshop_LLMJudge_v1_seed31_round00_20260528_001852"
+    },
+    {
+      "round": 1,
+      "pct_success": 0.76,
+      "avg_R": 0.711,
+      "manifest": "manifests/webshop_LLMJudge_v1_seed31_round01_20260528_055918"
+    },
+    {
+      "round": 2,
+      "pct_success": 0.84,
+      "avg_R": 0.7566,
+      "manifest": "manifests/webshop_LLMJudge_v1_seed31_round02_20260528_071247"
+    },
+    {
+      "round": 3,
+      "pct_success": 0.82,
+      "avg_R": 0.7574,
+      "manifest": "manifests/webshop_LLMJudge_v1_seed31_round03_20260528_082926"
+    },
+    {
+      "round": 4,
+      "pct_success": 0.83,
+      "avg_R": 0.7579,
+      "manifest": "manifests/webshop_LLMJudge_v1_seed31_round04_20260528_095529"
+    },
+    {
+      "round": 5,
+      "pct_success": 0.84,
+      "avg_R": 0.7514,
+      "manifest": "manifests/webshop_LLMJudge_v1_seed31_round05_20260528_110628"
+    },
+    {
+      "round": 6,
+      "pct_success": 0.82,
+      "avg_R": 0.7517,
+      "manifest": "manifests/webshop_LLMJudge_v1_seed31_round06_20260528_124355"
+    },
+    {
+      "round": 7,
+      "pct_success": 0.84,
+      "avg_R": 0.7527,
+      "manifest": "manifests/webshop_LLMJudge_v1_seed31_round07_20260528_141106"
+    },
+    {
+      "round": 8,
+      "pct_success": 0.83,
+      "avg_R": 0.7493,
+      "manifest": "manifests/webshop_LLMJudge_v1_seed31_round08_20260528_153359"
+    },
+    {
+      "round": 9,
+      "pct_success": 0.89,
+      "avg_R": 0.7972,
+      "manifest": "manifests/webshop_LLMJudge_v1_seed31_round09_20260528_171316"
+    }
+  ],
+  "Progress (HGPO-C)": [
+    {
+      "round": 0,
+      "pct_success": 0.48,
+      "avg_R": 0.4649,
+      "manifest": "manifests/webshop_Progress_v1_seed41_round00_20260528_001426"
+    },
+    {
+      "round": 1,
+      "pct_success": 0.68,
+      "avg_R": 0.6556,
+      "manifest": "manifests/webshop_Progress_v1_seed41_round01_20260528_020034"
+    },
+    {
+      "round": 2,
+      "pct_success": 0.8,
+      "avg_R": 0.7426,
+      "manifest": "manifests/webshop_Progress_v1_seed41_round02_20260528_024746"
+    },
+    {
+      "round": 3,
+      "pct_success": 0.81,
+      "avg_R": 0.7493,
+      "manifest": "manifests/webshop_Progress_v1_seed41_round03_20260528_034132"
+    },
+    {
+      "round": 4,
+      "pct_success": 0.83,
+      "avg_R": 0.7715,
+      "manifest": "manifests/webshop_Progress_v1_seed41_round04_20260528_042517"
+    },
+    {
+      "round": 5,
+      "pct_success": 0.83,
+      "avg_R": 0.7782,
+      "manifest": "manifests/webshop_Progress_v1_seed41_round05_20260528_050018"
+    },
+    {
+      "round": 6,
+      "pct_success": 0.86,
+      "avg_R": 0.7809,
+      "manifest": "manifests/webshop_Progress_v1_seed41_round06_20260528_053922"
+    },
+    {
+      "round": 7,
+      "pct_success": 0.88,
+      "avg_R": 0.7934,
+      "manifest": "manifests/webshop_Progress_v1_seed41_round07_20260528_062226"
+    },
+    {
+      "round": 8,
+      "pct_success": 0.87,
+      "avg_R": 0.776,
+      "manifest": "manifests/webshop_Progress_v1_seed41_round08_20260528_065411"
+    },
+    {
+      "round": 9,
+      "pct_success": 0.88,
+      "avg_R": 0.7961,
+      "manifest": "manifests/webshop_Progress_v1_seed41_round09_20260528_073307"
+    }
+  ]
+}

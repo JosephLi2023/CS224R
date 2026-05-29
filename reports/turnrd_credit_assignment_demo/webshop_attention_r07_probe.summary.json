@@ -1,0 +1,17 @@
+{
+  "lora_adapter_path": "/vol/checkpoints/webshop_attention_v1_seed11_round07_adapter",
+  "turnrd_ckpt_path": "/vol/cache/TurnRDV2_webshop_SOTA_10round_mlpr32_v1/ckpt.pt",
+  "config_path": "/workspace/configs/TurnRDV2_webshop_SOTA_10round_mlpr32_v1.json",
+  "config_sha256_16": "a1a4b0df4087bb6d",
+  "v_projection_clamp": 2.0,
+  "eval_task_id_base": 6500,
+  "n_tasks_requested": 40,
+  "n_emitted": 40,
+  "n_success": 34,
+  "n_failure": 6,
+  "n_crashed": 0,
+  "max_sum_to_R_drift": 2.5331974029541016e-07,
+  "elapsed_s": 181.65,
+  "jsonl_path": "/vol/manifests/turnrd_probe/webshop_attention_r07_probe_20260529_033933.jsonl",
+  "embedder_source": "policy_hidden_state_embedder (mean-pool last_hidden_state, LoRA enabled)"
+}
