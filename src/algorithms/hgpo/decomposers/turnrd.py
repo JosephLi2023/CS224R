@@ -16,8 +16,23 @@ from typing import Any, Callable, Iterator, Optional, Union
 
 import torch
 
-from src.algorithms.grpo.rollout import Trajectory, TrajectoryGroup
+from src.algorithms.grpo.rollout import Trajectory, TrajectoryGroup, TurnRecord
 from src.turnrd.model import TurnRD, TurnRDv2
+
+
+def _make_goal_only_turn(goal_text: str) -> TurnRecord:
+    """Construct a single-turn `TurnRecord` whose observation_text IS
+    the goal text, used to drive the per-trajectory goal embedder.
+
+    Factored out so the synthetic-Trajectory construction stays in one
+    place and the FiLM goal-conditioning path remains easy to audit.
+    """
+    return TurnRecord(
+        turn_idx=0,
+        observation_text=goal_text,
+        action_text="",
+        raw_env_reward=0.0,
+    )
 
 # Type alias for any TurnRD-shaped model accepted by the adapter.
 # Both `TurnRD` (v1) and `TurnRDv2` produce the same `TurnRDOutput`
@@ -84,6 +99,19 @@ class TurnRDDecomposer:
             self._model_dtype: torch.dtype = next(self.model.parameters()).dtype
         except StopIteration:
             self._model_dtype = torch.float32
+        # Plan `turnrd_goal_conditioned_v_head` Step 6: when the model
+        # was built with `cfg.goal_conditioned_value_head=True`, every
+        # forward needs a per-trajectory `goal_emb: [K, input_dim]`.
+        # We compute it on the fly here from the Turn 0 observation
+        # using the SAME embedder used for turn embeddings (synthetic
+        # single-turn trajectory whose observation_text IS the parsed
+        # goal_text). Cached by goal_text WITHIN a decompose() call (one
+        # group typically shares a single task → same goal across K).
+        # When the flag is off we never enter this path → saves the per-
+        # trajectory embedder call for non-goal-conditioned configs.
+        self._goal_emb_enabled: bool = bool(
+            getattr(getattr(self.model, "cfg", None), "goal_conditioned_value_head", False)
+        )
         # Tier-4 logging: stash the most recent eval-mode α tensor (cls_attn_weights)
         # + alignment metadata so the trainer can compute alpha_* statistics
         # unconditionally — even when `lambda_consistency == 0.0` and the
@@ -98,6 +126,82 @@ class TurnRDDecomposer:
         self._last_alpha: Optional[torch.Tensor] = None
         self._last_alpha_mask: Optional[torch.Tensor] = None
         self._last_alpha_traj_indices: list[int] = []
+
+    def _compute_goal_emb_for_indices(
+        self,
+        group: "TrajectoryGroup",
+        nonempty_indices: list[int],
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Compute `(goal_emb [K_real, D], goal_emb_mask [K_real])` for the
+        FiLM goal-conditioned V-head.
+
+        Returns `(None, None)` when `self._goal_emb_enabled` is False so
+        legacy configs pay zero per-trajectory cost. Otherwise extracts
+        the AlfWorld goal substring from each trajectory's Turn 0
+        observation, embeds it via the SAME `self.embedder` (synthetic
+        single-turn trajectory whose observation_text IS the goal_text),
+        and stacks into a per-row tensor. Rows whose goal text doesn't
+        parse get a zero placeholder + mask=0 — the model's FiLM block
+        then reverts to the unconditioned path for those rows.
+        """
+        if not self._goal_emb_enabled or not nonempty_indices:
+            return (None, None)
+        # Lazy import keeps the module torch-only (no pure-Python goal
+        # extractor dep at the top of file).
+        try:
+            from src.turnrd.goal_extractor import extract_goal_text  # type: ignore[import-not-found]
+        except Exception:
+            return (None, None)
+
+        target_device = self.device
+        target_dtype = self._model_dtype
+        K_real = len(nonempty_indices)
+        D = int(self.model.input_dim)
+        goal_emb = torch.zeros(K_real, D, dtype=target_dtype, device=target_device)
+        goal_emb_mask = torch.zeros(K_real, dtype=target_dtype, device=target_device)
+        # Cache by goal_text WITHIN this call so K rollouts of the same
+        # task share a single embedder forward pass.
+        cache: dict[str, torch.Tensor] = {}
+        with torch.no_grad():
+            for row, traj_idx in enumerate(nonempty_indices):
+                traj = group.trajectories[traj_idx]
+                if not traj.turns:
+                    continue
+                obs_text = traj.turns[0].observation_text or ""
+                goal_text = extract_goal_text(obs_text)
+                if not goal_text:
+                    continue
+                cached = cache.get(goal_text)
+                if cached is not None:
+                    goal_emb[row] = cached
+                    goal_emb_mask[row] = 1.0
+                    continue
+                try:
+                    synth = Trajectory(
+                        task_id=str(traj.task_id),
+                        env_name=traj.env_name,
+                        turns=[
+                            _make_goal_only_turn(goal_text)
+                        ],
+                        final_reward=0.0,
+                    )
+                    ge_t = self.embedder(synth)
+                    if ge_t.dim() != 2 or ge_t.shape[0] < 1 or ge_t.shape[1] != D:
+                        # Embedder gave us the wrong shape — skip this
+                        # row (mask stays 0, model falls back to
+                        # unconditioned for it). Don't raise so an
+                        # embedder bug doesn't kill the whole train
+                        # step.
+                        continue
+                    row_t = ge_t[0].detach().to(device=target_device, dtype=target_dtype)
+                    goal_emb[row] = row_t
+                    goal_emb_mask[row] = 1.0
+                    cache[goal_text] = row_t
+                except Exception:
+                    # Defensive: embedder failure on a single goal
+                    # shouldn't propagate. Mask stays 0 for this row.
+                    continue
+        return (goal_emb, goal_emb_mask)
 
     def decompose(self, group: TrajectoryGroup) -> list[list[float]]:
         """Return list[K] of list[T_i] per-turn rewards `r̂_t = α_t · R`.
@@ -185,11 +289,24 @@ class TurnRDDecomposer:
         # 3. Forward in eval mode with no grad. Use `__call__` (not `.forward`)
         #    so any `nn.Module` forward-pre/post hooks the trainer attaches
         #    (e.g. refresh-cadence telemetry) still fire.
+        # FiLM goal-conditioning: compute per-trajectory goal_emb once
+        # for the rows we're about to forward; pass None when the flag
+        # is off so the model takes the unconditioned path.
+        goal_emb, goal_emb_mask = self._compute_goal_emb_for_indices(
+            group, nonempty_indices
+        )
         was_training = self.model.training
         self.model.eval()
         try:
             with torch.no_grad():
-                out = self.model(stacked, attn_mask)
+                if goal_emb is not None:
+                    out = self.model(
+                        stacked, attn_mask,
+                        goal_emb=goal_emb,
+                        goal_emb_mask=goal_emb_mask,
+                    )
+                else:
+                    out = self.model(stacked, attn_mask)
         finally:
             if was_training:
                 self.model.train()
@@ -371,7 +488,24 @@ class TurnRDDecomposer:
         # NOTE: no torch.no_grad(), no eval() — we WANT grad through the
         # model. The trainer is responsible for putting the model in
         # train() mode before calling this.
-        out = self.model(stacked, attn_mask)
+        # FiLM goal-conditioning: same path as `decompose` — compute
+        # goal_emb once for the K_real rows. The goal extractor + the
+        # embedder runs in no_grad context (the embedder loop above
+        # already does this), so the FiLM modulation introduces a
+        # gradient path through `goal_proj/goal_gamma/goal_beta` but
+        # NOT through the embedder (matching the desired "train TurnRD,
+        # not the policy" semantics).
+        goal_emb, goal_emb_mask = self._compute_goal_emb_for_indices(
+            group, nonempty_indices
+        )
+        if goal_emb is not None:
+            out = self.model(
+                stacked, attn_mask,
+                goal_emb=goal_emb,
+                goal_emb_mask=goal_emb_mask,
+            )
+        else:
+            out = self.model(stacked, attn_mask)
         # alpha == cls_attn_weights (already mask-zeroed inside the model).
         alpha = out.cls_attn_weights  # [K_real, T_max], grad-tracking
         # V-head per-turn predictions for the actor-critic baseline

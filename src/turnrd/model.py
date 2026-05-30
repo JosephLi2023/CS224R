@@ -482,6 +482,18 @@ class TurnRDv2Config:
     # 2:1 last-vs-first turn weighting at T=4 — comparable to Method C
     # without committing fully.
     progress_prior_strength: float = 1.0
+    # FiLM goal-conditioned V-head (plan
+    # `turnrd_goal_conditioned_v_head`). When True, the model accepts
+    # an optional per-trajectory `goal_emb: [B, input_dim]` in
+    # `forward(...)` and uses it to compute FiLM (γ, β) modulators on
+    # the encoder output BEFORE the value head: ``h_cond = γ·h + β``,
+    # so v_t is a learnable function of (h_t, goal). Adds 3 small Linear
+    # layers (≈ 3·H² extra params, ~100k at H=128). γ, β are zero-init
+    # so γ outputs ≈ 1 and β ≈ 0 at construction — initial behavior is
+    # byte-identical to the unconditioned path, then the model learns to
+    # modulate. Default False keeps every existing checkpoint + config
+    # byte-for-byte unchanged.
+    goal_conditioned_value_head: bool = False
 
 
 class TurnRDv2(nn.Module):
@@ -556,6 +568,39 @@ class TurnRDv2(nn.Module):
         # Buffering it as a register would couple to max_turns; computing
         # at forward time is O(T) and free.
 
+        # ---- FiLM goal-conditioning (plan turnrd_goal_conditioned_v_head)
+        # When enabled, the model accepts an optional per-trajectory
+        # `goal_emb: [B, input_dim]` (in the same representation space as
+        # `turn_embeds`, produced by the producer-side `turnrd_embedder`
+        # callable) and uses it to modulate the encoder output before the
+        # value head. γ/β are zero-init so the initial behavior matches
+        # the unconditioned path byte-for-byte (γ ≈ 1 via the +1 offset
+        # below, β ≈ 0). All three layers exist only when the flag is on
+        # so legacy checkpoints load cleanly with strict=False (no
+        # missing-keys when the flag is off; only "unexpected keys" when
+        # loading a goal-conditioned ckpt into a plain config — which we
+        # don't do in practice).
+        if cfg.goal_conditioned_value_head:
+            self.goal_proj = nn.Linear(input_dim, cfg.hidden_size)
+            self.goal_gamma = nn.Linear(cfg.hidden_size, cfg.hidden_size)
+            self.goal_beta = nn.Linear(cfg.hidden_size, cfg.hidden_size)
+            # Zero-init the FiLM projector weights AND biases so γ/β
+            # outputs are ≈ 0 at init; the forward path then adds the +1
+            # offset to γ so the modulation is `1·h + 0` (identity) at
+            # construction. This makes the augmented model start out as a
+            # strict superset of the unconditioned model — the V-head
+            # learns to deviate from "ignore the goal" rather than from
+            # noise.
+            with torch.no_grad():
+                nn.init.zeros_(self.goal_gamma.weight)
+                nn.init.zeros_(self.goal_gamma.bias)
+                nn.init.zeros_(self.goal_beta.weight)
+                nn.init.zeros_(self.goal_beta.bias)
+        else:
+            self.goal_proj = None  # type: ignore[assignment]
+            self.goal_gamma = None  # type: ignore[assignment]
+            self.goal_beta = None  # type: ignore[assignment]
+
     def _progress_prior_bias(self, T: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         """Return a [T] bias added to per-turn scores.
 
@@ -577,6 +622,8 @@ class TurnRDv2(nn.Module):
         self,
         turn_embeds: torch.Tensor,
         attention_mask: torch.Tensor,
+        goal_emb: Optional[torch.Tensor] = None,
+        goal_emb_mask: Optional[torch.Tensor] = None,
     ) -> TurnRDOutput:
         if turn_embeds.dim() != 3:
             raise ValueError(
@@ -630,7 +677,46 @@ class TurnRDv2(nn.Module):
         )  # [B, T, H]
 
         # 4. Per-turn scores → α via masked softmax.
-        scores = self.score_head(h).squeeze(-1)  # [B, T]
+        # FiLM goal-conditioning (plan turnrd_goal_conditioned_v_head):
+        # Apply FiLM modulation BEFORE the score head so α is a learnable
+        # function of (h_t, goal), not just h_t. This makes the per-turn
+        # rewards r̂_t = α_t · R goal-aware at the policy-gradient level.
+        # Previously only the value head was conditioned; α remained
+        # goal-blind, so the credit decomposition itself didn't benefit
+        # from goal information.
+        if (
+            self.cfg.goal_conditioned_value_head
+            and goal_emb is not None
+            and self.goal_proj is not None
+        ):
+            if goal_emb.dim() != 2:
+                raise ValueError(
+                    f"TurnRDv2.forward: goal_emb must be [B, input_dim]; "
+                    f"got shape {tuple(goal_emb.shape)}."
+                )
+            if goal_emb.shape[0] != B or goal_emb.shape[1] != self.input_dim:
+                raise ValueError(
+                    f"TurnRDv2.forward: goal_emb shape {tuple(goal_emb.shape)} "
+                    f"must equal [B={B}, input_dim={self.input_dim}]."
+                )
+            g = self.goal_proj(goal_emb.to(dtype=h.dtype, device=h.device))
+            gamma = self.goal_gamma(g)
+            beta = self.goal_beta(g)
+            gamma_eff = gamma.unsqueeze(1) + 1.0
+            beta_b = beta.unsqueeze(1)
+            h_cond = h * gamma_eff + beta_b
+            if goal_emb_mask is not None:
+                if goal_emb_mask.dim() != 1 or goal_emb_mask.shape[0] != B:
+                    raise ValueError(
+                        f"TurnRDv2.forward: goal_emb_mask must be [B={B}]; "
+                        f"got shape {tuple(goal_emb_mask.shape)}."
+                    )
+                mask_b = goal_emb_mask.to(dtype=h.dtype, device=h.device).view(B, 1, 1)
+                h_cond = h_cond * mask_b + h * (1.0 - mask_b)
+        else:
+            h_cond = h
+
+        scores = self.score_head(h_cond).squeeze(-1)  # [B, T]
         # Add the progress-prior bias — broadcasts across batch.
         scores = scores + self._progress_prior_bias(T, scores.device, scores.dtype).unsqueeze(0)
         # Mask BEFORE softmax: set padded positions to -inf so softmax
@@ -653,7 +739,11 @@ class TurnRDv2(nn.Module):
         alpha = alpha * float_mask  # re-zero in case the divide drifted
 
         # 5. Per-turn value v_t.
-        v = self.value_head(h).squeeze(-1)  # [B, T]
+        # FiLM goal-conditioning: reuse h_cond computed above so both
+        # α and v_t are functions of (h_t, goal). When goal_emb is None
+        # or the flag is off, h_cond == h (identity), matching the
+        # pre-FiLM behaviour byte-for-byte.
+        v = self.value_head(h_cond).squeeze(-1)  # [B, T]
         v = v * float_mask
 
         # 6. R̂ = Σ_t α_t · v_t. Identifiable: ∂L/∂α_t = 2(R̂-R)·v_t.

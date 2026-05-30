@@ -55,6 +55,12 @@ def train_turnrd_run(
     value_head: bool = True,
     # v2-only model knob (ignored when version="v1").
     progress_prior_strength: float = 1.0,
+    # Plan `turnrd_goal_conditioned_v_head`: opt-in FiLM
+    # goal-conditioned V-head. When True (and version="v2"), the model
+    # is built with the FiLM γ/β projection layers and the trainer
+    # threads `goal_emb` from the replay rows into model.forward.
+    # Default False preserves legacy byte-for-byte behaviour.
+    goal_conditioned_value_head: bool = False,
     # Aux-loss knobs (Mode 1 only). lambda_value/gamma drive the
     # per-turn V-head loss; lambda_entropy is the negative-entropy reg.
     lambda_value: float = 0.5,
@@ -75,10 +81,6 @@ def train_turnrd_run(
     recency_decay_half_life: float = 0.0,
     legacy_decay_weight: float = 0.5,
     min_batch_weight: float = 1e-3,
-    # Goal-aware-supervision blend coefficient (plan
-    # `turnrd_goalsup_rl_loop_integration`). 0.0 (default) preserves
-    # legacy behaviour; 0.5 blends progress_signal with goal_match_signal.
-    goal_match_blend: float = 0.0,
     # The producer pre-embeds turns; the standalone trainer doesn't need
     # the LoRA policy. We DO need the embedding width D, which the
     # producer wrote into the replay (we read it off the first record).
@@ -130,6 +132,7 @@ def train_turnrd_run(
                 dropout=dropout,
                 causal=causal,
                 progress_prior_strength=progress_prior_strength,
+                goal_conditioned_value_head=bool(goal_conditioned_value_head),
             ),
             input_dim=input_dim,
         )
@@ -176,7 +179,6 @@ def train_turnrd_run(
         ),
         legacy_decay_weight=float(legacy_decay_weight),
         min_batch_weight=float(min_batch_weight),
-        goal_match_blend=float(goal_match_blend),
     )
     elapsed = round(time.time() - t0, 2)
     summary["elapsed_s"] = elapsed
@@ -204,6 +206,7 @@ def main(
     causal: bool = True,
     value_head: bool = True,
     progress_prior_strength: float = 1.0,
+    goal_conditioned_value_head: bool = False,
     lambda_value: float = 0.5,
     gamma: float = 0.95,
     lambda_entropy: float = 0.01,
@@ -215,7 +218,6 @@ def main(
     recency_decay_half_life: float = 0.0,
     legacy_decay_weight: float = 0.5,
     min_batch_weight: float = 1e-3,
-    goal_match_blend: float = 0.0,
 ) -> None:
     import json as _json
 
@@ -237,6 +239,7 @@ def main(
             causal=causal,
             value_head=value_head,
             progress_prior_strength=progress_prior_strength,
+            goal_conditioned_value_head=goal_conditioned_value_head,
             lambda_value=lambda_value,
             gamma=gamma,
             lambda_entropy=lambda_entropy,
@@ -248,7 +251,6 @@ def main(
             recency_decay_half_life=recency_decay_half_life,
             legacy_decay_weight=legacy_decay_weight,
             min_batch_weight=min_batch_weight,
-            goal_match_blend=goal_match_blend,
         ),
         indent=2,
         default=str,

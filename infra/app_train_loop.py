@@ -93,7 +93,7 @@ def _train_loop_impl(
     save_adapter_out: str = "",
     rollout_temperature: float = 1.0,
 ) -> dict:
-    """Env-agnostic training loop body. Both `train_loop_webshop` and
+    """Env-agnostic training loop body.
     `train_loop_alfworld` delegate here so the loop body lives in one
     place and image-binding is the only thing the entrypoints differ on.
 
@@ -341,14 +341,17 @@ def _train_loop_impl(
         # v6 BUG 2 fix plumbing: tell the trainer which round we're in
         # so the V-baseline annealing schedule can compute β.
         trainer.cfg.v_baseline_round_idx = int(round_idx)
-        # Goal-aware-supervision integration: when the new config flag
-        # is set, the producer emits `goal_text` + `goal_match_signal`
-        # on every record so the per-round `train_turnrd` step can
-        # blend the goal-aware target into the V-head loss (per plan
-        # `turnrd_goalsup_rl_loop_integration`). Default False keeps
-        # all existing runs byte-for-byte unchanged.
+        # Goal-aware producer plumbing: when these turnrd config flags
+        # are set, the producer emits `goal_text` and per-trajectory
+        # `goal_emb` on every record so the V-head's FiLM γ/β path
+        # (built when `goal_conditioned_value_head=true`) has its input.
+        # Both default False, keeping every existing config byte-for-byte
+        # unchanged.
         _emit_goal_text = bool(
             (cfg_dict.get("turnrd") or {}).get("emit_goal_text", False)
+        )
+        _emit_goal_emb = bool(
+            (cfg_dict.get("turnrd") or {}).get("emit_goal_emb", False)
         )
         collector = RolloutCollector(
             runner=runner,
@@ -361,6 +364,7 @@ def _train_loop_impl(
             judge_decomposer=judge_decomposer,
             round_idx=int(round_idx),
             turnrd_emit_goal_text=_emit_goal_text,
+            turnrd_emit_goal_emb=_emit_goal_emb,
         )
     else:
         collector = RolloutCollector(
@@ -389,13 +393,25 @@ def _train_loop_impl(
     # lower values (e.g. 0.7) reduce mode-collapse / dead-K on saturated
     # policies where K=8 rollouts at T=1.0 often produce all-same outcomes.
     sampling = SamplingParams(
-        n=1, temperature=rollout_temperature, top_p=0.95, max_tokens=48,
+        n=1, temperature=rollout_temperature, top_p=0.95,
+        max_tokens=48,
         return_logprobs=True, seed=None,  # fresh sampling each call → diverse K trajectories
     )
 
     if sft_loaded and use_sft_as_ref:
         n = trainer.snapshot_current_lora_as_ref()
         print(f">>> Snapshotted {n} LoRA modules as KL reference (RL-from-SFT)")
+
+    # ---- task-id iteration: legacy contiguous slice
+    # `[task_id_offset, task_id_offset + n_episodes)`. Kept as a list so the
+    # main loop can `for ep, task_id in enumerate(task_ids):` uniformly
+    # regardless of how the list is generated.
+    task_ids = [int(task_id_offset) + i for i in range(int(n_episodes))]
+    n_episodes_actual = len(task_ids)
+    print(
+        f">>> Iterating {n_episodes_actual} task ids "
+        f"(contiguous slice [{task_id_offset}, {task_id_offset + n_episodes}))"
+    )
 
     # Generic config snapshot for train_log.json — env-agnostic now that
     # `num_products` is just one possible env_kwarg among many.
@@ -420,14 +436,14 @@ def _train_loop_impl(
             "sync_every": sync_every, "run_name": run_name,
             "sft_adapter": sft_adapter,
             "turnrd_refresh": _turnrd_refresh,
+            "n_episodes_actual": n_episodes_actual,
         }
 
     log: list[dict] = []
     overall_start = time.time()
 
-    for ep in range(n_episodes):
+    for ep, task_id in enumerate(task_ids):
         ep_t0 = time.time()
-        task_id = task_id_offset + ep
         try:
             group, cstats = collector.collect_group(
                 task_id=task_id, env_name=env_name, K=k, sampling=sampling
@@ -521,7 +537,19 @@ def _train_loop_impl(
                 volume.commit()
                 raise
             print(f"ep={ep} CRASHED: {exc!r}")
-            log.append({"episode": ep, "task_id": task_id, "error": repr(exc)})
+            # Capture the FULL traceback so the row in train_log.json is
+            # diagnosable post-hoc \u2014 Modal truncates `app logs` aggressively
+            # when stdout exceeds N lines, so the print above often gets
+            # dropped. The traceback string is bounded (~few KB) and lets
+            # us debug failures without re-running.
+            import traceback as _tb
+            _tb_str = _tb.format_exc()
+            log.append({
+                "episode": ep,
+                "task_id": task_id,
+                "error": repr(exc),
+                "traceback": _tb_str,
+            })
             # When an episode crashes mid-step (typical: CUDA OOM
             # or an UnboundLocalError after partial allocations), the
             # `if sync_every > 0 ...` empty_cache block above is skipped.
@@ -682,7 +710,8 @@ def _train_loop_impl(
         )
 
         eval_sampling = SamplingParams(
-            n=1, temperature=0.0, top_p=1.0, max_tokens=48,
+            n=1, temperature=0.0, top_p=1.0,
+            max_tokens=48,
             return_logprobs=False, seed=42,
         )
         # Single eval collector reused across all eval episodes. Its env
@@ -742,7 +771,9 @@ def _train_loop_impl(
             "n_episodes_crashed": eval_crashed,
             "task_id_base": eval_task_id_base,
             "task_id_range": [eval_task_id_base, eval_task_id_base + eval_episodes],
-            "sampling": "greedy (T=0.0, top_p=1.0)",
+            "sampling": (
+                f"greedy (T=0.0, top_p=1.0, max_tokens=48)"
+            ),
             "K": 1,
             "elapsed_s": eval_elapsed,
             "avg_return": round(mean_R, 4),
@@ -751,6 +782,7 @@ def _train_loop_impl(
             "completed": eval_completed,
             "truncated": eval_truncated,
             "n_turns_avg": round(sum(eval_turns) / max(1, len(eval_turns)), 2),
+            "max_turns": max_turns,
         }
         print(
             f">>> Eval done: avg_R={eval_block['avg_return']:.4f} "

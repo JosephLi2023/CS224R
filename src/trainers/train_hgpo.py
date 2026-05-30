@@ -191,6 +191,16 @@ def _build_turnrd_branch(
                         "progress_prior_strength", v2_defaults.progress_prior_strength
                     )
                 ),
+                # Plan `turnrd_goal_conditioned_v_head`: opt-in FiLM
+                # goal-conditioned V-head. Default False preserves all
+                # existing TurnRDv2 configs byte-for-byte; v1 doesn't
+                # support this knob.
+                goal_conditioned_value_head=bool(
+                    turnrd_cfg.get(
+                        "goal_conditioned_value_head",
+                        v2_defaults.goal_conditioned_value_head,
+                    )
+                ),
             ),
             input_dim=input_dim,
         )
@@ -260,7 +270,31 @@ def _build_turnrd_branch(
                 map_location=next(decomposer.model.parameters()).device,
                 weights_only=True,
             )
-            decomposer.load_state_dict(sd)
+            # Plan `turnrd_goal_conditioned_v_head` Step 11: load with
+            # strict=False so legacy ckpts (no FiLM params) load cleanly
+            # into a goal-conditioned model — the new
+            # `goal_proj/goal_gamma/goal_beta` start from their zero-init
+            # state (γ ≈ 1, β ≈ 0 → identity modulation), so first-round
+            # behavior matches the unconditioned ckpt. PyTorch's
+            # IncompatibleKeys return value reports any missing /
+            # unexpected keys; surface a one-line warning so the
+            # operator can spot accidental schema mismatches.
+            _load_result = decomposer.load_state_dict(sd, strict=False)
+            try:
+                _missing = list(getattr(_load_result, "missing_keys", []) or [])
+                _unexpected = list(getattr(_load_result, "unexpected_keys", []) or [])
+                if _missing or _unexpected:
+                    logger.warning(
+                        "TurnRD refresh: load_state_dict(strict=False) -> "
+                        "missing=%d, unexpected=%d (missing example: %s; "
+                        "unexpected example: %s)",
+                        len(_missing),
+                        len(_unexpected),
+                        _missing[:3],
+                        _unexpected[:3],
+                    )
+            except Exception:
+                pass
             try:
                 _stat = ckpt_path_resolved.stat()
                 _size = int(_stat.st_size)

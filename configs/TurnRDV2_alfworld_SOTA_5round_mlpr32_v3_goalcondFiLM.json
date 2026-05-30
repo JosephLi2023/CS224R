@@ -1,8 +1,8 @@
 {
   "run": {
-    "name": "TurnRDV2_alfworld_SOTA_goalsup_v1",
+    "name": "TurnRDV2_alfworld_SOTA_5round_mlpr32_v3_goalcondFiLM",
     "output_dir": "experiments/manifests",
-    "seed": 41
+    "seed": 31
   },
   "env": {
     "name": "alfworld",
@@ -18,7 +18,7 @@
           "eval_id_data_path": "$ALFWORLD_DATA/json_2.1.1/valid_seen",
           "eval_ood_data_path": "$ALFWORLD_DATA/json_2.1.1/valid_unseen",
           "num_train_games": 400,
-          "num_eval_games": 127
+          "num_eval_games": 50
         },
         "env": {
           "type": "AlfredTWEnv",
@@ -132,7 +132,7 @@
     "max_turns": 50,
     "dropout": 0.1,
     "causal": false,
-    "progress_prior_strength": 0.5,
+    "progress_prior_strength": 1.0,
     "refresh_every_episodes": 10,
     "turnrd_lr": 0.0005,
     "lambda_value": 1.0,
@@ -142,13 +142,14 @@
     "recency_decay_half_life": 4.0,
     "legacy_decay_weight": 0.5,
     "min_batch_weight": 0.001,
-    "replay_buffer_path": "/vol/cache/TurnRDV2_alfworld_SOTA_goalsup_v1/replay.jsonl",
-    "ckpt_path": "/vol/cache/TurnRDV2_alfworld_SOTA_goalsup_v1/ckpt.pt",
+    "replay_buffer_path": "/vol/cache/TurnRDV2_alfworld_SOTA_5round_mlpr32_v3_goalcondFiLM/replay.jsonl",
+    "ckpt_path": "/vol/cache/TurnRDV2_alfworld_SOTA_5round_mlpr32_v3_goalcondFiLM/ckpt.pt",
     "emit_goal_text": true,
-    "goal_match_blend": 0.5
+    "emit_goal_emb": true,
+    "goal_conditioned_value_head": true
   },
   "logging": {
     "print_every": 10
   },
-  "_notes": "RL-loop integration of the goal-aware-supervision proposal (plan turnrd_goalsup_rl_loop_integration). Clones the v3 SOTA config with two additions: turnrd.emit_goal_text=true (collector emits goal_text + goal_match_signal per record) and turnrd.goal_match_blend=0.5 (per-round train_turnrd blends progress_signal with goal_match_signal as V-head target). Seed=41 picks a task-id slice disjoint from v1 (seed=11), v2 (seed=23), and v3 (seed=31): [41*10*80, 41*10*80+800) = [32800, 33600). [v1.1] Two tweaks for the full 10-round run: (1) num_eval_games 50->127 (maxes valid_seen pool for a more stable easy-type eval), (2) progress_prior_strength 1.0->0.5 (the per-turn progress-prior regularizer is partially fighting the new goal_match_signal target at \u03b2=0.5; halving it gives the goal-aware signal more room without disabling the prior entirely)."
+  "_notes": "5-round FiLM-only smoke test on top of v3 SOTA recipe. Derived from TurnRDV2_alfworld_SOTA_10round_mlpr32_v3_goalcond.json with run prefix + cache paths bumped to a fresh disjoint prefix; everything else (FiLM knobs, progress prior, recency decay, seed=31, eps=80, T=1.0, rank-32 MLP+attn LoRA) is byte-for-byte identical. Per-turn supervision (goal_match_blend, goal_shaping_coef, goal_match_signal) was removed from the codebase prior to this run \u2014 see plan remove_per_turn_goal_supervision. Geometry: base_task_id_offset = seed*rounds*eps = 31*5*80 = 12400, train slice [12400, 12800), eval [6500, 6600) (SAME pool as v3 so eval is comparable). Smoke-test pass criteria: R0 eval >= 0.58, R4 eval >= 0.65, train mean_reward in [0.5, 0.7] (NOT inflated to ~1.0 like the prior shaped run)."
 }

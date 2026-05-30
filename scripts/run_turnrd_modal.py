@@ -146,6 +146,16 @@ class OrchestrationConfig:
     # often produce all-same outcomes (so groups have zero advantage variance
     # and contribute zero gradient).
     rollout_temperature: float = 1.0
+    # ---- Cross-run carry-policy lineage. OPT-IN. When True (and
+    # `--carry-policy-across-rounds` is also set), the FIRST iterated
+    # round (`round_idx == cfg.start_round`) loads `cfg.sft_adapter`
+    # instead of the prefix-derived `<prefix>_round{start_round-1:02d}_adapter`
+    # path. Needed for cross-run warm-start where the new prefix has no
+    # prior adapter on disk. Default False preserves the legacy resume
+    # convention used by e.g. `run_alfworld_SOTA_10round_mlpr32_v3_extend_R10R12.sh`,
+    # which relies on `cfg.sft_adapter` being ignored at start_round so
+    # the orchestrator picks up the prior run's saved adapter.
+    sft_adapter_overrides_derived: bool = False
     extra_turnrd_args: list[str] = field(default_factory=list)
 
     @property
@@ -346,6 +356,16 @@ def _parse_args(argv: Sequence[str]) -> OrchestrationConfig:
              "contribute zero gradient).",
     )
     parser.add_argument(
+        "--sft-adapter-overrides-derived",
+        action="store_true",
+        help="OPT-IN. When combined with --carry-policy-across-rounds AND "
+             "--start-round > 0, the FIRST iterated round loads --sft-adapter "
+             "instead of the prefix-derived <prefix>_round{start_round-1:02d}_adapter "
+             "path. Needed for cross-run lineage. Default OFF preserves the legacy resume "
+             "convention where --sft-adapter is ignored at start_round and the "
+             "orchestrator picks up the prior run's saved adapter.",
+    )
+    parser.add_argument(
         "--extra-train-loop-args",
         nargs=argparse.REMAINDER,
         default=[],
@@ -376,6 +396,7 @@ def _parse_args(argv: Sequence[str]) -> OrchestrationConfig:
         carry_policy_across_rounds=bool(args.carry_policy_across_rounds),
         adapter_dir=str(args.adapter_dir),
         rollout_temperature=float(args.rollout_temperature),
+        sft_adapter_overrides_derived=bool(args.sft_adapter_overrides_derived),
     )
 
 
@@ -723,8 +744,19 @@ def _train_loop_cmd(cfg: OrchestrationConfig, round_idx: int) -> list[str]:
     #   saved adapter so training accumulates across rounds. Each round
     #   also writes its trained adapter to `--save-adapter-out` for the
     #   NEXT round to consume.
+    #
+    #   Cross-run lineage opt-in: when `--sft-adapter-overrides-derived`
+    #   is set, the FIRST iterated round (`round_idx == cfg.start_round`)
+    #   loads `cfg.sft_adapter` instead of the prefix-derived path. This
+    #   covers WebShop attention v2 R7 ← v1 R7. Default off preserves the
+    #   legacy `<prefix>_round{N-1}_adapter` resume convention used by
+    #   e.g. `scripts/run_alfworld_SOTA_10round_mlpr32_v3_extend_R10R12.sh`.
     if cfg.carry_policy_across_rounds:
-        if round_idx == 0:
+        cross_run_warm_start = (
+            cfg.sft_adapter_overrides_derived
+            and round_idx == cfg.start_round
+        )
+        if round_idx == 0 or cross_run_warm_start:
             load_adapter = cfg.sft_adapter
         else:
             load_adapter = (
@@ -816,11 +848,6 @@ def _train_turnrd_cmd(cfg: OrchestrationConfig) -> list[str]:
         ("--recency-decay-half-life", "recency_decay_half_life", None),
         ("--legacy-decay-weight", "legacy_decay_weight", None),
         ("--min-batch-weight", "min_batch_weight", None),
-        # Goal-aware-supervision blend coefficient (plan
-        # `turnrd_goalsup_rl_loop_integration`). When > 0 and the
-        # replay carries `goal_match_signal` on every row, the V-head
-        # target becomes (1-β)*progress_signal + β*goal_match_signal.
-        ("--goal-match-blend", "goal_match_blend", None),
     ]:
         if jkey in turnrd_block:
             cmd.extend([cli, str(turnrd_block[jkey])])
@@ -834,6 +861,11 @@ def _train_turnrd_cmd(cfg: OrchestrationConfig) -> list[str]:
         cmd.extend(_bool_flag("causal", bool(turnrd_block["causal"])))
     if "value_head" in turnrd_block:
         cmd.extend(_bool_flag("value-head", bool(turnrd_block["value_head"])))
+    if "goal_conditioned_value_head" in turnrd_block:
+        cmd.extend(_bool_flag(
+            "goal-conditioned-value-head",
+            bool(turnrd_block["goal_conditioned_value_head"]),
+        ))
     cmd.extend(cfg.extra_turnrd_args)
     return cmd
 

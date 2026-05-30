@@ -37,7 +37,7 @@ After every round / stage completes (and `volume.commit()`-ed), the
 orchestrator writes a JSON sentinel to the volume. On a preemption-restart
 Modal re-invokes the function with the same input args; without the
 sentinel scan, every restart would redo R0..R{N-1} from scratch (an
-issue that burned ~12h on the first AlfWorld xlbudget run). With the
+issue that burned ~12h on an early AlfWorld run). With the
 sentinel scan, the restart resumes at the first incomplete round/stage.
 Set `auto_resume=False` to force re-execution.
 
@@ -89,7 +89,7 @@ def orchestrate_rl_with_turnrd(
     turnrd_mode: int = 1,
     turnrd_batch_size: int = 16,
     rollout_temperature: float = 1.0,
-    run_name_prefix: str = "TurnRDV2_alfworld_xlbudget",
+    run_name_prefix: str = "TurnRDV2_alfworld",
     adapter_dir: str = "/vol/checkpoints",
     gpu_mem_util: float = 0.4,
     sync_every: int = 8,
@@ -387,8 +387,19 @@ def orchestrate_rl_with_turnrd(
                 n_heads=int(_trd_kwarg("n_heads", 4)),
                 max_turns=int(_trd_kwarg("max_turns", 64)),
                 dropout=float(_trd_kwarg("dropout", 0.1)),
+                causal=bool(_trd_kwarg("causal", True)),
                 progress_prior_strength=float(
                     _trd_kwarg("progress_prior_strength", 1.0)
+                ),
+                # Plan `turnrd_goal_conditioned_v_head`: thread the
+                # FiLM goal-conditioned V-head flag through to the
+                # standalone trainer so the rebuilt model in round N+1
+                # carries the right shape for the ckpt written by the
+                # parent train_loop's train_turnrd. Default False
+                # preserves byte-for-byte behaviour for non-AlfWorld
+                # configs.
+                goal_conditioned_value_head=bool(
+                    _trd_kwarg("goal_conditioned_value_head", False)
                 ),
                 lambda_value=float(_trd_kwarg("lambda_value", 0.5)),
                 lambda_rank=float(_trd_kwarg("lambda_rank", 0.1)),
@@ -402,9 +413,6 @@ def orchestrate_rl_with_turnrd(
                 ),
                 min_batch_weight=float(
                     _trd_kwarg("min_batch_weight", 1e-3)
-                ),
-                goal_match_blend=float(
-                    _trd_kwarg("goal_match_blend", 0.0)
                 ),
             )
             tt_result = train_turnrd_run.remote(**tt_kwargs)
@@ -1104,7 +1112,7 @@ def main(
     turnrd_mode: int = 1,
     turnrd_batch_size: int = 16,
     rollout_temperature: float = 1.0,
-    run_name_prefix: str = "TurnRDV2_alfworld_xlbudget",
+    run_name_prefix: str = "TurnRDV2_alfworld",
     adapter_dir: str = "/vol/checkpoints",
     gpu_mem_util: float = 0.4,
     sync_every: int = 8,

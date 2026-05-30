@@ -112,12 +112,23 @@ class RolloutCollector:
         # the AlfWorld goal substring from each trajectory's Turn 0
         # observation (via `src.turnrd.goal_extractor.extract_goal_text`)
         # and writes it as `goal_text` on the emitted record. Used by the
-        # goal-aware-supervision V-head target generator
-        # (see plan `turnrd_goal_aware_supervision`). No-op (goal_text
-        # stays None) on non-AlfWorld envs or when the Turn 0 obs
-        # doesn't contain the canonical "Your task is to: ..." pattern.
-        # Default False preserves byte-for-byte legacy producer output.
+        # FiLM goal-conditioned V-head. No-op (goal_text stays None) on
+        # non-AlfWorld envs or when the Turn 0 obs doesn't contain the
+        # canonical "Your task is to: ..." pattern. Default False
+        # preserves byte-for-byte legacy producer output.
         turnrd_emit_goal_text: bool = False,
+        # FiLM goal-conditioned V-head (plan
+        # `turnrd_goal_conditioned_v_head`). When True AND
+        # `turnrd_emit_goal_text=True`, the producer additionally calls
+        # `turnrd_embedder` on a synthetic single-turn trajectory whose
+        # observation_text is the parsed `goal_text`, taking the
+        # resulting `[1, D]` row 0 as a `[D]` per-trajectory goal
+        # embedding. The embedding is written to the JSONL as
+        # `goal_emb` and consumed by the FiLM-modulated V-head at
+        # train time. Default False preserves byte-for-byte legacy
+        # behaviour. Cached within a `collect_group` call by
+        # `goal_text` since the same task's K rollouts share a goal.
+        turnrd_emit_goal_emb: bool = False,
     ) -> None:
         """K-trajectory rollout collector.
 
@@ -170,6 +181,13 @@ class RolloutCollector:
             int(round_idx) if round_idx is not None else None
         )
         self._turnrd_emit_goal_text: bool = bool(turnrd_emit_goal_text)
+        self._turnrd_emit_goal_emb: bool = bool(turnrd_emit_goal_emb)
+        # Per-round cache: goal_text -> goal_emb (list[float]). Reset at
+        # the start of every `collect_group` call so we don't grow
+        # unbounded across the (~80) episodes in a round. The same goal
+        # text repeats across the K rollouts of one task, so caching
+        # saves K-1 redundant embedder calls per group.
+        self._goal_emb_cache: dict[str, list[float]] = {}
 
     def _acquire_envs(self, K: int) -> list[Any]:
         """Return K env instances, growing the pool lazily when reuse is on."""
@@ -189,6 +207,9 @@ class RolloutCollector:
         """K parallel rollouts on the same task → populated TrajectoryGroup."""
         if getattr(sampling, "n", 1) != 1:
             sampling = _override_n(sampling, 1)
+
+        # Per-call cache reset (see __init__ for rationale).
+        self._goal_emb_cache = {}
 
         envs = self._acquire_envs(K)
         states: list[Any] = [_safe_reset(env, task_id) for env in envs]
@@ -330,19 +351,11 @@ class RolloutCollector:
         # once up front when goal-text emission is enabled, rather than
         # re-importing for every trajectory in every group.
         extract_goal_text = None
-        parse_goal_object = None
-        score_action_against_goal = None
         if self._turnrd_emit_goal_text:
             from src.turnrd.goal_extractor import (  # type: ignore[import-not-found]
                 extract_goal_text as _extract_goal_text,
             )
-            from src.turnrd.goal_target import (  # type: ignore[import-not-found]
-                parse_goal_object as _parse_goal_object,
-                score_action_against_goal as _score_action_against_goal,
-            )
             extract_goal_text = _extract_goal_text
-            parse_goal_object = _parse_goal_object
-            score_action_against_goal = _score_action_against_goal
 
         assert self._turnrd_emit_path is not None  # narrowed
         assert self._turnrd_embedder is not None   # narrowed (validated in __init__)
@@ -447,14 +460,14 @@ class RolloutCollector:
                     judge_labels = [float(x) for x in raw]
                 else:
                     judge_labels = None
-                # Goal text (plan `turnrd_goal_aware_supervision`). When
+                # Goal text (FiLM goal-conditioned V-head input). When
                 # the collector is configured to emit goal text AND the
                 # AlfWorld goal-extractor finds a "Your task is to: ..."
                 # line in the Turn 0 observation, populate `goal_text`.
                 # Otherwise stays None — back-compat for non-AlfWorld
                 # envs and malformed prompts.
                 goal_text_v: str | None = None
-                goal_match_signal_v: list[float] | None = None
+                goal_emb_v: list[float] | None = None
                 if (
                     self._turnrd_emit_goal_text
                     and extract_goal_text is not None
@@ -463,27 +476,63 @@ class RolloutCollector:
                     goal_text_v = extract_goal_text(
                         traj.turns[0].observation_text or ""
                     )
-                    # Goal-aware per-turn target (plan
-                    # `turnrd_goal_aware_supervision`). Compute only when
-                    # the goal parsed into a (target, secondary) tuple;
-                    # otherwise leave goal_match_signal as None so the
-                    # trainer's per-batch all-or-nothing gate excludes
-                    # the batch from the goal-blend path cleanly.
+                    # FiLM goal-conditioned V-head input (plan
+                    # `turnrd_goal_conditioned_v_head` Step 2). Compute
+                    # a per-trajectory goal embedding via the SAME
+                    # `turnrd_embedder` callable used for per-turn
+                    # embeddings — synthesize a single-turn trajectory
+                    # whose observation_text IS the parsed goal_text,
+                    # call the embedder, and take row 0. This keeps the
+                    # V-head's inputs in a consistent representation
+                    # space without introducing a separate text-encoder
+                    # dependency. Cached by goal_text within the round
+                    # so K rollouts of the same task share the call.
                     if (
-                        goal_text_v is not None
-                        and parse_goal_object is not None
-                        and score_action_against_goal is not None
+                        self._turnrd_emit_goal_emb
+                        and goal_text_v is not None
                     ):
-                        target_obj, secondary_obj = parse_goal_object(goal_text_v)
-                        if target_obj is not None:
-                            goal_match_signal_v = [
-                                float(score_action_against_goal(
-                                    turn.action_text or "",
-                                    target_obj,
-                                    secondary_obj,
-                                ))
-                                for turn in traj.turns
-                            ]
+                        cache_key = goal_text_v
+                        cached = self._goal_emb_cache.get(cache_key)
+                        if cached is not None:
+                            goal_emb_v = cached
+                        else:
+                            try:
+                                synth_traj = Trajectory(
+                                    task_id=str(traj.task_id),
+                                    env_name=traj.env_name,
+                                    turns=[
+                                        TurnRecord(
+                                            turn_idx=0,
+                                            observation_text=goal_text_v,
+                                            action_text="",
+                                            raw_env_reward=0.0,
+                                        )
+                                    ],
+                                    final_reward=0.0,
+                                )
+                                ge_t = self._turnrd_embedder(synth_traj)
+                                if ge_t.dim() != 2 or ge_t.shape[0] < 1:
+                                    raise ValueError(
+                                        "turnrd_embedder on goal-only "
+                                        f"trajectory returned shape "
+                                        f"{tuple(ge_t.shape)}; expected [1, D]."
+                                    )
+                                goal_emb_v = (
+                                    ge_t[0].detach().to(device="cpu").tolist()
+                                )
+                                self._goal_emb_cache[cache_key] = goal_emb_v
+                            except Exception as exc:  # pragma: no cover
+                                # Embedder failures (e.g., tokenizer
+                                # quirk on an unusual goal string) must
+                                # not crash the producer — fall back to
+                                # goal_emb=None on this trajectory.
+                                logger.warning(
+                                    "TurnRD producer: goal_emb embedder failed "
+                                    "for task_id=%s (%s); emitting goal_emb=None.",
+                                    traj.task_id,
+                                    exc,
+                                )
+                                goal_emb_v = None
                 # Round-trip through TurnRDRecord so producer-side schema
                 # bugs surface here, not at the next trainer launch.
                 rec = TurnRDRecord(
@@ -495,7 +544,7 @@ class RolloutCollector:
                     progress_signal=progress_signal,
                     round_idx=self._round_idx,
                     goal_text=goal_text_v,
-                    goal_match_signal=goal_match_signal_v,
+                    goal_emb=goal_emb_v,
                 )
                 fh.write(json.dumps(asdict(rec)) + "\n")
                 fh.flush()
