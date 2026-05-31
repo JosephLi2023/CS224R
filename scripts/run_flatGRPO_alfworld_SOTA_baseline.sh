@@ -85,12 +85,12 @@ if [[ -z "${SFT_ADAPTER}" ]]; then
 fi
 
 CONFIG=${CONFIG:-configs/flatGRPO_alfworld_SOTA_10round_mlpr32_baseline.json}
-RUN_PREFIX=${RUN_PREFIX:-flatGRPO_alfworld_SOTA_a100}
+RUN_PREFIX=${RUN_PREFIX:-flatGRPO_alfworld_SOTA_baseline_seed31}
 ROUNDS=${ROUNDS:-10}
 START_ROUND=${START_ROUND:-0}
 EPS_PER_ROUND=${EPS_PER_ROUND:-80}
 EVAL_EPS=${EVAL_EPS:-100}
-SEED=${SEED:-41}
+SEED=${SEED:-31}
 ROLLOUT_TEMP=${ROLLOUT_TEMP:-1.0}
 ADAPTER_DIR=${ADAPTER_DIR:-/vol/checkpoints}
 EVAL_TASK_BASE=${EVAL_TASK_BASE:-6500}

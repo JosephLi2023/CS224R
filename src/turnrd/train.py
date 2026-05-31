@@ -91,6 +91,23 @@ def train_turnrd(
     lambda_rank: float = 0.1,
     lambda_progress: float = 0.01,
     rank_margin: float = 0.1,
+    # ---- LR schedule (plan: turnrd_v2_continual_larger). When
+    # `lr_schedule="warmup_cosine"`, wrap AdamW with a LambdaLR that does
+    # linear warmup for `warmup_steps` then cosine decay to 0 over the
+    # remaining total step count (main pass + fresh-emphasis pass). The
+    # default `lr_schedule="constant"` preserves byte-for-byte legacy
+    # behaviour (no scheduler, flat LR).
+    warmup_steps: int = 0,
+    lr_schedule: str = "constant",
+    # ---- Fresh-emphasis pass (plan: turnrd_v2_continual_larger). After
+    # the main training loop, run a SECOND pass over only the last
+    # `fresh_emphasis_window_rounds` rounds of records for
+    # `fresh_emphasis_n_epochs` epochs. The fresh pass does NOT apply
+    # recency decay (those rows are already the freshest); it just gives
+    # the optimizer extra gradient steps on the most-recent slice of data.
+    # Both default 0 = disabled = byte-for-byte legacy behaviour.
+    fresh_emphasis_window_rounds: int = 0,
+    fresh_emphasis_n_epochs: int = 0,
     # Optional replay-buffer **recency decay**. When set to H > 0, each
     # batch's loss is multiplied by a per-batch scalar equal to the
     # mean over its records of `0.5 ** ((max_round_idx - round_idx) / H)`,
@@ -225,6 +242,49 @@ def train_turnrd(
     # ---------------------------------------------------------------------
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(lr))
+
+    # ---- LR schedule setup (plan: turnrd_v2_continual_larger). ----------
+    # `lr_schedule="warmup_cosine"` wraps the optimizer with a LambdaLR
+    # that does linear warmup over `warmup_steps` then cosine decay to 0
+    # over the remaining total step count (main + fresh-emphasis). Default
+    # `"constant"` is a no-op so legacy callers preserve their flat-LR
+    # behaviour.
+    _n_batches_per_epoch = max(1, (len(dataset) + int(batch_size) - 1) // int(batch_size))
+    _total_steps_main = int(n_epochs) * _n_batches_per_epoch
+    _total_steps_fresh_est = 0
+    if int(fresh_emphasis_window_rounds) > 0 and int(fresh_emphasis_n_epochs) > 0:
+        # Over-estimate using the full-buffer batch count; the actual fresh
+        # subset is smaller. Cosine decay will reach the floor earlier than
+        # planned; that's acceptable for a tail pass.
+        _total_steps_fresh_est = int(fresh_emphasis_n_epochs) * _n_batches_per_epoch
+    _total_steps_for_schedule = max(1, _total_steps_main + _total_steps_fresh_est)
+    scheduler = None
+    _lr_schedule_norm = str(lr_schedule).lower().strip()
+    if _lr_schedule_norm == "warmup_cosine":
+        import math as _math
+        _ws = max(0, int(warmup_steps))
+        _total_for_decay = max(1, _total_steps_for_schedule - _ws)
+
+        def _lr_lambda(step: int) -> float:
+            if step < _ws:
+                return float(step + 1) / max(1, _ws)
+            progress = float(step - _ws) / float(_total_for_decay)
+            progress = min(1.0, max(0.0, progress))
+            return 0.5 * (1.0 + _math.cos(_math.pi * progress))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
+        print(
+            f"[turnrd train] LR schedule = warmup_cosine: warmup_steps={_ws}, "
+            f"total_steps={_total_steps_for_schedule} (main {_total_steps_main} + "
+            f"fresh_est {_total_steps_fresh_est})",
+            flush=True,
+        )
+    elif _lr_schedule_norm != "constant":
+        raise ValueError(
+            f"train_turnrd: lr_schedule must be 'constant' or 'warmup_cosine'; "
+            f"got {lr_schedule!r}."
+        )
+    # ---------------------------------------------------------------------
 
     initial_loss: float | None = None
     final_loss: float = float("nan")
@@ -450,6 +510,8 @@ def train_turnrd(
 
             loss.backward()
             optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
             n_steps += 1
 
             loss_value = float(loss.detach().item())
@@ -470,6 +532,125 @@ def train_turnrd(
                     flush=True,
                 )
 
+    # ---- Fresh-emphasis pass (plan: turnrd_v2_continual_larger). --------
+    # After the main loop, optionally run a SECOND pass over only the last
+    # `fresh_emphasis_window_rounds` rounds of records, for
+    # `fresh_emphasis_n_epochs` epochs. Recency decay is INTENTIONALLY
+    # disabled here — these rows are already fresh, and we want to give
+    # the optimizer extra gradient steps on the latest policy's data.
+    # The scheduler (if set) continues its decay through the fresh pass.
+    n_steps_fresh = 0
+    fresh_emphasis_info: dict[str, Any] | None = None
+    if int(fresh_emphasis_window_rounds) > 0 and int(fresh_emphasis_n_epochs) > 0:
+        # Compute max_round_idx INDEPENDENTLY of the decay-path
+        # (decay_max_round_idx is only populated when decay is enabled;
+        # fresh-emphasis should work regardless of the decay setting).
+        _all_round_idx = [r.round_idx for r in dataset if r.round_idx is not None]
+        if _all_round_idx:
+            _max_round = max(_all_round_idx)
+            _min_recent = int(_max_round) - int(fresh_emphasis_window_rounds) + 1
+            _fresh_records = [
+                r for r in dataset
+                if r.round_idx is not None and r.round_idx >= _min_recent
+            ]
+        else:
+            _min_recent = None
+            _fresh_records = []
+        if _fresh_records:
+            class _ListShim:
+                def __init__(self, records): self.records = records
+                def __len__(self): return len(self.records)
+                def __getitem__(self, i): return self.records[i]
+            _fresh_ds = _ListShim(_fresh_records)
+            print(
+                f"[turnrd train] fresh-emphasis pass: {len(_fresh_records)} rows "
+                f"(round_idx >= {_min_recent}), {fresh_emphasis_n_epochs} epochs, "
+                f"decay=OFF",
+                flush=True,
+            )
+            for fe_epoch in range(int(fresh_emphasis_n_epochs)):
+                model.train()
+                for batch in _iter_batches(_fresh_ds, batch_size):
+                    collated = pad_collate(batch)
+                    turn_embeds = collated["turn_embeds"].to(target_device)
+                    attention_mask = collated["attention_mask"].to(target_device)
+                    final_reward = collated["final_reward"].to(target_device)
+                    optimizer.zero_grad(set_to_none=True)
+                    _flag_goal_cond = bool(
+                        getattr(getattr(model, "cfg", None), "goal_conditioned_value_head", False)
+                    )
+                    if _flag_goal_cond and "goal_emb" in collated:
+                        _goal_emb_t = collated["goal_emb"].to(target_device)
+                        _goal_emb_mask_t = collated.get("goal_emb_mask")
+                        if _goal_emb_mask_t is not None:
+                            _goal_emb_mask_t = _goal_emb_mask_t.to(target_device)
+                        out = model(
+                            turn_embeds, attention_mask,
+                            goal_emb=_goal_emb_t, goal_emb_mask=_goal_emb_mask_t,
+                        )
+                    else:
+                        out = model(turn_embeds, attention_mask)
+                    # v2-only loss (matches main loop's v2 branch; we don't
+                    # support fresh-emphasis on v1/mode-2 paths since the
+                    # plan targets the goalcondFiLM-on-v2 SOTA).
+                    if version_norm != "v2":
+                        raise RuntimeError(
+                            "train_turnrd: fresh_emphasis pass only supports "
+                            "version='v2' (current SOTA recipe)."
+                        )
+                    pred_loss = loss_v2_pred(out, final_reward)
+                    rank_loss = loss_v2_rank(out, final_reward, margin=float(rank_margin))
+                    progress_loss = loss_v2_progress_prior(out, attention_mask)
+                    loss = (
+                        pred_loss
+                        + float(lambda_rank) * rank_loss
+                        + float(lambda_progress) * progress_loss
+                    )
+                    if float(lambda_value) != 0.0:
+                        fmask = attention_mask.to(dtype=final_reward.dtype)
+                        if "progress_signal" in collated:
+                            target_v = collated["progress_signal"].to(target_device).to(
+                                dtype=final_reward.dtype
+                            ) * fmask
+                        elif "progress" in collated:
+                            target_v = collated["progress"].to(target_device).to(
+                                dtype=final_reward.dtype
+                            ) * fmask
+                        else:
+                            T_i = fmask.sum(dim=-1, keepdim=True).clamp_min(1.0)
+                            target_v = (final_reward.unsqueeze(-1) / T_i) * fmask
+                        value_attention_mask = attention_mask
+                        if _flag_goal_cond and "goal_emb_mask" in collated:
+                            row_mask = collated["goal_emb_mask"].to(
+                                target_device
+                            ).to(dtype=attention_mask.dtype).unsqueeze(-1)
+                            value_attention_mask = attention_mask * row_mask.to(
+                                attention_mask.dtype
+                            )
+                        value_loss = loss_v2_value(out, target_v, value_attention_mask)
+                        loss = loss + float(lambda_value) * value_loss
+                    # NO recency-decay multiplication (this is the fresh pass).
+                    loss.backward()
+                    optimizer.step()
+                    if scheduler is not None:
+                        scheduler.step()
+                    n_steps_fresh += 1
+                    final_loss = float(loss.detach().item())
+            fresh_emphasis_info = {
+                "window_rounds": int(fresh_emphasis_window_rounds),
+                "n_epochs": int(fresh_emphasis_n_epochs),
+                "n_rows": len(_fresh_records),
+                "min_round_idx": _min_recent,
+                "n_steps": n_steps_fresh,
+            }
+        else:
+            print(
+                f"[turnrd train] fresh-emphasis: NO records with round_idx >= "
+                f"{_min_recent} — skipping (likely all-legacy dataset).",
+                flush=True,
+            )
+    # ---------------------------------------------------------------------
+
     saved_ckpt: str | None = None
     if ckpt_path is not None:
         ckpt_path = Path(ckpt_path)
@@ -481,9 +662,13 @@ def train_turnrd(
         "final_loss": float(final_loss),
         "initial_loss": float(initial_loss if initial_loss is not None else float("nan")),
         "n_steps": int(n_steps),
+        "n_steps_fresh": int(n_steps_fresh),
         "ckpt_path": saved_ckpt,
         "skipped_records": int(dataset.skipped_empty + dataset.skipped_missing_judge),
         "version": version_norm,
+        "lr_schedule": _lr_schedule_norm,
+        "warmup_steps": int(warmup_steps),
+        "fresh_emphasis": fresh_emphasis_info,
         "recency_decay": {
             "half_life": (
                 float(decay_half_life) if decay_half_life is not None else None

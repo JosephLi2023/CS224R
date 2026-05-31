@@ -81,6 +81,20 @@ def train_turnrd_run(
     recency_decay_half_life: float = 0.0,
     legacy_decay_weight: float = 0.5,
     min_batch_weight: float = 1e-3,
+    # ---- Cumulative warm-start (plan: turnrd_v2_continual_larger). When
+    # non-empty AND the file exists, load model state_dict with
+    # `strict=False` BEFORE training begins. Used by the orchestrator to
+    # pass the prior round's ckpt for warm-start across rounds. Default
+    # empty preserves byte-for-byte cold-start behaviour.
+    ckpt_in: str = "",
+    # ---- LR schedule (plan: turnrd_v2_continual_larger). Threads through
+    # to `train_turnrd`. Default "constant" is a no-op.
+    warmup_steps: int = 0,
+    lr_schedule: str = "constant",
+    # ---- Fresh-emphasis pass (plan: turnrd_v2_continual_larger). Default
+    # 0/0 = disabled, byte-for-byte legacy behaviour.
+    fresh_emphasis_window_rounds: int = 0,
+    fresh_emphasis_n_epochs: int = 0,
     # The producer pre-embeds turns; the standalone trainer doesn't need
     # the LoRA policy. We DO need the embedding width D, which the
     # producer wrote into the replay (we read it off the first record).
@@ -152,6 +166,29 @@ def train_turnrd_run(
     if torch.cuda.is_available():
         model.to("cuda:0")
 
+    # ---- Cumulative warm-start (plan: turnrd_v2_continual_larger). -----
+    # When `--ckpt-in` is non-empty AND the file exists, load the prior
+    # round's TurnRD ckpt into THIS round's freshly-constructed model
+    # before training. `strict=False` so a legacy no-FiLM ckpt can warm-
+    # start a FiLM-enabled model (the FiLM-specific keys stay at zero-init).
+    import os as _os
+    if ckpt_in and _os.path.exists(ckpt_in):
+        ckpt_in_state = torch.load(ckpt_in, map_location="cpu", weights_only=True)
+        result = model.load_state_dict(ckpt_in_state, strict=False)
+        n_loaded = len(ckpt_in_state) - len(result.missing_keys)
+        print(
+            f">>> warm-started from {ckpt_in} "
+            f"({n_loaded}/{len(ckpt_in_state)} tensors loaded; "
+            f"missing={len(result.missing_keys)}, unexpected={len(result.unexpected_keys)})",
+            flush=True,
+        )
+    elif ckpt_in:
+        print(
+            f">>> WARNING: ckpt_in={ckpt_in!r} does not exist; "
+            "cold-starting TurnRD from random init.",
+            flush=True,
+        )
+
     t0 = time.time()
     summary = train_turnrd(
         replay,
@@ -179,6 +216,10 @@ def train_turnrd_run(
         ),
         legacy_decay_weight=float(legacy_decay_weight),
         min_batch_weight=float(min_batch_weight),
+        warmup_steps=int(warmup_steps),
+        lr_schedule=str(lr_schedule),
+        fresh_emphasis_window_rounds=int(fresh_emphasis_window_rounds),
+        fresh_emphasis_n_epochs=int(fresh_emphasis_n_epochs),
     )
     elapsed = round(time.time() - t0, 2)
     summary["elapsed_s"] = elapsed
@@ -218,6 +259,11 @@ def main(
     recency_decay_half_life: float = 0.0,
     legacy_decay_weight: float = 0.5,
     min_batch_weight: float = 1e-3,
+    ckpt_in: str = "",
+    warmup_steps: int = 0,
+    lr_schedule: str = "constant",
+    fresh_emphasis_window_rounds: int = 0,
+    fresh_emphasis_n_epochs: int = 0,
 ) -> None:
     import json as _json
 
@@ -251,6 +297,11 @@ def main(
             recency_decay_half_life=recency_decay_half_life,
             legacy_decay_weight=legacy_decay_weight,
             min_batch_weight=min_batch_weight,
+            ckpt_in=ckpt_in,
+            warmup_steps=warmup_steps,
+            lr_schedule=lr_schedule,
+            fresh_emphasis_window_rounds=fresh_emphasis_window_rounds,
+            fresh_emphasis_n_epochs=fresh_emphasis_n_epochs,
         ),
         indent=2,
         default=str,

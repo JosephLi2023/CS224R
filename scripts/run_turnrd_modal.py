@@ -783,7 +783,7 @@ def _train_loop_cmd(cfg: OrchestrationConfig, round_idx: int) -> list[str]:
     return cmd
 
 
-def _train_turnrd_cmd(cfg: OrchestrationConfig) -> list[str]:
+def _train_turnrd_cmd(cfg: OrchestrationConfig, round_idx: int = 0) -> list[str]:
     """`modal run --detach infra/app_train_turnrd.py --replay <p> --mode N ...`
 
     Round-independent: every round reads and writes the same shared
@@ -848,6 +848,14 @@ def _train_turnrd_cmd(cfg: OrchestrationConfig) -> list[str]:
         ("--recency-decay-half-life", "recency_decay_half_life", None),
         ("--legacy-decay-weight", "legacy_decay_weight", None),
         ("--min-batch-weight", "min_batch_weight", None),
+        # ---- LR schedule + fresh-emphasis (plan: turnrd_v2_continual_larger).
+        # Forwarded only when present in the JSON's turnrd block so configs
+        # without these keys preserve legacy behavior (constant LR, no
+        # fresh-emphasis pass).
+        ("--warmup-steps", "warmup_steps", None),
+        ("--lr-schedule", "lr_schedule", None),
+        ("--fresh-emphasis-window-rounds", "fresh_emphasis_window_rounds", None),
+        ("--fresh-emphasis-n-epochs", "fresh_emphasis_n_epochs", None),
     ]:
         if jkey in turnrd_block:
             cmd.extend([cli, str(turnrd_block[jkey])])
@@ -866,6 +874,14 @@ def _train_turnrd_cmd(cfg: OrchestrationConfig) -> list[str]:
             "goal-conditioned-value-head",
             bool(turnrd_block["goal_conditioned_value_head"]),
         ))
+    # ---- Cumulative warm-start (plan: turnrd_v2_continual_larger).
+    # When `turnrd.cumulative_train` is true AND we're past round 0,
+    # pass `--ckpt-in <cfg.ckpt_path>` so the standalone trainer warm-
+    # starts from the prior round's saved ckpt instead of cold-restart
+    # from `torch.manual_seed(0)`. Default (key absent or false) is
+    # byte-for-byte legacy cold-start.
+    if bool(turnrd_block.get("cumulative_train", False)) and int(round_idx) >= 1:
+        cmd.extend(["--ckpt-in", cfg.ckpt_path])
     cmd.extend(cfg.extra_turnrd_args)
     return cmd
 
@@ -1008,7 +1024,7 @@ def _orchestrate(cfg: OrchestrationConfig) -> int:
             )
             continue
         rc = _run(
-            _train_turnrd_cmd(cfg),
+            _train_turnrd_cmd(cfg, round_idx),
             dry_run=cfg.dry_run,
             label=f"Round {round_idx}: train_turnrd ({cfg.turnrd_epochs} epochs)",
         )
