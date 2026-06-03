@@ -1,47 +1,21 @@
 #!/usr/bin/env bash
 # WebShop SOTA - HGPO-Attention (TurnRDv2) v1.
-#
-# Recipe-transplant from AlfWorld's 73% SOTA (configs/TurnRDV2_alfworld_SOTA_10round_mlpr32_v3.json)
-# PLUS the WebShop-specific attribute-progress dense signal
-# (env.use_attribute_progress_intermediate_reward=true) - see plan
-# /Users/shoupeili/.llms/plans/webshop_sota_recipe_transplant_dense_signal.plan.md.
-#
-# Geometry (seed=11, rounds=10, eps=80):
-#   base_task_id_offset = 11 * 10 * 80 = 8800
-#   train task range    = [8800, 9600)
-#   eval task range     = [6500, 6600)   (disjoint)
-#   disjoint from flatGRPO v1 (seed=23 -> [18400, 19200))
-#   disjoint from LLMJudge v1 (seed=31 -> [24800, 25600))
-#
-# ~3-4 hours wall-clock. K=8 + 100-eps eval, 10 rounds * 80 eps.
+# Recipe-transplant from AlfWorld's 73% SOTA + WebShop attribute-progress dense
+# signal (env.use_attribute_progress_intermediate_reward=true). seed=11, rounds=10, eps=80.
+# Override via env vars: SFT_ADAPTER, CONFIG, RUN_PREFIX, REPLAY, CKPT, ROUNDS, etc.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-# Warm-start adapter at R0. Default points at the WebShop SFT v3
-# rank-32 + 7-MLP-target adapter produced by
-# `scripts/run_webshop_sft_v3_mlpr32.sh` (see
-# ~/.llms/plans/webshop_sft_mlpr32_oracle_baseline.plan.md).
-#
-# PLACEHOLDER - replace `REPLACE_WITH_TS_FROM_PHASE4` with the
-# timestamp suffix of the actual adapter dir produced by Phase 4
-# (look at the `ckpt_dir` field printed at the end of the SFT
-# train step's Modal log; format: YYYYMMDD_HHMMSS).
-# Or override at invocation time:
-#   SFT_ADAPTER=/vol/checkpoints/sft_webshop_v3_mlpr32_<ts> \
-#     bash scripts/run_webshop_SOTA_attention_v1.sh
-#
-# Falls back to the legacy rank-16 attention-only adapter
-# `/vol/checkpoints/sft_v3_20260504_154752` ONLY if the placeholder
-# is left in place AND no env override is supplied; we DO NOT default
-# to the legacy path because doing so would silently revert to the
-# rank-16 -> rank-32 arch mismatch the new SFT was created to fix.
+# Warm-start adapter at R0 (WebShop SFT v3 rank-32 + 7-MLP, from
+# scripts/run_webshop_sft_v3_mlpr32.sh). Replace REPLACE_WITH_TS_FROM_PHASE4 or
+# override via SFT_ADAPTER=/vol/checkpoints/sft_webshop_v3_mlpr32_<ts>. Do NOT
+# default to the legacy rank-16 adapter (arch mismatch the new SFT fixes).
 SFT_ADAPTER="${SFT_ADAPTER:-/vol/checkpoints/sft_webshop_v3_mlpr32_REPLACE_WITH_TS_FROM_PHASE4}"
 
 CONFIG=${CONFIG:-configs/TurnRDV2_webshop_SOTA_10round_mlpr32_v1.json}
 RUN_PREFIX=${RUN_PREFIX:-webshop_attention_v1}
-# REPLAY / CKPT defaults MUST match the config's turnrd.replay_buffer_path
-# and turnrd.ckpt_path; the run_turnrd_modal.py orchestrator enforces this
-# at pre-flight to avoid a producer/standalone-trainer split-brain.
+# REPLAY / CKPT defaults must match the config's turnrd.replay_buffer_path /
+# turnrd.ckpt_path (run_turnrd_modal.py enforces this at pre-flight).
 REPLAY=${REPLAY:-/vol/cache/TurnRDV2_webshop_SOTA_10round_mlpr32_v1/replay.jsonl}
 CKPT=${CKPT:-/vol/cache/TurnRDV2_webshop_SOTA_10round_mlpr32_v1/ckpt.pt}
 ROUNDS=${ROUNDS:-10}

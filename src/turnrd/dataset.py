@@ -1,29 +1,20 @@
 """TurnRD replay-buffer reader (Method B).
 
-Schema (one JSON object per line in the replay JSONL file):
+Schema (one JSON object per line):
 ```
 {
   "task_id": str,
   "turn_embeds": float[][T_i][D],   # pre-computed mean-pooled hidden states
-                                    # (one [D]-vector per turn, length T_i)
   "final_reward": float,
-  "judge_labels": float[T_i] | null # cached normalized judge scores per turn
-                                    # (Mode 2 only; null when not available)
-  "progress":     float[T_i] | null # OPTIONAL per-turn env progress signal
-                                    # (e.g. AlfWorld per-step reward). Used as
-                                    # the v2 value-head target when every
-                                    # record in a batch carries it. JSONL alias
-                                    # `raw_env_rewards` also accepted.
-  "progress_signal": float[T_i] | null # OPTIONAL dense per-turn shaping signal
-                                    # from the env adapter (e.g. ALFWorld
-                                    # expert-plan-length reduction). Preferred
-                                    # over `progress` for the V-head target
-                                    # when present in every record.
+  "judge_labels": float[T_i] | null # judge scores per turn (Mode 2)
+  "progress":     float[T_i] | null # per-turn env signal; v2 V-head target
+                                    # (alias `raw_env_rewards`)
+  "progress_signal": float[T_i] | null # dense shaping signal; preferred over
+                                    # `progress` for the V-head target
 }
 ```
 
-Embeddings are pre-computed producer-side (the rollout already has the policy
-+ tokenizer loaded) so the trainer never re-tokenizes or re-forwards.
+Embeddings are pre-computed producer-side so the trainer never re-tokenizes.
 """
 from __future__ import annotations
 
@@ -44,10 +35,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class TurnRDRecord:
-    """One row of the replay JSONL - the producer's contract with this reader.
-
-    `turn_embeds` is `list[list[float]]` after `json.loads`; conversion to
-    tensors happens in `pad_collate`.
+    """One row of the replay JSONL. `turn_embeds` is `list[list[float]]`;
+    tensors are built in `pad_collate`.
     """
 
     task_id: str
@@ -55,21 +44,17 @@ class TurnRDRecord:
     final_reward: float
     judge_labels: Optional[list[float]] = None  # [T_i] or None
     progress: Optional[list[float]] = None  # [T_i] or None - per-turn env signal
-    # Optional dense per-turn shaping signal from the env adapter (e.g.
-    # ALFWorld expert-plan-length reduction). Preferred over `progress` for
-    # the V-head target when present. None on non-ALFWorld envs.
+    # Dense per-turn shaping signal (e.g. ALFWorld expert-plan reduction);
+    # preferred over `progress` for the V-head target. None on non-ALFWorld.
     progress_signal: Optional[list[float]] = None  # [T_i] or None
-    # Round index (0-based). Producer writes the parent train_loop's round
-    # value; the trainer's recency-decay path reads it. `None` on legacy rows.
+    # Round index (0-based), read by the trainer's recency-decay path. None on
+    # legacy rows.
     round_idx: Optional[int] = None
-    # Optional per-trajectory AlfWorld goal text, parsed from the Turn 0
-    # observation by `src.turnrd.goal_extractor.extract_goal_text`. None for
-    # non-AlfWorld envs. Consumed (with `goal_emb`) by the FiLM V-head.
+    # Per-trajectory AlfWorld goal text (Turn 0 obs); consumed with `goal_emb`
+    # by the FiLM V-head. None for non-AlfWorld envs.
     goal_text: Optional[str] = None
-    # Optional per-trajectory embedding of `goal_text` in the same space as
-    # `turn_embeds[t]` (`[input_dim]`). Consumed by the FiLM V-head. `None` on
-    # legacy rows; `pad_collate` emits a `goal_emb_mask` to zero-mask
-    # missing-goal rows rather than dropping them.
+    # Per-trajectory `goal_text` embedding (`[input_dim]`) for the FiLM V-head.
+    # None on legacy rows; `pad_collate` emits a `goal_emb_mask` for them.
     goal_emb: Optional[list[float]] = None
 
     def __post_init__(self) -> None:
@@ -153,20 +138,9 @@ class TurnRDRecord:
 
 
 class TurnRDReplayDataset:
-    """JSONL-backed replay buffer for the standalone TurnRD trainer.
-
-    Loads + parses on construction so per-step iteration is cheap (a plain
-    `list` + a separate `pad_collate`, no `torch.utils.data` dependency).
-
-    Args:
-        jsonl_path: path to a JSONL file written by the rollout producer.
-        mode: 1 (predict R) or 2 (distill judge labels). Mode 2 also filters
-              out rows whose `judge_labels` are `None`.
-        max_records: optional cap on records loaded from the start.
-
-    Recency: this dataset does NOT filter by `round_idx`; the buffer is
-    append-only and the trainer downweights stale rows via
-    `train_turnrd(..., recency_decay_half_life=N)`.
+    """JSONL-backed replay buffer, parsed on construction. `mode` 2 drops rows
+    lacking `judge_labels`. Does not filter by `round_idx` (the trainer applies
+    recency decay at loss time).
     """
 
     def __init__(
@@ -208,8 +182,7 @@ class TurnRDReplayDataset:
                     self.skipped_empty += 1
                     continue
                 try:
-                    # Backward-compat: legacy producers wrote `raw_env_rewards`;
-                    # new producers write `progress`.
+                    # Backward-compat alias: `raw_env_rewards` -> `progress`.
                     raw_progress = obj.get("progress", obj.get("raw_env_rewards", None))
                     raw_progress_signal = obj.get("progress_signal", None)
                     raw_round_idx = obj.get("round_idx", None)
@@ -281,22 +254,12 @@ class TurnRDReplayDataset:
 
 
 def pad_collate(batch: list[TurnRDRecord]) -> dict[str, torch.Tensor]:
-    """Pad a list of `TurnRDRecord` to fixed-shape tensors.
+    """Pad `TurnRDRecord`s to fixed-shape tensors.
 
-    Returns a dict with:
-    - `turn_embeds`:    `[B, T_max, D]` float32
-    - `attention_mask`: `[B, T_max]` long (1 == real, 0 == padded)
-    - `final_reward`:   `[B]` float32
-    - `judge_labels`:   `[B, T_max]` float32 - present iff EVERY record has
-                        non-None `judge_labels` (padded positions 0.0).
-    - `progress`:       `[B, T_max]` float32 - present iff EVERY record has
-                        non-None `progress`. All-or-nothing so zero-padding
-                        isn't mistaken for real env signal.
-    - `progress_signal`:`[B, T_max]` float32 - same all-or-nothing gate;
-                        preferred over `progress` for the V-head target.
-    - `goal_emb`:       `[B, input_dim]` float32 - present when any record
-                        carries a goal embedding, paired with
-                        `goal_emb_mask: [B]`; absent otherwise.
+    Returns: `turn_embeds [B,T,D]`, `attention_mask [B,T]`, `final_reward [B]`,
+    plus `judge_labels`/`progress`/`progress_signal [B,T]` (each present only
+    if every record has it) and `goal_emb [B,D]` + `goal_emb_mask [B]` (if any
+    record carries a goal embedding).
     """
     if not batch:
         raise ValueError("pad_collate: batch must be non-empty.")
@@ -325,9 +288,8 @@ def pad_collate(batch: list[TurnRDRecord]) -> dict[str, torch.Tensor]:
     progress_signal: torch.Tensor | None = (
         torch.zeros(B, T_max, dtype=torch.float32) if have_all_progress_signal else None
     )
-    # Per-trajectory goal embedding (FiLM V-head). Emitted as [B, D] (zeros on
-    # absent rows) with a `goal_emb_mask: [B]` flagging real rows, so the model
-    # can skip FiLM on missing-goal rows.
+    # Goal embedding [B, D] (zeros on absent rows) + `goal_emb_mask [B]` so the
+    # model skips FiLM on missing-goal rows.
     any_goal_emb = any(rec.goal_emb is not None for rec in batch)
     goal_emb: torch.Tensor | None = (
         torch.zeros(B, D, dtype=torch.float32) if any_goal_emb else None
@@ -335,9 +297,7 @@ def pad_collate(batch: list[TurnRDRecord]) -> dict[str, torch.Tensor]:
     goal_emb_mask: torch.Tensor | None = (
         torch.zeros(B, dtype=torch.float32) if any_goal_emb else None
     )
-    # Round index per record (always emitted; -1 sentinel for legacy rows).
-    # Read by the trainer's recency-decay path. No all-or-nothing gate, so
-    # mixed legacy + fresh batches still produce a valid update.
+    # Round index per record (always emitted; -1 for legacy rows).
     round_idx_t = torch.full((B,), -1, dtype=torch.long)
 
     for i, rec in enumerate(batch):

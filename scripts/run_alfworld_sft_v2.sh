@@ -1,44 +1,20 @@
 #!/usr/bin/env bash
-# run_alfworld_sft_v2.sh - Train an improved AlfWorld SFT baseline (v1: 0.40, target >=0.55).
-#
-# Self-contained pipeline for a teammate running on a fresh Modal account:
-#   1. Install AlfWorld game data on the volume (one-time, ~20 min).
-#   2. Generate 1000 expert SFT trajectories (5x more than v1's 200).
-#   3. Train SFT v2 with longer training + larger context window.
-#   4. Eval on 200 held-out games (4x more than v1's 50, tighter CI).
-#
-# Recipe (v1 -> v2):
-#   n_games            200 -> 1000   (5x more expert demos, ~10k SFT examples)
-#   epochs             3   -> 6      (2x; pairs with the lower LR)
-#   learning_rate      1e-4 -> 5e-5  (half; pairs with the higher epoch count)
-#   max_seq_len        1024 -> 2048  (2x; AlfWorld histories are long)
-#   max_history_turns  3   -> 6      (2x; uses the new seq_len budget for context)
-#   grad_accum         4   -> 8      (2x; compensates for 2x attention memory at seq_len=2048)
-#   eval_episodes      50  -> 200    (4x; tightens the 95% CI)
+# run_alfworld_sft_v2.sh - Train an improved AlfWorld SFT baseline (target >=0.55).
+# Pipeline: install AlfWorld data -> generate expert SFT trajs -> train SFT v2 -> eval.
 #
 # Usage:
 #   bash scripts/run_alfworld_sft_v2.sh [--dry-run|--full|--skip-install|--skip-gen|--train-only|--eval-only]
 #
 # Modes:
-#   --dry-run        : print every modal command without running anything (verify env vars + paths).
+#   --dry-run        : print every modal command without running anything.
 #   --full (default) : run all 4 steps end-to-end.
-#   --skip-install   : assume AlfWorld data is already on the volume; start from step 2.
-#   --skip-gen       : assume the SFT data file already exists; start from step 3.
+#   --skip-install   : AlfWorld data already on the volume; start from step 2.
+#   --skip-gen       : SFT data file already exists; start from step 3.
 #   --train-only     : only run step 3 (assumes data file is at $DATA_PATH).
-#   --eval-only      : only run step 4 (assumes adapter exists at $ADAPTER_PATH; set ADAPTER_PATH env var).
+#   --eval-only      : only run step 4 (set ADAPTER_PATH env var).
 #
-# Override knobs via env vars (defaults shown):
-#   N_GAMES=1000  EPOCHS=6  LR=5e-5  MAX_SEQ_LEN=2048  MAX_HISTORY_TURNS=6
-#   GRAD_ACCUM=8  MIN_REWARD=0.5  EVAL_EPS=200  EVAL_TASK_BASE=6500
-#   RUN_TS=$(date +%Y%m%d_%H%M%S)  RUN_NAME=sft_alfworld_v2_${RUN_TS}
-#   DATA_PATH=/vol/data/alfworld/sft_trajs_v2.jsonl
-#   LOG_DIR=/tmp
-#
-# Resume after partial failure:
-#   - Install crashed:    re-run with --full (install is idempotent on Modal volume).
-#   - Gen crashed mid-way: re-run with --skip-install (gen overwrites the JSONL fresh).
-#   - Train crashed:      re-run with --train-only (data file is preserved).
-#   - Eval crashed:       re-run with --eval-only ADAPTER_PATH=/vol/checkpoints/<run_name>.
+# Override knobs via env vars: N_GAMES EPOCHS LR MAX_SEQ_LEN MAX_HISTORY_TURNS
+#   GRAD_ACCUM MIN_REWARD EVAL_EPS EVAL_TASK_BASE RUN_NAME DATA_PATH LOG_DIR.
 
 set -uo pipefail
 
@@ -64,12 +40,8 @@ GRAD_ACCUM=${GRAD_ACCUM:-8}
 MIN_REWARD=${MIN_REWARD:-0.5}
 EVAL_EPS=${EVAL_EPS:-200}
 EVAL_TASK_BASE=${EVAL_TASK_BASE:-6500}
-# LoRA arch knobs (Phase 1 plumb-through, see
-# ~/.llms/plans/alfworld_8round_mlp_rank32_restart.plan.md).
-# Defaults preserve the original v2 baseline (rank-16 attention-only).
-# Override for the rank-32 MLP+attn experiment with:
-#   LORA_RANK=32 LORA_TARGETS=q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj \
-#     bash scripts/run_alfworld_sft_v2.sh --full
+# LoRA arch knobs. Defaults: rank-16 attention-only; override LORA_RANK/LORA_TARGETS
+# for the rank-32 MLP+attn experiment.
 LORA_RANK=${LORA_RANK:-16}
 LORA_TARGETS=${LORA_TARGETS:-q_proj,k_proj,v_proj,o_proj}
 

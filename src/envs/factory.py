@@ -16,9 +16,7 @@ def make_env(env_cfg: dict, seed: int):
         )
 
     if name == "alfworld":
-        # seed is unused by the ALFWorldAdapter constructor but accepted for
-        # parity with WebShop. The adapter forwards train_eval=task_split into
-        # env_kwargs internally.
+        # seed is unused by the adapter but accepted for parity with WebShop.
         env_kwargs = dict(env_cfg.get("env_kwargs", {}))
         if seed is not None and "seed" not in env_kwargs:
             env_kwargs.setdefault("seed", int(seed))

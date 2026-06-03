@@ -1,17 +1,8 @@
 """ReAct-style prompt rendering for ALFWorld trajectories.
 
-Pure-Python: no torch / transformers / vLLM dependency, so the prompt format
-is unit-testable without a GPU.
-
-Mirrors `src/envs/prompts/react_webshop.py` - same `render_*_turn_prompt`
-signature, same `_format_history` truncation pattern, same `parse_react_action`
-body. Only the system prompt + action vocabulary differs.
-
-ALFWorld's action surface is a small fixed verb set (`go to`, `take`, `put`,
-`open`, `close`, `examine`, `look`, `inventory`, `use`, etc.) typically
-combined with object names from the current room. The system prompt below
-keeps the ReAct cadence used elsewhere in the project so the rollout
-collector + parser are env-agnostic.
+Pure-Python (no torch / transformers / vLLM) so the prompt format is
+unit-testable without a GPU. Mirrors `react_webshop.py`; only the system
+prompt and action vocabulary differ.
 """
 
 from __future__ import annotations
@@ -37,9 +28,7 @@ ALFWORLD_SYSTEM_PROMPT = (
 def _format_history(history: Iterable[Any]) -> str:
     """Render previous (observation, action) turns into a chat-style transcript.
 
-    `history` is an iterable of `TurnRecord` (or any object exposing
-    `observation_text` and `action_text` attributes). We avoid importing
-    `TurnRecord` directly to keep this module dependency-free.
+    Accepts any objects exposing `observation_text` / `action_text`.
     """
     lines: list[str] = []
     for t in history:
@@ -62,23 +51,9 @@ def render_alfworld_turn_prompt(
 ) -> str:
     """Build the prompt for the agent's next ALFWorld turn.
 
-    Args:
-        state: object exposing `observation_text` (str) and optionally
-               `valid_actions` (list[str]) and `instruction` (str).
-        history: completed turns (TurnRecord-like) so far in this trajectory.
-        instruction: explicit goal string; defaults to `state.instruction`
-                     if available, else the empty string.
-        valid_actions: explicit action whitelist; defaults to
-                       `state.valid_actions` if available, else None.
-        max_history_turns: keep only the most recent N turns of history in
-                           the prompt to bound vLLM context growth (default 3
-                           keeps prompts well under the 2048-token cap; ALFWorld
-                           trajectories can hit 30+ turns on multi-stage tasks
-                           so trimming is essential).
-
-    Returns:
-        Prompt string ending with `Thought:` so the model is prompted to
-        produce a Thought + Action block.
+    Reads `observation_text`, `instruction`, and `valid_actions` from `state`
+    (overridable via kwargs), appends the most recent `max_history_turns`
+    turns, and ends with `Thought:` to prompt a Thought + Action block.
     """
     obs_text = getattr(state, "observation_text", "") or ""
     if instruction is None:
@@ -112,17 +87,10 @@ def render_alfworld_turn_prompt(
 
 
 def parse_react_action(generation: str) -> str:
-    """Extract the `Action: ...` line from a model generation.
+    """Extract the `Action: ...` body from a model generation.
 
-    Identical body to `react_webshop.parse_react_action` - duplicated here
-    rather than imported so the env-dispatch test in
-    `tests/unit/test_train_loop_env_dispatch.py` can verify each env's
-    parser is independently importable.
-
-    Returns the action body (everything after `Action:` on the first matching
-    line). Falls back to the first non-empty line if no `Action:` prefix is
-    found, which makes the function robust to the policy's early-training
-    drift before it has internalized the ReAct format.
+    Identical to `react_webshop.parse_react_action`, duplicated so each env's
+    parser is independently importable. Falls back to the first non-empty line.
     """
     for raw in generation.splitlines():
         line = raw.strip()

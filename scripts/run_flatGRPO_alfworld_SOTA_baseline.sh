@@ -1,48 +1,8 @@
 #!/usr/bin/env bash
 # AlfWorld SOTA - Flat GRPO baseline (alpha=1.0) to quantify credit-assignment lift.
-#
-# The alpha-sweep (reports/alfworld_alpha_sweep_README.md) tested
-# alpha in {0.25, 0.50, 0.75} but never alpha=1.0, so we can't isolate how
-# much of the TurnRDV2 SOTA gain is the per-turn signal vs the Tier-2
-# fix-package (lr=5e-6, K=8, dead-K guard).
-#
-# This run flips two knobs vs the SOTA recipe:
-#   1. hgpo.alpha          : 0.5 -> 1.0   (drop per-turn signal; A_H = A_traj)
-#   2. hgpo.decomposer     : turnrd -> progress
-#                            (decomposer is inert at alpha=1.0; switching to
-#                             'progress' removes the TurnRD model + replay
-#                             buffer + per-round train_turnrd cycle)
-# Everything else (env, K=8, lr=5e-6, kl=0.04, rank-32 LoRA + MLP targets,
-# num_train_games=400, dense intermediate_reward signals, eval pool, warm-start
-# adapter family, rounds=10, eps/round=80, T=1.0) is identical to
-# scripts/run_alfworld_SOTA_10round_mlpr32_v3.sh, so the eval delta isolates
-# the per-turn signal's contribution.
-#
-# decomposer='progress' (not 'turnrd') at alpha=1.0: the combined advantage
-# is A_H = 1.0*A_traj + 0.0*A_turn, so A_turn is multiplied by zero regardless
-# of the decomposer (see combine in src/algorithms/grpo/advantage.py:130).
-# 'progress' is pure-Python and parameter-free, so it avoids building a V-head
-# and running train_turnrd per round. This is NOT Progress-HGPO (Method C),
-# which runs decomposer='progress' at alpha<1.0 so the per-turn signal flows.
-#
-# Geometry (seed=41, rounds=10, eps=80):
-#   base_task_id_offset = 41 * 10 * 80 = 32800
-#   train task range    = [32800, 33600)
-#   eval task range     = [6500, 6600)   (disjoint, identical to v3 SOTA)
-#   disjoint from v1 (seed=11 -> [5280, 5760))
-#   disjoint from v2 (seed=23 -> [14720, 15360))
-#   disjoint from v3 (seed=31 -> [24800, 25600))
-#
-# ~4-5 hours wall-clock. Faster than v3 SOTA because there's no train_turnrd
-# per round and no /vol/cache/turnrd_* IO. Can run in parallel with v3 SOTA -
-# disjoint task slice and run-name prefix.
-#
-# Pass criterion: expected alpha=1.0 mean pct_success should land near
-# alpha=0.75 mean (0.518) from the alpha-sweep. The credit-assignment lift is
-# quantified as: lift = (v3 SOTA alpha=0.5 best mean) - (this run alpha=1.0
-# best mean). A null result (this run >= v3 SOTA mean - noise floor) would
-# imply the per-turn signal contributes <2pp lift, consistent with
-# reports/turn_adv_noise_analysis.md.
+# Flips two knobs vs the SOTA recipe: hgpo.alpha 0.5->1.0 and decomposer turnrd->progress
+# (inert at alpha=1.0). seed=41, rounds=10, eps=80; everything else matches v3 SOTA.
+# Override via env vars: SFT_ADAPTER (required), CONFIG, RUN_PREFIX, ROUNDS, etc.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -79,17 +39,9 @@ fi
 BASE_OFFSET=$(( SEED * ROUNDS * EPS_PER_ROUND ))
 TRAIN_HI=$(( BASE_OFFSET + ROUNDS * EPS_PER_ROUND ))
 
-# Read K_trajectories_per_task + gpu_mem_util + sync_every from the JSON
-# config so we mirror the orchestrator's flag-derivation logic for
-# train_loop_alfworld. (Flat GRPO has no TurnRD trainer to coordinate,
-# so we invoke `modal run infra/app_train_loop.py::train_loop_alfworld`
-# directly in a per-round bash for-loop. This matches the WebShop
-# flatGRPO launcher and the orchestrator's error message: non-TurnRD
-# configs should run directly via `modal run infra/app_train_loop.py`.)
-#
-# Capture python stdout into a variable first so an exception (missing
-# config, malformed JSON) fails the script via `set -e` instead of
-# silently producing empty values that get spliced into `modal run`.
+# Read K/gpu_mem_util/sync_every from the JSON config (Flat GRPO runs
+# app_train_loop.py per round directly; no TurnRD trainer to coordinate).
+# Capture stdout first so a JSON/config error fails via set -e.
 _CFG_PROBE=$(python -c "
 import json, sys
 with open('${CONFIG}') as f: c = json.load(f)
@@ -104,9 +56,7 @@ if [[ -z "${K_PER_TASK}" ]]; then
   echo "ERROR: K_trajectories_per_task probe returned empty for ${CONFIG}"; exit 1
 fi
 
-# AlfWorld max_steps lives under env.max_steps in the config; the modal
-# entrypoint takes it via `--max-turns`. Pull it from the same source
-# of truth so the two stay in sync.
+# Read env.max_steps from the config; passed to the entrypoint via --max-turns.
 MAX_TURNS=$(python -c "
 import json
 with open('${CONFIG}') as f: c = json.load(f)
@@ -144,11 +94,8 @@ echo "                       requires decomposer='turnrd'; not applicable here).
 echo "  Parallel-safe      : YES - disjoint task ranges + disjoint run-name prefix."
 echo "========================================"
 
-# In-bash per-round driver. Adapter chaining mirrors run_turnrd_modal.py's
-# carry-policy mode: R0 loads ${SFT_ADAPTER}; R_N>0 loads R_{N-1}'s saved
-# adapter. Each round saves to ${ADAPTER_DIR}/<prefix>_seed<S>_round<NN>_adapter
-# so the chain is deterministic + recoverable on partial failure (just
-# restart with START_ROUND=<last_completed+1>).
+# Per-round driver: R0 loads the SFT adapter; R_N>0 loads R_{N-1}'s saved
+# adapter. Restart on partial failure with START_ROUND=<last_completed+1>.
 run_rounds () {
     local rc
     for round_idx in $(seq "${START_ROUND}" $((ROUNDS - 1))); do
@@ -164,8 +111,7 @@ run_rounds () {
             load_adapter="${ADAPTER_DIR}/${RUN_PREFIX}_seed${SEED}_round${prev_pad}_adapter"
         fi
 
-        # Modal mounts the local repo at /workspace inside the container,
-        # so relative repo paths become /workspace/<rel>.
+        # Modal mounts the repo at /workspace; relative paths become /workspace/<rel>.
         local config_container="/workspace/${CONFIG}"
         local cmd=(
             modal run --detach

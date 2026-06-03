@@ -1,23 +1,9 @@
 """Deterministic in-memory fake WebShop env for collector unit tests.
 
-Mirrors the `WebShopAdapter` reset/step shape but does NOT depend on the real
-WebShop install (pyserini, spaCy, BM25 index). Behavior:
-
-- `reset(task_id)` -> initial state with `instruction` + `observation_text` +
-  `valid_actions`.
-- `step(action_text)` -> progresses through a fixed branching script:
-    turn 0: only `search[*]` actions are valid; any `search` advances.
-    turn 1: must `click[item-N]`; clicking item-0 yields the highest reward.
-    turn 2: must `click[buy]`; rewards finalize.
-- Episode terminates after the buy step or after `max_steps`.
-
-Reward model:
-- Clicking the canonical "best" item then buying -> reward = 1.0.
-- Clicking a wrong item then buying    -> reward = 0.4 (partial match).
-- Failing to buy by `max_steps`        -> reward = 0.0.
-
-Determinism: derived purely from `task_id` (an int). Two FakeWebShopEnv
-instances with the same task_id reset to byte-identical states.
+Mirrors WebShopAdapter's reset/step shape without the real WebShop install.
+A fixed 3-turn script (search -> click -> buy): clicking item-0 then buying
+gives reward 1.0, a wrong item 0.4, and failing to buy by max_steps 0.0.
+State is derived purely from task_id, so equal task_ids reset identically.
 """
 
 from __future__ import annotations
@@ -83,7 +69,6 @@ class FakeWebShopEnv:
             elif action_text.startswith("click[item-"):
                 self._clicked_correct = False
                 self._stage = "buy"
-            # Other actions also waste a step.
         elif self._stage == "buy":
             if action_text == "click[buy]":
                 reward = 1.0 if self._clicked_correct else 0.4

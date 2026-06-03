@@ -1,32 +1,9 @@
 """SFT dataset loader for ALFWorld expert-trajectory JSONL files.
 
-Each `.jsonl` file is one **whole trajectory** consisting of multiple
-`{prompt, action, ...}` rows produced by `infra/app_alfworld_sft_gen.py`.
-Unlike the WebShop loader (`src/datasets/sft_webshop.py`), each row's
-`prompt` field is **pre-rendered** by the same
-`render_alfworld_turn_prompt` function the runtime ReAct collector uses.
-The SFT loader therefore reads the prompt verbatim and ONLY synthesizes
-the SFT target (`Thought: ... \\nAction: ...`).
-
-Why pre-render: the WebShop SFT pipeline duplicated its prompt template
-into `src/datasets/sft_webshop.py::default_render_prompt`, and a v3
-template-drift bug (see comments at `sft_webshop.py:218-227`) sent
-post-SFT R back to zero. By having the trajectory generator call the
-runtime renderer directly we *guarantee* the SFT prompt and the GRPO
-runtime prompt are byte-identical for every row.
-
-Schema: each JSONL row is a JSON object with at minimum
-    {
-        "prompt": str,        # pre-rendered ReAct prompt ending with `Thought:`
-        "action": str,        # the expert action string (e.g. "go to fridge 1")
-        "step_idx": int,      # 0-based step within the trajectory
-        "trajectory_id": str, # unique per trajectory (typically the game-file path basename)
-        "instruction": str,   # the task instruction (mostly for debugging / summary stats)
-        "final_reward": float # 1.0 for successful expert demos, 0.0 otherwise
-    }
-
-This module is pure Python (stdlib only) so it's unit-testable locally
-without torch / transformers / Modal.
+Each row's `prompt` is pre-rendered by the same `render_alfworld_turn_prompt`
+the runtime collector uses, so the loader reads it verbatim and only
+synthesizes the SFT target. Pure stdlib, so it's unit-testable without
+torch / transformers / Modal.
 """
 
 from __future__ import annotations
@@ -39,13 +16,7 @@ from typing import Any, Iterable
 
 @dataclass(frozen=True)
 class SFTExample:
-    """One (prompt, target_action) training pair.
-
-    Field shape is intentionally identical to
-    `src.datasets.sft_webshop.SFTExample` so downstream tokenizer code
-    in the SFT trainer (`infra/app_sft_train_alfworld.py`) can be a
-    one-line import swap.
-    """
+    """One (prompt, target_action) training pair; matches sft_webshop.SFTExample."""
 
     prompt: str
     action: str
@@ -61,13 +32,8 @@ class SFTExample:
 def _action_to_thought(action: str) -> str:
     """Synthesize a one-sentence ReAct 'Thought' from an ALFWorld action.
 
-    AlfWorld's verb surface is small and regular, so a leading-verb
-    dispatch produces consistent natural-language thoughts. Used by
-    `synthesize_sft_target` so the SFT label is a full
-    `Thought: <reason>\\nAction: <body>` block matching the runtime
-    ReAct template exactly. The expert plan is action-only (no
-    natural-language thoughts), so we synthesize one consistent
-    with each action verb.
+    The expert plan is action-only, so `synthesize_sft_target` uses a
+    leading-verb dispatch to build a full Thought/Action SFT label.
     """
     a = action.strip()
     low = a.lower()
@@ -122,13 +88,10 @@ def _action_to_thought(action: str) -> str:
 
 
 def synthesize_sft_target(action: str) -> str:
-    """Build the multi-line SFT label matching the prompt's `Thought:` ending.
+    """Build the SFT label emitted after the prompt's trailing `Thought:`.
 
-    Returns the string the model should emit AFTER the prompt ends - i.e.
-    ` <synthesized thought>\\nAction: <action body>`. The leading space
-    is deliberate so it concatenates cleanly with the prompt's trailing
-    `Thought:` (which has no trailing whitespace). Mirrors
-    `src.datasets.sft_webshop.synthesize_sft_target` exactly.
+    Returns ` <thought>\\nAction: <action>`; the leading space concatenates
+    cleanly with the prompt's `Thought:` ending. Mirrors the WebShop version.
     """
     return f" {_action_to_thought(action)}\nAction: {action}"
 
@@ -137,10 +100,9 @@ def synthesize_sft_target(action: str) -> str:
 
 
 def _row_to_example(row: dict[str, Any]) -> SFTExample | None:
-    """Convert one JSONL row dict into an SFTExample, or None if malformed.
+    """Convert one JSONL row into an SFTExample, or None if malformed.
 
-    Required keys: `prompt` (str) and `action` (str). All other fields
-    have safe defaults so the loader is resilient to schema additions.
+    Requires `prompt` and `action` strings; other fields default safely.
     """
     prompt = row.get("prompt")
     action = row.get("action")
@@ -197,8 +159,7 @@ def load_sft_examples_from_jsonl(
             try:
                 row = json.loads(line)
             except json.JSONDecodeError:
-                # Skip malformed lines but keep loading - partial files
-                # from a crashed SFT-gen run are still usable.
+                # Skip malformed lines but keep loading.
                 continue
             if not isinstance(row, dict):
                 continue
@@ -214,11 +175,7 @@ def load_sft_examples_from_jsonl(
 
 
 def summarize_sft_dataset(examples: Iterable[SFTExample]) -> dict[str, Any]:
-    """Quick stats for printing after a load.
-
-    Mirrors `src.datasets.sft_webshop.summarize_sft_dataset` so the
-    trainer's summary-printing code is shape-compatible across envs.
-    """
+    """Quick stats for printing after a load; mirrors the WebShop version."""
     examples = list(examples)
     n = len(examples)
     if n == 0:

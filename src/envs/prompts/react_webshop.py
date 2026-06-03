@@ -1,12 +1,8 @@
 """ReAct-style prompt rendering for WebShop trajectories.
 
-Pure-Python: no torch / transformers / vLLM dependency, so the prompt format
-is unit-testable without a GPU.
-
-The output of `render_webshop_turn_prompt` is a single text string ready to
-be fed to `VLLMRunner.generate_rich`. We use the simple `Thought:` / `Action:`
-ReAct cadence; the action vocabulary is the standard WebShop one
-(`search[query]`, `click[item]`, etc.).
+Pure-Python (no torch / transformers / vLLM) so the prompt format is
+unit-testable without a GPU. Uses the `Thought:`/`Action:` ReAct cadence with
+the standard WebShop action vocabulary.
 """
 
 from __future__ import annotations
@@ -28,9 +24,7 @@ WEBSHOP_SYSTEM_PROMPT = (
 def _format_history(history: Iterable[Any]) -> str:
     """Render previous (observation, action) turns into a chat-style transcript.
 
-    `history` is an iterable of `TurnRecord` (or any object exposing
-    `observation_text` and `action_text` attributes). We avoid importing
-    `TurnRecord` directly to keep this module dependency-free.
+    Accepts any objects exposing `observation_text` / `action_text`.
     """
     lines: list[str] = []
     for t in history:
@@ -53,21 +47,9 @@ def render_webshop_turn_prompt(
 ) -> str:
     """Build the prompt for the agent's next turn.
 
-    Args:
-        state: object exposing `observation_text` (str) and optionally
-               `valid_actions` (list[str]) and `instruction` (str).
-        history: completed turns (TurnRecord-like) so far in this trajectory.
-        instruction: explicit goal string; defaults to `state.instruction`
-                     if available, else the empty string.
-        valid_actions: explicit action whitelist; defaults to
-                       `state.valid_actions` if available, else None.
-        max_history_turns: keep only the most recent N turns of history in
-                           the prompt to bound vLLM context growth (default
-                           3 keeps prompts well under the 2048-token cap).
-
-    Returns:
-        Prompt string ending with `Thought:` so the model is prompted to
-        produce a Thought + Action block.
+    Reads `observation_text`, `instruction`, and `valid_actions` from `state`
+    (overridable via kwargs), appends the most recent `max_history_turns`
+    turns, and ends with `Thought:` to prompt a Thought + Action block.
     """
     obs_text = getattr(state, "observation_text", "") or ""
     if instruction is None:
@@ -101,12 +83,9 @@ def render_webshop_turn_prompt(
 
 
 def parse_react_action(generation: str) -> str:
-    """Extract the `Action: ...` line from a model generation.
+    """Extract the `Action: ...` body from a model generation.
 
-    Returns the action body (everything after `Action:` on the first matching
-    line). Falls back to the first non-empty line if no `Action:` prefix is
-    found, which makes the function robust to the policy's early-training
-    drift before it has internalized the ReAct format.
+    Falls back to the first non-empty line when no `Action:` prefix is found.
     """
     for raw in generation.splitlines():
         line = raw.strip()

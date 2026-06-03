@@ -1,16 +1,10 @@
 #!/usr/bin/env bash
-# Bootstrap the local dev environment for CS224R H-GRPO.
-#
-# Creates a project-local venv on top of /Users/shoupeili/miniconda3 Python 3.11,
-# installs the lightweight requirements, runs the test suite to confirm.
-#
-# Heavy ML deps (torch, transformers, vllm, ...) intentionally NOT installed
-# locally - they live inside the Modal image (infra/image.py).
+# Bootstrap the local dev environment for CS224R H-GRPO: create a project-local
+# venv, install requirements/local.txt, run the test suite. Heavy ML deps live in
+# the Modal image (infra/image.py), not locally. Idempotent.
 #
 # Usage:
 #   bash scripts/bootstrap_local.sh
-#
-# Idempotent: safe to re-run.
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"

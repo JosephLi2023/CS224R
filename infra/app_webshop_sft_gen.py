@@ -1,50 +1,9 @@
 """Modal app: generate WebShop SFT trajectories with a deterministic oracle.
 
-  modal run infra/app_webshop_sft_gen.py                               # generate
-  modal run infra/app_webshop_sft_gen.py --action summarize             # peek
-  modal run infra/app_webshop_sft_gen.py --action inspect               # alias
-
-WebShop has no upstream handcoded expert (unlike AlfWorld's PDDL plan),
-so we build a deterministic oracle from the goal-payload primitives
-already exposed by `src/envs/webshop_adapter.py` for the
-attribute-progress intermediate reward signal:
-
-  * `_extract_target_attrs(env)`  -> set[str] target attr tokens.
-  * `_extract_target_asin(env)`   -> str|None target product ASIN.
-  * `_extract_selected_attrs(env)` -> currently engaged options.
-
-Per-episode oracle policy:
-  1. Reset -> snapshot `env.goal["query"]`, `env.goal["asin"]` (or
-     `goal["asins"][0]`), `env.goal["attributes"]`.
-  2. Emit `search[<query>]`.
-  3. Up to N=5 search-result pages: if `target_asin` substring appears
-     in the rendered obs, emit `click[<asin>]` and move on; else emit
-     `click[Next >]` and recurse. If never found, drop the trajectory.
-  4. On the item page, for each canonicalised goal attribute token, try
-     `click[<token>]` (best-effort - values not surfaced as options
-     are simply no-ops). Cap at len(attributes)+a few safety turns.
-  5. Emit `click[Buy Now]`.
-
-Terminal env reward is the attribute-match fraction; only trajectories
-whose final reward >= `reward_threshold` (default 0.99) get flushed.
-Partial demos are dropped wholesale rather than written to disk.
-
-Output schema (one row per turn, single JSONL file):
-    {"prompt": str, "action": str, "instruction": str, "step_idx": int,
-     "trajectory_id": str, "final_reward": float}
-
-`prompt` is pre-rendered via the runtime renderer
-`src.envs.prompts.react_webshop.render_webshop_turn_prompt` - the SAME
-module the runtime ReAct collector uses + the SAME module that the
-SFT loader's `default_render_prompt` shim delegates to. That guarantees
-SFT-rollout prompt-parity (the v3 R=0 template-drift root cause).
-
-`--include-human-trajs` additionally concatenates the upstream WebShop
-~50 gdown human trajectories (loaded via
-`load_sft_examples_from_directory`) into the same JSONL, so the
-trainer has one input file.
-
-Cost: ~$0.50, ~30 min CPU at n_sessions=2000.
+The oracle (search target title -> click target ASIN -> click goal-option
+buttons -> Buy Now) drives the env; only trajectories with final reward >=
+reward_threshold are flushed. Prompts use the runtime `render_webshop_turn_prompt`
+to avoid template drift; `--include-human-trajs` appends the upstream gdown trajs.
 """
 from __future__ import annotations
 
@@ -56,25 +15,15 @@ from infra.image import webshop_image
 app = modal.App("cs224r-hgpo-webshop-sft-gen")
 
 
-# Where the oracle gen app writes the SFT trajectories on the shared
-# Volume. Single JSONL (AlfWorld pattern) - vs the gdown human-trajs
-# directory-of-files layout. The trainer's `--data-path` flag dispatches
-# on suffix (.jsonl -> single-file loader) so this path Just Works.
+# Single JSONL output (the trainer dispatches on the .jsonl suffix).
 SFT_OUTPUT_PATH = "/vol/data/webshop/oracle_trajs.jsonl"
 
-# Where the upstream WebShop gdown human-trajectory dump lives on the
-# Volume (one .jsonl per trajectory). Used by `--include-human-trajs`
-# to pre-render those into the same merged JSONL.
+# Upstream gdown human-trajectory dump (used by --include-human-trajs).
 HUMAN_TRAJS_DIR = "/vol/data/webshop/human_trajs"
 
 
 def _resolve_env_goal(env) -> dict | None:
-    """Pull the per-session goal dict from the upstream WebShop env.
-
-    Mirrors the tiered access pattern used by the introspection helpers
-    in `src/envs/webshop_adapter.py`. Returns None if no goal is
-    accessible (the caller drops the trajectory).
-    """
+    """Pull the per-session goal dict from the env (None if inaccessible)."""
     goal = getattr(env, "goal", None)
     if isinstance(goal, dict):
         return goal
@@ -102,30 +51,8 @@ def _instruction_from_goal(goal: dict | None) -> str:
 
 
 def _query_from_goal(goal: dict | None) -> str:
-    """Build the BM25 search query the oracle should issue.
-
-    WebShop caps `search[...]` results at 50 (5 pages x 10/page) so the
-    query must be SELECTIVE enough to surface the target ASIN inside
-    the top-50 BM25 hits. The goal payload exposes (in increasing
-    order of BM25 selectivity):
-
-      * `goal["query"]` - short user-typed category, e.g.
-        "men's polos". 0/N oracle win rate on real env (way too
-        generic - top-50 BM25 hits don't include the target ASIN).
-      * `goal["instruction_text"]` - verbose generated description
-        listing every required attribute, e.g. "Find me slim fit,
-        moisture wicking men's polos with short sleeve, ...".
-        Marginally better but attribute tokens (sizes, materials) can
-        BM25-dominate and pull the wrong category of products
-        (e.g. "underwater photography ... 8x6.5ft" pulls 8x6.5ft
-        BACKDROPS instead of actual photography equipment).
-      * `goal["name"]` - the target product's actual title. Pinpoint
-        precision: searching for the title returns the exact target
-        ASIN as the top BM25 hit virtually 100% of the time.
-
-    Prefers `name`, falls back to `instruction_text`, then `query`,
-    then empty. Empirically this is the difference between ~0% and
-    ~95% oracle win rate against the 1k-product split.
+    """Pick the BM25 search query, preferring `name` (the exact product title,
+    ~95% oracle win) over `instruction_text` over `query` (too generic, ~0%).
     """
     if not isinstance(goal, dict):
         return ""
@@ -142,14 +69,8 @@ def _query_from_goal(goal: dict | None) -> str:
 
 
 def _render_prompt_for_state(state, history: list, instruction: str) -> str:
-    """Render a WebShop ReAct prompt for `state` + `history` + `instruction`.
-
-    Wraps `state` in a SimpleNamespace shim that exposes `instruction`
-    (the runtime WebShopState dataclass doesn't carry it directly) so
-    the renderer's `state.instruction` access path resolves. The shim
-    is byte-identical in semantics to what
-    `src/datasets/sft_webshop.py::default_render_prompt` does on the
-    SFT loader side.
+    """Render a WebShop ReAct prompt; wraps `state` in a shim that exposes
+    `instruction` (matching `sft_webshop.default_render_prompt`).
     """
     from types import SimpleNamespace
 
@@ -174,22 +95,10 @@ def _oracle_episode(
 ) -> tuple[list[dict], float, str]:
     """Run one oracle episode; return (traj_rows, final_reward, status).
 
-    `traj_rows` is empty when the trajectory is dropped (oracle failed
-    to win the episode). `status` is one of:
-      - "won"             : terminal reward >= threshold; rows kept.
-      - "no_goal"         : env didn't expose a recognisable goal.
-      - "no_target_asin"  : goal had no ASIN field.
-      - "asin_not_found"  : target ASIN never appeared in the first
-                            `max_result_pages` of search results.
-      - "lost"            : env terminated with reward < threshold.
-      - "truncated"       : hit `max_steps_per_episode` before terminal.
-      - "exception:<E>"   : an env step raised an exception.
-
-    If `infos_out` is supplied, each step's post-step `info` dict is
-    appended (including `intermediate_reward` /
-    `intermediate_reward_source` when the dense-signal flag is on at
-    adapter construction). The list is populated regardless of final
-    status (so callers can inspect partial/dropped trajectories too).
+    `traj_rows` is empty when the trajectory is dropped. `status` is one of
+    won / no_goal / no_target_asin / asin_not_found / lost / truncated /
+    exception:<E>. If `infos_out` is given, each step's post-step info is
+    appended for inspection.
     """
     from types import SimpleNamespace
 
@@ -221,24 +130,8 @@ def _oracle_episode(
     attrs_raw = goal.get("attributes") or []
     if not isinstance(attrs_raw, (list, tuple)):
         attrs_raw = []
-    # Build the click-targets list. WebShop item pages render option
-    # buttons whose labels are the EXACT option values, not the goal's
-    # short attribute tokens. Two goal fields contribute:
-    #
-    #   * `goal["goal_options"]` - dict like {"color": "dark blue",
-    #     "size": "x-large"} mapping option NAME -> exact VALUE the
-    #     env's reward function expects. These values match the
-    #     item-page button labels byte-for-byte -> click[<value>] is
-    #     the precise option-engagement signal.
-    #   * `goal["attributes"]` - flat list of attribute tokens like
-    #     "moisture wicking", "stretch fabric". Some of these surface
-    #     as item-page buttons (then click[<token>] works), some don't
-    #     (they're hidden product-description attributes the env
-    #     credits when the target ASIN is bought). Tried as a
-    #     supplement to goal_options for best-effort coverage.
-    #
-    # Preserve original casing (button labels render mixed case) and
-    # de-duplicate while preserving order.
+    # Click-targets from goal_options (exact button-label VALUEs) plus
+    # goal attributes (best-effort), de-duped with original casing preserved.
     seen: set[str] = set()
     target_attrs: list[str] = []
     goal_options = goal.get("goal_options")
@@ -271,10 +164,8 @@ def _oracle_episode(
     traj_id = f"oracle_{session_id:06d}"
 
     def _record_and_step(action: str) -> tuple:
-        """Render + record one (prompt, action) pair, then env.step it.
-
-        Returns the post-step (state, reward, done, info) tuple plus a
-        bool indicating whether an exception fired.
+        """Render + record one (prompt, action), then step; returns the
+        post-step (state, reward, done, info) tuple plus an exception flag.
         """
         nonlocal state, history
         prompt = _render_prompt_for_state(state, history, instruction)
@@ -296,9 +187,8 @@ def _oracle_episode(
         except Exception as exc:
             return None, 0.0, True, {"_exc": f"{type(exc).__name__}:{exc}"}, True
         if infos_out is not None:
-            # Snapshot the post-step info dict so the caller can inspect
-            # `intermediate_reward` / `intermediate_reward_source` per turn
-            # without having to re-implement the oracle loop.
+            # Snapshot post-step info so callers can inspect per-turn
+            # intermediate_reward without re-running the oracle loop.
             infos_out.append({
                 "action": action,
                 "raw_env_reward": float(reward),
@@ -359,9 +249,7 @@ def _oracle_episode(
         action = f"click[{attr}]"
         out = _record_and_step(action)
         if out[-1]:
-            # Some option strings can crash the upstream `text_to_acts`
-            # parser; treat as a soft no-op by dropping this attempt
-            # but continuing.
+            # Some option strings crash upstream text_to_acts; treat as a no-op.
             continue
         _, reward, done, info, _ = out
         if done:
@@ -383,11 +271,8 @@ def _oracle_episode(
 
 
 def _add_local_render_paths():
-    """Append the WebShop pyuser site-packages + repo dir to sys.path.
-
-    Needed inside the gen container so `import web_agent_site...`
-    resolves against the editable install dropped by
-    `app_webshop_install.py::pip_install_webshop`.
+    """Add the WebShop pyuser site-packages + repo dir to sys.path so
+    `import web_agent_site...` resolves against the editable install.
     """
     import os
     import sys
@@ -423,35 +308,9 @@ def generate_sft_trajectories(
 ) -> dict:
     """Iterate session ids [base, base+n_sessions), drive oracle, write JSONL.
 
-    Args:
-        n_sessions: how many distinct sessions to attempt. WebShop's
-                    upstream env picks the goal via `reset(session=i)`.
-        output_path: where to write the JSONL on the shared Volume.
-                     Truncated on entry - re-running this app produces
-                     a fresh dataset.
-        session_id_base: starting session id. Default 0 mirrors the
-                         upstream's training-split start. Bumps useful
-                         if you want to dedupe against the eval slice
-                         `[6500, 6600)`.
-        max_result_pages: how many search-result pages to scan for the
-                          target ASIN before giving up on the session.
-        max_steps_per_episode: hard cap on adapter steps per episode.
-        reward_threshold: minimum terminal env reward to keep a
-                          trajectory. 0.99 ~ "all target attrs matched".
-        include_human_trajs: when True, also pre-render the
-                             ~50 upstream gdown human trajectories at
-                             `human_trajs_dir` and append them to the
-                             same JSONL. Uses
-                             `load_sft_examples_from_directory` so the
-                             renderer is the SAME runtime ReAct one.
-        human_trajs_dir: dir of `<traj>.jsonl` files. Defaults to the
-                         path written by `app_data.py::download_human_trajectories`.
-        human_trajs_min_reward: drop human trajs with final reward
-                                below this. Default 0.5 matches the
-                                current trainer's `--min-reward` knob.
-
-    Returns:
-        manifest dict with cardinalities + per-status breakdown.
+    `--include-human-trajs` also appends the ~50 upstream gdown human trajs
+    (filtered by `human_trajs_min_reward`). Returns a manifest with
+    cardinalities + per-status breakdown.
     """
     import json
     import os
@@ -587,11 +446,7 @@ def generate_sft_trajectories(
     timeout=10 * 60,
 )
 def summarize_sft_dataset_app(path: str = SFT_OUTPUT_PATH) -> dict:
-    """Peek at the SFT JSONL: cardinality + first row preview.
-
-    Useful smoke test after `generate_sft_trajectories` to confirm the
-    file is non-trivial before kicking off the SFT trainer.
-    """
+    """Peek at the SFT JSONL: cardinality + first row preview."""
     import json
     import os
 
@@ -666,20 +521,9 @@ def diagnose_oracle(
     session_id_base: int = 0,
     max_result_pages: int = 10,
 ) -> dict:
-    """Diagnostic: for each session, dump goal payload + each search-result
-    page's obs so we can see WHY the oracle can't find the target ASIN.
-
-    For each session:
-      - goal.query / goal.asin / goal.attributes / goal.category
-      - obs of `search[goal.query]`
-      - obs of up to `max_result_pages-1` subsequent `click[Next >]`
-      - on each page: bool whether goal.asin substring is in the obs
-
-    Surfaces the typical failure mode: BM25 search returns top-K results
-    that don't include the target ASIN within `max_result_pages` pages.
-    Helps decide if we need to (a) increase max_result_pages, (b) make
-    the oracle's search query more selective, or (c) drop the
-    attribute-engagement step.
+    """Diagnostic: dump each session's goal + per-page search obs to see why
+    the oracle can't find the target ASIN (BM25 top-K misses it within
+    `max_result_pages`).
     """
     _add_local_render_paths()
 
@@ -807,54 +651,17 @@ def validate_dense_signal(
 ) -> dict:
     """Validate WebShop's per-turn `intermediate_reward` dense signal.
 
-    WebShop has NO PDDL facts-diff signal (unlike AlfWorld) - its only
-    per-turn supervision for TurnRDv2's V-head is the attribute-progress
-    intermediate reward synthesised by `WebShopAdapter.step()` when
-    `use_attribute_progress_intermediate_reward=True` (the flag set in
-    all 3 RL configs' env block). This validator drives the oracle
-    against the live env WITH that flag on, captures each step's
-    `info["intermediate_reward"]`, and reports:
-
-      * `n_sessions_with_signal`: how many sessions had at least one
-        non-None IR (indicator that target-attrs introspection
-        worked at reset).
-      * `signal_coverage`: across captured turns, fraction with
-        non-None IR. ~1.0 means the signal never silently degraded;
-        < 1.0 means the upstream env occasionally hid the goal-attr
-        payload mid-trajectory.
-      * `mean_ir_by_action_kind`: per-bucket means. Expected pattern
-        (this is what makes the signal HIGH QUALITY for TurnRD
-        supervision):
-          - search ~ 0.0           (no option engagement)
-          - click_nav ~ 0.0        (Next/Prev/Back has no IR delta)
-          - click_target_asin ~ 0.25 (one-time ASIN-landing bonus)
-          - click_option ~ 1/|target_attrs| (per-attribute delta when
-            the click hits an option in the goal-options set)
-          - click_buy_now ~ 0.0    (terminal; no further engagement)
-      * `cum_ir_per_session`: per-session (cumulative_IR, final_raw_reward)
-        pairs. CORRELATION between cum_IR and final_raw_reward is the
-        single most diagnostic metric - if it's > 0.7, the signal is
-        carrying real per-turn credit; if it's ~ 0, the signal is
-        noise and TurnRD's V-head will learn nothing.
-      * `pearson_r`: Pearson correlation between cum_IR and final
-        reward across captured sessions.
-      * `sample_trajectory`: full per-turn (action, raw_env_reward,
-        intermediate_reward, intermediate_reward_source, target_overlap_after)
-        dump for visual sanity inspection.
-
-    This exercises the EXACT path the producer (collector) reads from
-    at `src/algorithms/grpo/collectors.py:251`
-    (`info.get("intermediate_reward")`), so if the signal looks right
-    here, TurnRDv2 will see the same shape in the replay JSONL.
+    Drives the oracle with `use_attribute_progress_intermediate_reward=True`,
+    captures each step's `info["intermediate_reward"]`, and reports coverage,
+    per-action-kind means, and the Pearson r between cumulative IR and final
+    reward (the key signal-quality metric).
     """
     _add_local_render_paths()
 
     from src.envs.webshop_adapter import WebShopAdapter
 
-    # CRITICAL: build the adapter with the dense-signal flag ENABLED.
-    # This is the only difference from the SFT-gen path - same env,
-    # same goal payloads, same oracle action sequence; just an extra
-    # `info["intermediate_reward"]` field per step.
+    # Build the adapter with the dense-signal flag ENABLED (the only
+    # difference from the SFT-gen path).
     adapter = WebShopAdapter(
         max_steps=max_steps_per_episode,
         observation_mode="text",
@@ -874,9 +681,7 @@ def validate_dense_signal(
     for i in range(n_sessions):
         sid = session_id_base + i
 
-        # Re-resolve target_asin BEFORE the oracle clobbers state, so
-        # we can bucket actions (e.g. tell click_target_asin from
-        # click_option) without re-introspecting the env later.
+        # Re-resolve target_asin before the oracle runs, to bucket actions.
         try:
             adapter.reset(task_id=sid)
         except Exception:
@@ -894,9 +699,7 @@ def validate_dense_signal(
             len(adapter._target_attrs) if adapter._target_attrs else 0
         )
 
-        # Now run the actual oracle episode with info capture. The
-        # adapter does its own reset(task_id=sid) at the top, so the
-        # pre-fetch above doesn't leak state.
+        # Run the oracle episode with info capture (it resets internally).
         infos: list = []
         traj_rows, final_reward, status = _oracle_episode(
             adapter,
@@ -957,8 +760,7 @@ def validate_dense_signal(
     }
     bucket_n = {k: bucket_counts[k] for k in sorted(bucket_counts.keys())}
 
-    # Pearson r between cum_IR and final_raw_reward across sessions
-    # (sessions with at least one captured turn).
+    # Pearson r between cum_IR and final reward across sessions.
     pairs = [
         (s["cum_intermediate_reward"], s["final_raw_reward"])
         for s in per_session_records if s["n_turns"] > 0
@@ -1004,12 +806,7 @@ def main(
     human_trajs_dir: str = HUMAN_TRAJS_DIR,
     human_trajs_min_reward: float = 0.5,
 ) -> None:
-    """Local entrypoint dispatching on `--action`.
-
-    Actions:
-      generate            - run `generate_sft_trajectories(...)`
-      summarize / inspect - pretty-print the dataset summary + first row
-    """
+    """Local entrypoint; dispatch on --action (generate | summarize | inspect | diagnose | validate_signal)."""
     import json as _json
 
     if action == "generate":

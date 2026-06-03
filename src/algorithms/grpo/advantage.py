@@ -180,13 +180,11 @@ def consistency_loss_tensor(
         )
 
     if turn_adv.shape[0] == 0:
-        # Empty batch - return a 0 that still depends on traj_adv so the
-        # graph stays connected if the caller wants .backward() on it.
+        # Empty batch: keep the result dependent on traj_adv so .backward() works.
         return lam * (traj_adv.sum() * 0.0)
 
     mask_f = attention_mask.to(dtype=turn_adv.dtype)
     summed_per_traj = (turn_adv * mask_f).sum(dim=-1)  # [B]
     diff = (summed_per_traj - traj_adv.to(dtype=turn_adv.dtype)) ** 2  # [B]
-    # Cast lam through a tensor so the result follows turn_adv.dtype rather
-    # than promoting to float64 on a Python multiply.
+    # Cast lam via tensor so the result keeps turn_adv.dtype (not float64).
     return torch.as_tensor(lam, dtype=turn_adv.dtype, device=turn_adv.device) * diff.mean()

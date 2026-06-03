@@ -1,13 +1,9 @@
 """TurnRD per-turn reward decomposer adapter (Method B).
 
-Inference-only adapter that the trainer plugs in.
-
-torch is imported at the top of this file; the embedder callable is supplied
-by the caller, so unit tests can drive the adapter with a deterministic
-stub embedder that returns plain tensors - no LoRAPolicy or HF model needed.
-
-The invariant `sum_t r_hat_t = R` per trajectory holds by construction
-(`TurnRDOutput.decompose(R) = alpha * R` where `sum alpha = 1` after masking).
+Inference-only adapter that the trainer plugs in. The embedder callable is
+supplied by the caller, so tests can drive it with a deterministic stub. The
+invariant `sum_t r_hat_t = R` holds by construction (`decompose(R) = alpha * R`
+with `sum alpha = 1` after masking).
 """
 
 from __future__ import annotations
@@ -21,11 +17,8 @@ from src.turnrd.model import TurnRD, TurnRDv2
 
 
 def _make_goal_only_turn(goal_text: str) -> TurnRecord:
-    """Construct a single-turn `TurnRecord` whose observation_text IS
-    the goal text, used to drive the per-trajectory goal embedder.
-
-    Factored out so the synthetic-Trajectory construction stays in one
-    place and the FiLM goal-conditioning path remains easy to audit.
+    """Build a single-turn `TurnRecord` whose observation_text is the goal
+    text, used to drive the per-trajectory goal embedder.
     """
     return TurnRecord(
         turn_idx=0,
@@ -34,32 +27,15 @@ def _make_goal_only_turn(goal_text: str) -> TurnRecord:
         raw_env_reward=0.0,
     )
 
-# Type alias for any TurnRD-shaped model accepted by the adapter.
-# Both `TurnRD` (v1) and `TurnRDv2` produce the same `TurnRDOutput`
-# surface (`cls_attn_weights` + `predicted_per_turn_R`), so the adapter
-# is architecture-agnostic. New v2 architectures should be added here.
+# Type alias for any TurnRD-shaped model. Both `TurnRD` (v1) and `TurnRDv2`
+# expose the same `TurnRDOutput`, so the adapter is architecture-agnostic.
 TurnRDLike = Union[TurnRD, TurnRDv2]
 
 
 # Embedder contract: per-trajectory callable returning a per-turn embedding
-# tensor of shape `[T_i, D]` (D == TurnRD.input_dim).
-#
-# Production wires this from `LoRAPolicy.model.eval()` mean-pooled hidden
-# states; tests pass a deterministic stub.
-#
-# Contract requirements (the adapter enforces (a)+(b) defensively, (c) is
-# the embedder's responsibility but the adapter wraps the call in
-# `torch.no_grad()` belt-and-suspenders so a forgetful caller doesn't leak
-# memory):
-#   (a) shape: `[T_i, D]` (asserted in `decompose`).
-#   (b) device + dtype: free; the adapter casts to the model's parameter
-#       device + dtype before forward (so the embedder MAY return e.g. CPU
-#       fp32 tensors even when the model lives on a CUDA bf16 device).
-#   (c) gradient: ideally `.detach()` or computed under `torch.no_grad()`,
-#       since the adapter only needs the values. The adapter's `no_grad`
-#       wrapper neutralises a careless implementation but does NOT free a
-#       graph that already exists on tensors returned BEFORE the wrapper
-#       takes effect - so production embedders SHOULD still detach.
+# of shape `[T_i, D]` (D == TurnRD.input_dim). Device/dtype are free (the
+# adapter casts to the model's before forward); the returned tensor should be
+# detached, though the adapter also wraps the call in `torch.no_grad()`.
 TurnEmbedder = Callable[[Trajectory], torch.Tensor]
 
 
@@ -77,43 +53,31 @@ class TurnRDDecomposer:
     ) -> None:
         self.model = model
         self.embedder = embedder
-        # Resolve the target device once. Default to the model's parameter
-        # device so a caller doing `TurnRDDecomposer(cuda_model, cpu_embedder)`
-        # without specifying `device` doesn't silently land tensors on CPU and
-        # crash inside `model.input_proj` with a device-mismatch error.
+        # Resolve the target device once, defaulting to the model's parameter
+        # device so a CPU embedder + CUDA model don't trip a device mismatch.
         if device is not None:
             self.device: torch.device = torch.device(device)
         else:
             try:
                 self.device = next(self.model.parameters()).device
             except StopIteration:
-                # No parameters (extremely unusual; only happens if someone
-                # constructs a stripped TurnRD). Fall back to CPU.
+                # No parameters (stripped TurnRD); fall back to CPU.
                 self.device = torch.device("cpu")
-        # Resolve the model's parameter dtype too: the embedder is allowed to
-        # return any dtype, and we'll cast `stacked` into the model dtype
-        # before forward. This avoids the fp16-embedder vs fp32-input_proj
-        # dtype-mismatch RuntimeError that would otherwise greet the
-        # production wiring.
+        # Resolve the model's param dtype; `stacked` is cast to it before
+        # forward to avoid an embedder-vs-input_proj dtype mismatch.
         try:
             self._model_dtype: torch.dtype = next(self.model.parameters()).dtype
         except StopIteration:
             self._model_dtype = torch.float32
         # When goal conditioning is enabled, compute one goal embedding per
-        # trajectory from the parsed task text. The cache is local to one
-        # decompose call because a rollout group usually shares a task goal.
+        # trajectory; the cache is local to one decompose call.
         self._goal_emb_enabled: bool = bool(
             getattr(getattr(self.model, "cfg", None), "goal_conditioned_value_head", False)
         )
-        # Stash the most recent eval-mode attention tensor and alignment
-        # metadata so the trainer can compute alpha diagnostics even when
-        # the gradient-tracking path is not invoked. Shape:
-        #   _last_alpha:              CPU torch.Tensor [K_real, T_max], detached
-        #   _last_alpha_mask:         CPU torch.Tensor [K_real, T_max], 0/1
-        #   _last_alpha_traj_indices: list[int] mapping K_real rows back to
-        #                             the original (possibly-padded) K-index in
-        #                             group.trajectories (so empty trajectories
-        #                             can be filtered out without ambiguity)
+        # Stash the most recent eval-mode attention + alignment metadata so the
+        # trainer can compute alpha diagnostics off the no-grad path:
+        #   _last_alpha / _last_alpha_mask: CPU [K_real, T_max] (detached, 0/1)
+        #   _last_alpha_traj_indices: K_real rows -> original K-index
         self._last_alpha: Optional[torch.Tensor] = None
         self._last_alpha_mask: Optional[torch.Tensor] = None
         self._last_alpha_traj_indices: list[int] = []
@@ -126,19 +90,14 @@ class TurnRDDecomposer:
         """Compute `(goal_emb [K_real, D], goal_emb_mask [K_real])` for the
         FiLM goal-conditioned V-head.
 
-        Returns `(None, None)` when `self._goal_emb_enabled` is False so
-        legacy configs pay zero per-trajectory cost. Otherwise extracts
-        the AlfWorld goal substring from each trajectory's Turn 0
-        observation, embeds it via the SAME `self.embedder` (synthetic
-        single-turn trajectory whose observation_text IS the goal_text),
-        and stacks into a per-row tensor. Rows whose goal text doesn't
-        parse get a zero placeholder + mask=0 - the model's FiLM block
-        then reverts to the unconditioned path for those rows.
+        Returns `(None, None)` when goal conditioning is disabled. Otherwise
+        extracts each trajectory's goal text, embeds it via `self.embedder`, and
+        stacks per-row; rows whose goal doesn't parse get mask=0 and fall back
+        to the unconditioned path.
         """
         if not self._goal_emb_enabled or not nonempty_indices:
             return (None, None)
-        # Lazy import keeps the module torch-only (no pure-Python goal
-        # extractor dep at the top of file).
+        # Lazy import keeps the module torch-only.
         try:
             from src.turnrd.goal_extractor import extract_goal_text  # type: ignore[import-not-found]
         except Exception:
@@ -150,8 +109,8 @@ class TurnRDDecomposer:
         D = int(self.model.input_dim)
         goal_emb = torch.zeros(K_real, D, dtype=target_dtype, device=target_device)
         goal_emb_mask = torch.zeros(K_real, dtype=target_dtype, device=target_device)
-        # Cache by goal_text WITHIN this call so K rollouts of the same
-        # task share a single embedder forward pass.
+        # Cache by goal_text within this call so K rollouts of the same task
+        # share one embedder forward pass.
         cache: dict[str, torch.Tensor] = {}
         with torch.no_grad():
             for row, traj_idx in enumerate(nonempty_indices):
@@ -178,45 +137,32 @@ class TurnRDDecomposer:
                     )
                     ge_t = self.embedder(synth)
                     if ge_t.dim() != 2 or ge_t.shape[0] < 1 or ge_t.shape[1] != D:
-                        # Embedder gave us the wrong shape - skip this
-                        # row (mask stays 0, model falls back to
-                        # unconditioned for it). Don't raise so an
-                        # embedder bug doesn't kill the whole train
-                        # step.
+                        # Wrong shape: skip this row (mask stays 0); don't
+                        # raise so an embedder bug doesn't kill the train step.
                         continue
                     row_t = ge_t[0].detach().to(device=target_device, dtype=target_dtype)
                     goal_emb[row] = row_t
                     goal_emb_mask[row] = 1.0
                     cache[goal_text] = row_t
                 except Exception:
-                    # Defensive: embedder failure on a single goal
-                    # shouldn't propagate. Mask stays 0 for this row.
+                    # Defensive: a single embedder failure shouldn't propagate.
                     continue
         return (goal_emb, goal_emb_mask)
 
     def decompose(self, group: TrajectoryGroup) -> list[list[float]]:
         """Return list[K] of list[T_i] per-turn rewards `r_hat_t = alpha_t * R`.
 
-        Steps:
-        1. Embed each non-empty trajectory via `self.embedder` -> `[T_i, D]`,
-           inside `torch.no_grad()` so a careless embedder can't leak the
-           policy's autograd graph into our KxT padded stack.
-        2. Pad to `[K, T_max, D]` (cast to the model's param device+dtype)
-           and build `attention_mask = [K, T_max]`.
-        3. Forward through `model` under `torch.no_grad()` + `eval()`.
-        4. Multiply attention weights by per-trajectory `final_reward`.
-        5. Slice each row back to its real T_i and convert to Python floats.
-           Empty trajectories return `[]` and the model is NOT called for
-           them (matches `JudgeDecomposer.decompose` behavior).
+        Embeds each non-empty trajectory under `torch.no_grad()`, pads to
+        `[K, T_max, D]`, forwards through the model in eval mode, and scales the
+        attention weights by `final_reward`. Empty trajectories return `[]` and
+        are not forwarded.
         """
         K = len(group.trajectories)
         if K == 0:
             return []
 
         # 1. Embed each non-empty trajectory under `no_grad` so a careless
-        #    embedder (one that forgot its own `with torch.no_grad():` /
-        #    `.detach()`) doesn't keep the LoRA-policy backward graph alive
-        #    across rollout groups.
+        #    embedder can't keep the policy backward graph alive across groups.
         per_traj_embeds: list[Optional[torch.Tensor]] = []
         with torch.no_grad():
             for traj in group.trajectories:
@@ -234,13 +180,11 @@ class TurnRDDecomposer:
                         f"embedder returned T={embed.shape[0]} but trajectory has "
                         f"{len(traj.turns)} turns (task_id={traj.task_id})."
                     )
-                # Defense in depth: detach in case the embedder built its
-                # tensor BEFORE the `no_grad` context took effect (e.g. it
-                # captured a closure over a grad-enabled tensor).
+                # Detach in case the embedder built its tensor before the
+                # `no_grad` context took effect.
                 per_traj_embeds.append(embed.detach())
 
-        # If all trajectories are empty, short-circuit before allocating
-        # an empty-T tensor (the model would reject T=0).
+        # If all trajectories are empty, short-circuit (the model rejects T=0).
         non_empty = [e for e in per_traj_embeds if e is not None]
         if not non_empty:
             return [[] for _ in range(K)]
@@ -255,16 +199,13 @@ class TurnRDDecomposer:
                 )
         T_max = max(e.shape[0] for e in non_empty)
 
-        # Build padded stack ONLY over non-empty trajectories. We'll splice
-        # the empties back in at the end so we don't waste a model call on
-        # an all-zero row.
+        # Build the padded stack over non-empty trajectories only; empties are
+        # spliced back at the end to avoid a wasted all-zero model row.
         nonempty_indices = [i for i, e in enumerate(per_traj_embeds) if e is not None]
         K_real = len(nonempty_indices)
 
-        # Cast to the model's param device + dtype (resolved once in __init__).
-        # The embedder is allowed to return any device/dtype combo per the
-        # documented contract; the adapter normalises here so the model's
-        # `input_proj` never trips on a device-mismatch / dtype-mismatch error.
+        # Cast to the model's param device + dtype so `input_proj` never trips
+        # on a device/dtype mismatch.
         target_device = self.device
         target_dtype = self._model_dtype
 
@@ -277,12 +218,8 @@ class TurnRDDecomposer:
             stacked[row, :T_i] = e.to(device=target_device, dtype=target_dtype)
             attn_mask[row, :T_i] = 1
 
-        # 3. Forward in eval mode with no grad. Use `__call__` (not `.forward`)
-        #    so any `nn.Module` forward-pre/post hooks the trainer attaches
-        #    (e.g. refresh-cadence telemetry) still fire.
-        # FiLM goal-conditioning: compute per-trajectory goal_emb once
-        # for the rows we're about to forward; pass None when the flag
-        # is off so the model takes the unconditioned path.
+        # 3. Forward in eval mode with no grad, via `__call__` so any module
+        #    hooks still fire. Compute goal_emb only when FiLM conditioning is on.
         goal_emb, goal_emb_mask = self._compute_goal_emb_for_indices(
             group, nonempty_indices
         )
@@ -309,11 +246,10 @@ class TurnRDDecomposer:
             device=stacked.device,
         )
         per_turn = out.decompose(final_R)  # [K_real, T_max]
-        # Defensive: zero padded slots so any tiny float drift doesn't sneak in.
+        # Zero padded slots so float drift doesn't sneak in.
         per_turn = per_turn * attn_mask.to(dtype=per_turn.dtype)
 
-        # Expose the eval-mode attention weights for trainer diagnostics.
-        # Detach and move to CPU because these values are used only for stats.
+        # Expose eval-mode attention (detached, CPU) for trainer diagnostics.
         self._last_alpha = out.cls_attn_weights.detach().to(
             dtype=torch.float32, device=torch.device("cpu")
         )
@@ -339,31 +275,24 @@ class TurnRDDecomposer:
     # Learnable surface
 
     def __call__(self, group: TrajectoryGroup) -> list[list[float]]:
-        """Make the decomposer object directly callable, forwarding to
-        `decompose`, so a `TurnRDDecomposer` instance can be passed as the
-        trainer's `decomposer` argument while still exposing the learnable
-        surface (`decompose_with_grad` / `parameters` / `has_learnable_params`).
+        """Forward to `decompose` so a `TurnRDDecomposer` instance can be passed
+        as the trainer's `decomposer` while exposing the learnable surface.
         """
         return self.decompose(group)
 
     @property
     def has_learnable_params(self) -> bool:
-        """TurnRD is the learnable Method B decomposer.
-
-        The trainer reads this via `getattr(decomposer, "has_learnable_params",
-        False)`, so Methods A/C need not define it (they read False and the
-        trainer skips the second optimizer + the C3 consistency-loss reattach).
+        """True: TurnRD is the learnable Method B decomposer. The trainer reads
+        this via `getattr` to enable the second optimizer + C3 consistency loss.
         """
         return True
 
     def parameters(self) -> Iterator[torch.nn.Parameter]:
-        """Forward to `self.model.parameters()` so the trainer can build a
-        separate AdamW for the TurnRD params (`turnrd_lr` in the config)."""
+        """Forward to `self.model.parameters()` for the trainer's TurnRD AdamW."""
         return self.model.parameters()
 
     def state_dict(self) -> dict[str, torch.Tensor]:
-        """Forward to `self.model.state_dict()` for the refresh hook +
-        Modal checkpoint persistence."""
+        """Forward to `self.model.state_dict()` for refresh + checkpointing."""
         return self.model.state_dict()
 
     def load_state_dict(
@@ -372,31 +301,16 @@ class TurnRDDecomposer:
         *,
         strict: bool = True,
     ) -> Any:
-        """Forward to `self.model.load_state_dict(...)`. Returned value is
-        whatever PyTorch returns (an `IncompatibleKeys` namedtuple); kept
-        as `Any` so we don't add a torch internals dep here."""
+        """Forward to `self.model.load_state_dict(...)`; returns PyTorch's
+        `IncompatibleKeys`, typed `Any` to avoid a torch-internals dep."""
         return self.model.load_state_dict(sd, strict=strict)
 
     def decompose_with_grad(self, group: TrajectoryGroup) -> dict[str, Any]:
-        """Grad-enabled twin of `decompose`, used by `HGPOTrainer.compute_loss`
-        to build the C3 consistency loss against TurnRD params.
-
-        Differences from `decompose`:
-        - Does NOT enter `torch.no_grad()` around the model forward (we
-          want grad to flow back to TurnRD params).
-        - Does NOT call `model.eval()` (TurnRD is *training* on this path).
-        - Returns a dict of tensors instead of a Python list, so the
-          caller can compute torch-tensor advantages without re-padding:
-            * `alpha`:           `[K_real, T_max]` (the model's alpha weights)
-            * `attention_mask`:  `[K_real, T_max]` long
-            * `nonempty_indices`: `list[int]` (indices into `group.trajectories`
-                                  for the rows present in `alpha`)
-            * `final_R`:         `[K_real]` aligned with `alpha` rows.
-
-        Important: the embedder loop still runs under `torch.no_grad()`
-        and detaches each returned tensor - the gradient path we care
-        about is alpha_t -> TurnRD params (NOT into the policy backbone the
-        embedder hits).
+        """Grad-enabled twin of `decompose` for `HGPOTrainer.compute_loss`'s C3
+        consistency loss: skips `no_grad`/`eval` around the forward so grad flows
+        to TurnRD params (the embedder loop still runs under `no_grad`). Returns
+        a dict: `alpha` [K_real, T_max], `attention_mask`, `nonempty_indices`,
+        `final_R` [K_real], and `value_per_turn`.
         """
         K = len(group.trajectories)
         if K == 0:
@@ -408,8 +322,7 @@ class TurnRDDecomposer:
                 "value_per_turn": None,
             }
 
-        # 1. Embed each non-empty trajectory under no_grad (same rationale
-        #    as `decompose`: we only want gradient through TurnRD params).
+        # 1. Embed under no_grad (same rationale as `decompose`).
         per_traj_embeds: list[Optional[torch.Tensor]] = []
         with torch.no_grad():
             for traj in group.trajectories:
@@ -462,13 +375,9 @@ class TurnRDDecomposer:
             stacked[row, :T_i] = e.to(device=target_device, dtype=target_dtype)
             attn_mask[row, :T_i] = 1
 
-        # Keep gradients through the decomposer; the trainer controls train/eval mode.
-        # FiLM goal-conditioning uses the same goal embedding path as `decompose`.
-        # embedder runs in no_grad context (the embedder loop above
-        # already does this), so the FiLM modulation introduces a
-        # gradient path through `goal_proj/goal_gamma/goal_beta` but
-        # NOT through the embedder (matching the desired "train TurnRD,
-        # not the policy" semantics).
+        # Keep gradients through the decomposer (trainer controls train/eval).
+        # FiLM uses the same goal-embedding path; grad flows through goal_proj/
+        # goal_gamma/goal_beta but not the embedder.
         goal_emb, goal_emb_mask = self._compute_goal_emb_for_indices(
             group, nonempty_indices
         )
@@ -482,10 +391,8 @@ class TurnRDDecomposer:
             out = self.model(stacked, attn_mask)
         # alpha == cls_attn_weights (already mask-zeroed inside the model).
         alpha = out.cls_attn_weights  # [K_real, T_max], grad-tracking
-        # V-head per-turn predictions for the actor-critic baseline
-        # in HGPOTrainer.compute_loss. None when the model was built
-        # with cfg.value_head=False (back-compat); the trainer falls
-        # back to the per-position-normalized turn_adv path then.
+        # V-head per-turn predictions for the actor-critic baseline; None when
+        # the model was built without a value head (trainer falls back).
         value_per_turn = out.predicted_per_turn_R  # [K_real, T_max] or None
 
         final_R = torch.tensor(
@@ -510,17 +417,12 @@ def build_turnrd_decomposer(
     embedder: TurnEmbedder,
     device: Optional[str] = None,
 ) -> "TurnRDDecomposer":
-    """Factory used by `build_decomposer` for the `"turnrd"` branch.
+    """Factory for `build_decomposer`'s `"turnrd"` branch.
 
-    Returns the `TurnRDDecomposer` *object* (not its `.decompose` method)
-    so the trainer can reach the learnable surface
-    (`has_learnable_params`, `parameters`, `decompose_with_grad`,
-    `state_dict`, `load_state_dict`). `TurnRDDecomposer.__call__` forwards
-    to `.decompose`, so the returned value is still a valid
-    `PerTurnDecomposer` per the existing call-site contract
-    `self.decomposer(group)` in `HGPOTrainer.build_advantages`.
+    Returns the `TurnRDDecomposer` object (not its `.decompose`) so the trainer
+    can reach the learnable surface; `__call__` forwards to `.decompose`, so it
+    still satisfies the `PerTurnDecomposer` contract.
     """
-    # cfg is accepted for symmetry with the other build_* factories; future
-    # config-loader work will read e.g. cfg["turnrd"]["refresh_every_n_episodes"].
+    # cfg accepted for symmetry with the other build_* factories.
     _ = cfg
     return TurnRDDecomposer(model=model, embedder=embedder, device=device)

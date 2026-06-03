@@ -1,20 +1,8 @@
-"""OpenAI GPT-4o-mini judge backend.
+"""OpenAI GPT-4o-mini judge backend (default).
 
-Default judge backend. Costs ~$0.65/1k judge calls with caching;
-expected total study spend ~$3-6.
-
-Requires `OPENAI_API_KEY` env var (loaded from a Modal Secret in production).
-
-Implementation notes:
-- Both sync and async clients are constructed lazily (`_ensure_clients`) so
-  importing this module never requires an API key.
-- The sync `score_turns` and async `score_turns_async` paths share a single
-  parse routine (`_parse_response_to_turn_scores`) and a single retry loop
-  shape: catch RateLimitError / APITimeoutError / APIConnectionError, sleep
-  with exponential backoff, retry up to `max_retries` times, then re-raise.
-- Concurrency control (asyncio.Semaphore) is owned by the caller (the
-  JudgeDecomposer) so a single semaphore can gate K-trajectory groups across
-  many score_turns_async calls.
+Clients are constructed lazily so importing never needs an API key. The sync
+and async paths share one parse routine and one retry loop (exponential
+backoff on transient API errors). Requires `OPENAI_API_KEY`.
 """
 
 from __future__ import annotations
@@ -46,14 +34,10 @@ class OpenAIJudge:
     # Client init
 
     def _ensure_clients(self) -> None:
-        """Lazy-import + lazy-construct both OpenAI clients.
+        """Lazy-import + construct both OpenAI clients.
 
-        Reads `OPENAI_API_KEY` implicitly from the process env (Modal Secret
-        injects it; tests can monkeypatch this method to avoid network).
-
-        `max_retries=0` disables the OpenAI SDK's built-in retry layer so the
-        in-house retry loop in `score_turns` / `score_turns_async` is the
-        single source of truth for retry behavior.
+        `max_retries=0` disables the SDK's retry layer so our own retry loop
+        is the single source of truth.
         """
         if self._client is not None and self._async_client is not None:
             return
@@ -75,10 +59,9 @@ class OpenAIJudge:
     def _parse_response_to_turn_scores(
         self, content: str, request: JudgeRequest
     ) -> list[TurnScore]:
-        """Parse the JSON object the model returned and apply the section 3.2 invariant.
+        """Parse the model's JSON response and normalize to the sum invariant.
 
-        Raises ValueError on any structural issue (per Protocol contract:
-        backends must raise on parse failure rather than silently zero).
+        Raises ValueError on any structural issue (never silently zeros).
         """
         try:
             payload = json.loads(content)
@@ -97,8 +80,7 @@ class OpenAIJudge:
                 f"{len(scores_field)}: {payload!r}"
             )
 
-        # Sort by 'turn' if present so out-of-order responses still align with
-        # request.turns. After sorting, indices must be exactly [0..n-1].
+        # Sort by 'turn' so out-of-order responses align; indices must be 0..n-1.
         try:
             sorted_entries = sorted(scores_field, key=lambda e: int(e["turn"]))
         except (KeyError, TypeError, ValueError) as e:
@@ -126,8 +108,7 @@ class OpenAIJudge:
 
     def _is_transient(self, exc: BaseException) -> bool:
         """True if `exc` is a transient OpenAI API error worth retrying."""
-        # Import lazily so the class is constructable without the openai dep
-        # being installed at module import time.
+        # Import lazily so the class is constructable without the openai dep.
         try:
             from openai import (
                 APIConnectionError,
@@ -161,15 +142,13 @@ class OpenAIJudge:
                     raise ValueError("OpenAIJudge: response content was None")
                 return self._parse_response_to_turn_scores(content, request)
             except Exception as exc:  # noqa: BLE001 - transient classification done in helper
-                # Narrowed from BaseException so KeyboardInterrupt /
-                # SystemExit / asyncio.CancelledError propagate as Python
-                # intends (review item I2).
+                # Narrowed from BaseException so KeyboardInterrupt/SystemExit propagate.
                 if self._is_transient(exc) and attempt < self.max_retries:
                     last_exc = exc
                     time.sleep(self._backoff_seconds(attempt))
                     continue
                 raise
-        # Defensive: we should never fall through, but keep mypy/pyright happy.
+        # Defensive: should never fall through.
         raise RuntimeError(
             f"OpenAIJudge: exhausted retries without raising; last_exc={last_exc!r}"
         )
@@ -191,9 +170,7 @@ class OpenAIJudge:
                     raise ValueError("OpenAIJudge: response content was None")
                 return self._parse_response_to_turn_scores(content, request)
             except Exception as exc:  # noqa: BLE001 - transient classification done in helper
-                # Narrowed from BaseException so asyncio.CancelledError
-                # (a BaseException subclass) propagates the gather cancel
-                # cascade transparently per Python's contract (review I2).
+                # Narrowed from BaseException so asyncio.CancelledError propagates.
                 if self._is_transient(exc) and attempt < self.max_retries:
                     last_exc = exc
                     await asyncio.sleep(self._backoff_seconds(attempt))

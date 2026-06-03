@@ -1,26 +1,9 @@
 """Modal A100 app: SFT warm-start of Qwen2.5-1.5B + LoRA on ALFWorld expert trajectories.
 
-  modal run --detach infra/app_sft_train_alfworld.py --epochs 3 --min-reward 0.5
-
-Tokenizes (prompt, action) SFT examples loaded via
-`src.datasets.sft_alfworld.load_sft_examples_from_jsonl`, runs masked
-cross-entropy (only action tokens contribute to the loss), saves the
-LoRA adapter to /vol/checkpoints/<run_name>_<ts>/. The adapter can
-then be loaded by `infra/app_train_loop.py::train_loop_alfworld` via
-`LoRAPolicy.load_adapter(...)` to seed GRPO with a non-trivial init.
-
-This is a near line-for-line clone of `infra/app_sft_train.py` with:
-  - dataset import: `src.datasets.sft_alfworld` instead of `sft_webshop`
-  - data path: `/vol/data/alfworld/sft_trajs.jsonl` (single JSONL) instead
-    of `/vol/data/webshop/human_trajs/` (directory of JSONLs)
-  - loader: `load_sft_examples_from_jsonl(path)` instead of
-    `load_sft_examples_from_directory(dir)`
-  - default `run_name = "sft_alfworld_v1"`
-  - image: `image` (NOT `alfworld_image`); the trainer doesn't need
-    AlfWorld at runtime - the SFT data file is fully pre-rendered by
-    the SFT-gen app, so the trainer is purely a tokenize+CE loop.
-
-Cost: ~$0.50, ~30 min for 3 epochs over ~2000+ examples on A100.
+Tokenizes (prompt, action) examples and runs masked cross-entropy (action
+tokens only), saving the LoRA adapter to /vol/checkpoints/<run_name>_<ts>/ for
+`train_loop_alfworld` to load. Mirrors `app_sft_train.py` but reads a single
+pre-rendered JSONL via `sft_alfworld.load_sft_examples_from_jsonl`.
 """
 from __future__ import annotations
 
@@ -32,8 +15,7 @@ from infra.image import image
 app = modal.App("cs224r-hgpo-sft-train-alfworld")
 
 
-# Default location of the AlfWorld SFT JSONL on the shared Volume -
-# matches `infra/app_alfworld_sft_gen.py::SFT_OUTPUT_PATH`.
+# Matches `infra/app_alfworld_sft_gen.py::SFT_OUTPUT_PATH`.
 DEFAULT_SFT_DATA_PATH = "/vol/data/alfworld/sft_trajs.jsonl"
 
 
@@ -84,10 +66,8 @@ def sft_train(
         )
 
     print(">>> Loading LoRAPolicy")
-    # LoRA arch knobs propagated from CLI. Defaults preserve v1 behavior
-    # (rank 16, attention-only). The 2:1 alpha:rank convention is kept
-    # in lockstep with the dataclass default (16/32) and the train_loop
-    # plumb-through in infra/app_train_loop.py.
+    # LoRA arch knobs from CLI (defaults: rank 16, attention-only); 2:1
+    # alpha:rank matches the dataclass default + train_loop plumb-through.
     _targets = [t.strip() for t in lora_target_modules.split(",") if t.strip()]
     print(f">>> LoRA arch: rank={lora_rank} target_modules={_targets}")
     policy = LoRAPolicy(LoRAPolicyConfig(
@@ -103,9 +83,8 @@ def sft_train(
     n_truncated_prompts = 0
     for ex in examples:
         prompt_ids = tokenizer(ex.prompt, add_special_tokens=False).input_ids
-        # Target is the full ReAct emission ` <thought>\nAction: <body>` so
-        # the SFT model learns to produce Thought + Action together - the
-        # exact format the runtime ReAct loop expects.
+        # Target = full ReAct emission (Thought + Action), the format the
+        # runtime ReAct loop expects.
         target_str = synthesize_sft_target(ex.action) + tokenizer.eos_token
         action_ids = tokenizer(target_str, add_special_tokens=False).input_ids
         if len(prompt_ids) + len(action_ids) > max_seq_len:

@@ -1,44 +1,15 @@
 #!/usr/bin/env bash
 # WebShop SOTA - HGPO-Progress (Method C) v1.
-#
-# Recipe-transplant from AlfWorld SOTA (rank-32 + MLP target modules,
-# K=8, kl=0.04, lr=5e-6, T=1.0) PLUS the WebShop-specific attribute-progress
-# dense signal (env.use_attribute_progress_intermediate_reward=true).
-# alpha=0.5 (per-turn signal contributes), decomposer=progress (reads
-# TurnRecord.raw_env_reward, populated with the dense IR signal).
-# See plan ~/.llms/plans/webshop_sft_mlpr32_oracle_baseline.plan.md.
-#
-# Method C is the parameter-free per-turn-supervision baseline: TurnRDv2
-# learns a model to attribute credit; Progress just uses the raw env-progress
-# signal as the per-turn credit. With the goal_options + user_sessions adapter
-# fixes landed (verified via infra/app_webshop_sft_gen.py::validate_dense_signal:
-# mean_ir_by_action_kind[click_option]=0.0384,
-# pearson_r(cum_IR, final_reward)=0.9651), this is a real per-turn-supervision
-# experiment on WebShop; previously the dense signal degenerated to a 1-bit
-# ASIN-landing indicator so Method C was equivalent to flatGRPO on WebShop.
-#
-# Geometry (seed=41, rounds=10, eps=80):
-#   base_task_id_offset = 41 * 10 * 80 = 32800
-#   train task range    = [32800, 33600)
-#   eval task range     = [6500, 6600)   (disjoint)
-#   disjoint from attention v1 (seed=11), flatGRPO v1 (seed=23),
-#   and LLMJudge v1 (seed=31)
-#
-# ~2.5-3 hours wall-clock. K=8 + 100-eps eval, 10 rounds * 80 eps. Same
-# cost profile as flatGRPO (no TurnRD trainer step per round).
+# Recipe-transplant from AlfWorld SOTA + WebShop attribute-progress dense signal.
+# alpha=0.5, decomposer=progress (reads TurnRecord.raw_env_reward, the dense IR).
+# Parameter-free per-turn-supervision baseline. seed=41, rounds=10, eps=80.
+# Override via env vars: SFT_ADAPTER, CONFIG, RUN_PREFIX, ROUNDS, etc.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-# Warm-start adapter at R0. Default points at the WebShop SFT v3
-# rank-32 + 7-MLP-target adapter produced by
-# `scripts/run_webshop_sft_v3_mlpr32.sh` (see
-# ~/.llms/plans/webshop_sft_mlpr32_oracle_baseline.plan.md).
-#
-# PLACEHOLDER - replace `REPLACE_WITH_TS_FROM_PHASE4` with the
-# timestamp suffix of the actual adapter dir produced by Phase 4,
-# or override at invocation time:
-#   SFT_ADAPTER=/vol/checkpoints/sft_webshop_v3_mlpr32_<ts> \
-#     bash scripts/run_webshop_SOTA_Progress_v1.sh
+# Warm-start adapter at R0 (WebShop SFT v3 rank-32 + 7-MLP, from
+# scripts/run_webshop_sft_v3_mlpr32.sh). Replace REPLACE_WITH_TS_FROM_PHASE4 or
+# override via SFT_ADAPTER=/vol/checkpoints/sft_webshop_v3_mlpr32_<ts>.
 SFT_ADAPTER="${SFT_ADAPTER:-/vol/checkpoints/sft_webshop_v3_mlpr32_REPLACE_WITH_TS_FROM_PHASE4}"
 
 CONFIG=${CONFIG:-configs/Progress_webshop_SOTA_10round_mlpr32_v1.json}
@@ -63,13 +34,8 @@ fi
 BASE_OFFSET=$(( SEED * ROUNDS * EPS_PER_ROUND ))
 TRAIN_HI=$(( BASE_OFFSET + ROUNDS * EPS_PER_ROUND ))
 
-# Read K_trajectories_per_task + gpu_mem_util + sync_every from the JSON
-# config so we mirror the orchestrator's flag-derivation logic for
-# train_loop_webshop. (Flat GRPO has no TurnRD trainer to coordinate, so
-# we invoke `modal run infra/app_train_loop.py::train_loop_webshop`
-# directly in a per-round bash for-loop. This matches the orchestrator's
-# error-message guidance: "non-TurnRD configs should run directly via
-# `modal run infra/app_train_loop.py --config ...`.")
+# Read K/gpu_mem_util/sync_every from the JSON config (non-TurnRD configs run
+# app_train_loop.py per round directly; no TurnRD trainer to coordinate).
 read -r K_PER_TASK GPU_MEM_UTIL SYNC_EVERY < <(python -c "
 import json, sys
 with open('${CONFIG}') as f: c = json.load(f)
@@ -112,10 +78,7 @@ echo "                       trainer step per round)."
 echo "  Parallel-safe      : YES - disjoint task ranges + adapter run-name prefix."
 echo "========================================"
 
-# In-bash per-round driver. Adapter chaining mirrors run_turnrd_modal.py's
-# carry-policy mode: R0 loads ${SFT_ADAPTER}; R_N>0 loads R_{N-1}'s saved
-# adapter. Each round saves to ${ADAPTER_DIR}/<prefix>_seed<S>_round<NN>_adapter
-# so the chain is deterministic + recoverable.
+# Per-round driver: R0 loads ${SFT_ADAPTER}; R_N>0 loads R_{N-1}'s saved adapter.
 run_rounds () {
     local rc
     for round_idx in $(seq "${START_ROUND}" $((ROUNDS - 1))); do
@@ -131,9 +94,7 @@ run_rounds () {
             load_adapter="${ADAPTER_DIR}/${RUN_PREFIX}_seed${SEED}_round${prev_pad}_adapter"
         fi
 
-        # Build the modal run command. `_to_container_path` analog: the
-        # local repo gets mounted at /workspace inside the container, so
-        # `configs/foo.json` -> `/workspace/configs/foo.json`.
+        # Repo is mounted at /workspace; configs/foo.json -> /workspace/configs/foo.json.
         local config_container="/workspace/${CONFIG}"
         local cmd=(
             modal run --detach

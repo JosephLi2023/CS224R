@@ -1,24 +1,7 @@
-"""Shared Modal Images for CS224R H-GRPO.
-
-Three images, all built off the same heavy ML base:
-- `image`          - trainer + policy + judge (default).
-- `webshop_image`  - same base + Java JDK + WebShop env runtime deps
-                     (pyserini, spaCy, rank_bm25, Flask, gym, ...). Used by
-                     `infra/app_webshop_install.py` and any app that
-                     instantiates `WebAgentTextEnv` directly.
-- `alfworld_image` - same base + AlfWorld + TextWorld runtime deps. Used by
-                     `infra/app_alfworld_install.py` (one-time
-                     `alfworld-download` into the Volume) and any app that
-                     instantiates `AlfredTWEnv` directly. Much lighter than
-                     `webshop_image` - no Java, no pyserini, no spaCy. The
-                     `ALFWORLD_DATA` env var is set to the volume-resident
-                     data path so the upstream `$ALFWORLD_DATA` interpolation
-                     in the env config dict resolves correctly inside the
-                     container.
-
-WebShop's own `requirements.txt` pins legacy torch/transformers/numpy that
-would clobber our modern stack - we install its EXTRA deps explicitly here
-and `pip install -e webshop --no-deps` at runtime in the install app.
+"""Shared Modal Images for CS224R H-GRPO, all built off one heavy ML base:
+`image` (trainer/policy/judge), `webshop_image` (+ Java/pyserini/spaCy), and
+`alfworld_image` (+ AlfWorld/TextWorld). WebShop's legacy pins are kept out by
+installing only its extra deps here and `pip install -e --no-deps` at runtime.
 """
 from __future__ import annotations
 
@@ -55,9 +38,8 @@ _PIP_PACKAGES = [
 
 _BASE_APT = ["git", "build-essential"]
 
-# WebShop runtime deps - installed ON TOP of the modern stack. We
-# deliberately pin only what WebShop genuinely needs at env-reset/step
-# time and leave torch/transformers/numpy at our modern versions.
+# WebShop runtime deps on top of the modern stack (torch/transformers/numpy
+# stay at our versions).
 _WEBSHOP_PIP_EXTRAS = [
     "pyserini==0.22.1",        # newer than WebShop's 0.17.0; works with Java 21
     "faiss-cpu>=1.8",          # pyserini imports faiss at module load
@@ -76,25 +58,18 @@ _WEBSHOP_PIP_EXTRAS = [
 _WEBSHOP_APT = ["default-jdk", "default-jre"]
 
 
-# AlfWorld runtime deps. Much smaller than WebShop's - `alfworld` brings in
-# `textworld` (TextWorld game engine) + `gym` itself; no Java, no pyserini,
-# no spaCy. The `--extra` flag during install also brings the THOR/embodied
-# assets, but those are downloaded by `app_alfworld_install.py` into the
-# Volume rather than baked into the image.
+# AlfWorld runtime deps (alfworld + textworld + gym; no Java/pyserini/spaCy).
 _ALFWORLD_PIP_EXTRAS = [
     "alfworld>=0.3.5",
     "textworld>=1.6",
-    # `alfworld` declares gym as a runtime dep but doesn't pin it; we pin
-    # to the same version as WebShop so the two images stay binary-compatible
-    # for the shared `gym` import path.
+    # Pin gym to WebShop's version so the two images stay compatible.
     "gym==0.24.0",
 ]
 
 _ALFWORLD_APT = ["libffi-dev"]
 
-# Where the install app downloads ALFWorld's data into the shared Volume.
-# Match the path documented in `infra/common.py::Volume layout` + referenced
-# by every config's `$ALFWORLD_DATA/...` interpolation.
+# Where the install app downloads ALFWorld data (matches configs'
+# `$ALFWORLD_DATA` interpolation).
 ALFWORLD_DATA_DIR = "/vol/data/alfworld"
 
 
@@ -111,16 +86,10 @@ def _add_workspace(img: modal.Image) -> modal.Image:
         img.env({
             "PYTHONPATH": "/workspace",
             "HF_HOME": "/vol/hf_cache",
-            # Use PyTorch's expandable-segments CUDA caching allocator.
-            # Forces `torch.cuda.mem_get_info()` to reflect actual OS-level
-            # free memory honestly across alloc -> empty_cache cycles.
-            # Workaround for vLLM 0.6.3.post1's
-            # `assert peak_memory > 0` (vllm/worker/worker.py:232) which
-            # fires on the train->eval vLLM handoff in
-            # `infra/app_train_loop._train_loop_impl` because the default
-            # caching allocator returns transient profile-run blocks to a
-            # pool that mem_get_info no longer sees as "free" -> delta == 0.
-            # See PyTorch 2.4 release notes ("expandable_segments").
+            # Use PyTorch's expandable-segments allocator so mem_get_info()
+            # reports OS-level free memory honestly across empty_cache cycles
+            # (works around vLLM 0.6.3.post1's `peak_memory > 0` profile assert
+            # on the train->eval handoff).
             "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
         })
         .add_local_dir(

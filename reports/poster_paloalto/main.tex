@@ -1,0 +1,263 @@
+% CS224R Final Poster — Hybrid Advantage Shaping with Goal-Aware Attention TurnRD
+% =============================================================================
+% Compile with XeLaTeX (Overleaf: Menu > Settings > Compiler > XeLaTeX)
+% Stanford LaTeX Poster Template (Gemini theme + Stanford color theme)
+% 120cm x 72cm landscape, 3 columns, Palo Alto Green banner
+% =============================================================================
+\documentclass[final]{beamer}
+
+% ============================================================================
+% Packages
+% ============================================================================
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[size=custom,width=91.44,height=60.96,scale=0.79]{beamerposter}
+\usetheme{gemini}
+\usecolortheme{stanford}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tikz}
+\usepackage{pgfplots}
+\usepackage{amsmath}
+\usepackage{xcolor}
+\pgfplotsset{compat=1.17}
+
+% ============================================================================
+% Lengths (3 columns)
+% ============================================================================
+\newlength{\sepwidth}
+\newlength{\colwidth}
+\setlength{\sepwidth}{0.025\paperwidth}
+\setlength{\colwidth}{0.3\paperwidth}
+\newcommand{\separatorcolumn}{\begin{column}{\sepwidth}\end{column}}
+
+% ============================================================================
+% Metadata (FILL IN AUTHOR NAMES + EMAILS)
+% ============================================================================
+\title{Hybrid Advantage Shaping with Goal-Aware Attention\\for Per-Turn Credit Assignment in LLM-Agent Reinforcement Learning}
+
+\author{Joseph Li \and Max Rodriguez \and Samantha Leventis}
+
+\institute[shortinst]{~}
+
+\footercontent{
+  CS224R Final Project Poster Session \hfill
+  \texttt{shoupei@stanford.edu, maxrod@stanford.edu, samanthaleventis@stanford.edu} \hfill
+  Code: \texttt{github.com/JosephLi2023/CS224R}
+}
+
+% ============================================================================
+% Body
+% ============================================================================
+\begin{document}
+
+% Stanford logo seated inside the banner (theme-native: banner auto-expands to contain it)
+\logoright{\includegraphics[height=8cm]{stanford_logos/Block_S_2_color.png}}
+
+\begin{frame}[t]
+\vspace*{3cm}
+\begin{columns}[t]
+\separatorcolumn
+
+% =====================================================================
+% COLUMN 1 — Motivation + Method + Architecture
+% =====================================================================
+\begin{column}{\colwidth}
+
+  \begin{block}{Motivation}
+
+    LLM agents acting over many turns in sparse-reward environments such as AlfWorld and
+    WebShop receive only a single terminal reward, yet success depends on credit being
+    assigned to the individual turns that actually mattered. As tool-use, web, and embodied
+    agents tackle ever longer horizons, stable per-turn credit assignment has become the
+    central bottleneck for sample-efficient learning.
+
+    Existing approaches leave this gap open: trajectory-level GRPO (DeepSeekMath) copies one
+    advantage onto every token and gives no per-turn signal; step-level GRPO (GiGPO, HoGPO)
+    adds per-step structure but relies on fixed, heuristic credit; and return decomposition
+    (RUDDER-style) learns per-step credit yet remains goal-agnostic. We therefore propose:
+
+    \begin{itemize}
+      \item \textbf{Hybrid Advantage Shaping (HAS)} --- a one-knob framework that blends a
+            trajectory baseline with a pluggable per-turn decomposer.
+      \item \textbf{TurnRD with goal-aware FiLM attention} --- the strongest decomposer:
+            learnable attention over per-turn hiddens, modulated by a per-trajectory goal
+            embedding.
+    \end{itemize}
+
+  \end{block}
+
+  \begin{block}{Method: Hybrid Advantage Shaping}
+
+    Per-turn advantage is a blend of the trajectory-level baseline and a per-turn signal:
+    \begin{equation*}
+      A_H^t \;=\; \alpha \cdot A_{\text{traj}} \;+\; (1-\alpha) \cdot A_{\text{turn}}^t
+    \end{equation*}
+
+    \begin{itemize}
+      \item $\alpha = 1.0$: pure trajectory (flatGRPO, no credit);
+            $\alpha = 0.5$: hybrid blend (empirically optimal)
+      \item Per-turn decomposer is pluggable: Progressive,
+            LLM-Judge, or TurnRD (learned attention)
+    \end{itemize}
+
+  \end{block}
+
+  \begin{figure}
+    \centering
+    \IfFileExists{figures/architecture.png}{%
+      \includegraphics[width=\linewidth]{figures/architecture.png}%
+    }{%
+      \IfFileExists{figures/F1_method_overview.pdf}{%
+        \includegraphics[width=\linewidth]{figures/F1_method_overview.pdf}%
+      }{%
+        \fbox{\rule{0pt}{18cm}\rule{27cm}{0pt}}%
+      }%
+    }
+  \end{figure}
+
+  \begin{block}{TurnRD + FiLM (goal aware)}
+
+    \begin{itemize}
+      \item \textbf{Input/Encoder:} per-turn hiddens $h_t$ (policy's last hidden state), encoded by a
+            bidirectional transformer (2 layers, 4 heads, $H=128$)
+      \item \textbf{FiLM (Feature-wise Linear Modulation) goal-conditioning:} per-trajectory goal\_emb produces $\gamma, \beta$;
+            $\text{FiLM}(h_t) = \gamma \odot h_t + \beta$ modulates $h_t$ before $\alpha$- and $V$-heads
+      \item \textbf{$\alpha$-head:} softmax over turns gives the per-turn credit weight $\alpha_t$
+      \item \textbf{$V$-head:} per-turn value $V_t$; $\sum_t \alpha_t V_t \approx R$ recovers reward
+      \item \textbf{Training:} 4-term auxiliary loss (pred, rank, progress, value);
+            re-fit per round on cumulative recency-decayed replay buffer
+    \end{itemize}
+
+  \end{block}
+
+\end{column}
+
+\separatorcolumn
+
+% =====================================================================
+% COLUMN 2 — AlfWorld Results (HEADLINE) + FiLM evidence
+% =====================================================================
+\begin{column}{\colwidth}
+
+  \begin{block}{Experiment \& Results}
+
+    \begin{itemize}
+      \item \textbf{Models:} Qwen2.5-1.5B-Instruct + LoRA $r=32$ (attn + MLP targets)
+      \item \textbf{Envs:} AlfWorld (1{,}000 games), WebShop (1{,}000 products)
+      \item \textbf{Training:} 10 rounds $\times$ 80 episodes $\times$ $K=8$ rollouts/task
+      \item \textbf{Eval:} greedy $K=1$, $n=100$ held-out episodes per round
+      \item \textbf{Compute:} A100-80GB on Modal, $\sim$5--12h per run
+      \item \textbf{AlfWorld:} 80\% success vs $\sim$70\% flatGRPO baseline (+10pp)
+      \item \textbf{WebShop:} 91.3\% success vs 80.5\% flatGRPO (+10.8pp)
+    \end{itemize}
+
+  \end{block}
+
+  \begin{block}{AlfWorld --- TurnRD+FiLM reaches 80\%}
+
+    \begin{figure}
+      \centering
+      \includegraphics[width=0.85\linewidth]{figures/F4_alfworld_trajectory.pdf}
+    \end{figure}
+
+    \begin{itemize}
+      \item TurnRD+FiLM (80\%) > TurnRD without FiLM (75\%) > flatGRPO ($\sim$70\%):
+            the per-turn signal and goal-aware FiLM each add measurable lift.
+      \item Our method improves steadily to 80\%, while flatGRPO plateaus in the high-60s\%.
+      \item Early rounds are noisy and overlap the baseline; TurnRD's lead
+            emerges with more training as its learned credit assignment matures.
+    \end{itemize}
+
+  \end{block}
+
+  \begin{alertblock}{Goal-Aware FiLM is Actively Learning}
+
+    \begin{figure}
+      \centering
+      \includegraphics[width=\linewidth]{figures/F7_film_mechanism.pdf}
+    \end{figure}
+
+    \begin{itemize}
+      \item \textbf{Perturbation:} zeroing $\gamma/\beta$ changes the per-turn V-head credit by 39.7\%, so goal conditioning genuinely shapes the assigned credit.
+      \item \textbf{Goal-shuffle:} feeding a mismatched goal\_emb worsens V-head MSE by 3.16\% (57.6\% of samples), so the credit tracks the true goal, not just position.
+      \item \textbf{$\gamma/\beta$ growth:} modulation strength rises monotonically ($\gamma$ norm $0.34$ to $0.83$, R0--R12), so the model leans more on the goal as training proceeds.
+    \end{itemize}
+
+  \end{alertblock}
+
+\end{column}
+
+\separatorcolumn
+
+% =====================================================================
+% COLUMN 3 — WebShop + Conclusion + Limitations + Refs
+% =====================================================================
+\begin{column}{\colwidth}
+
+  \begin{block}{WebShop --- HAS generalizes across envs}
+
+    \begin{figure}
+      \centering
+      \includegraphics[width=0.78\linewidth]{figures/F2_webshop_5method_bar.pdf}
+    \end{figure}
+
+    \begin{itemize}
+      \item The hybrid blend ($\alpha=0.5$) beats the flatGRPO baseline ($\alpha=1.0$) by
+            10.8pp, so the framework generalizes beyond AlfWorld.
+      \item TurnRD's learned attention beats Progressive (+5.3pp) and LLM-Judge (+9.3pp):
+            learned per-turn credit outperforms hand-designed heuristics.
+    \end{itemize}
+
+  \end{block}
+
+  \begin{block}{Conclusion}
+
+    \begin{itemize}
+      \item \textbf{One knob, general:} HAS blends trajectory- and turn-level advantages
+            with a single $\alpha$ and improves results in both environments.
+      \item \textbf{Learned, goal-aware credit wins:} TurnRD with FiLM is the strongest
+            decomposer, adding +5pp on AlfWorld over the no-FiLM variant.
+      \item \textbf{Strong end-to-end results:} 80\% on AlfWorld and 91.3\% on WebShop
+            from one shared framework.
+      \item \textbf{Safe by design:} at $\alpha=1.0$ HAS reduces to flatGRPO, so it is
+            never worse than the baseline.
+    \end{itemize}
+
+  \end{block}
+
+  \begin{block}{Limitations \& Future Work}
+
+    \begin{itemize}
+      \item \textbf{Single base model:} validated only on Qwen2.5-1.5B with LoRA;
+            full fine-tuning and larger backbones remain untested.
+      \item \textbf{Limited environments:} results cover AlfWorld and WebShop only;
+            transfer to other agentic domains is unverified.
+      \item \textbf{Modest goal signal:} the goal-shuffle effect (+3.16\%) is statistically
+            real but small, so goal-awareness is present yet weak.
+      \item \textbf{Future work:} adaptive per-round $\alpha$ schedules, larger models,
+            multi-task transfer, and a stronger goal-discrimination loss.
+    \end{itemize}
+
+  \end{block}
+
+  \begin{block}{References}
+
+    \footnotesize
+    \begin{thebibliography}{9}
+      \setlength{\itemsep}{0.3em}
+      \bibitem{feng2025gigpo} Yunzhen Feng et al. GiGPO: Step-level group relative policy optimization for long-horizon reasoning. arXiv:2505.10978, 2025.
+      \bibitem{he2026hogpo} Shuo He et al. Hierarchy-of-groups policy optimization for long-horizon agentic tasks. In ICLR, 2026.
+      \bibitem{shao2024deepseekmath} Zhihong Shao et al. DeepSeekMath: Pushing the limits of mathematical reasoning in open language models, 2024. Preprint.
+      \bibitem{perez2018film} Ethan Perez et al. FiLM: Visual reasoning with a general conditioning layer. In AAAI, 2018.
+    \end{thebibliography}
+
+  \end{block}
+
+\end{column}
+
+\separatorcolumn
+\end{columns}
+\end{frame}
+
+\end{document}

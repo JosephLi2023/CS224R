@@ -1,18 +1,8 @@
 """SFT dataset loader for the WebShop human-trajectory JSONL files.
 
-Each `.jsonl` file is one human shopping trajectory:
-    row 0:  page=index, url=<base>/<task_id>                                 (initial state)
-    row k:  page=search_results, url=<base>/search_results/<task>/<q>/<pg>   (after a search)
-    row j:  page=item_page,      url=<base>/item_page/<task>/<asin>/<q>/...  (after a click)
-    row N:  page=done,           url=<base>/done/<task>/<asin>/<opts>        (terminal; reward populated)
-
-Actions are encoded in the URL of the *next* row, so we extract them by
-diffing successive URLs. We produce SFTExamples of the form (prompt,
-target_action) suitable for cross-entropy SFT against a Qwen-style
-chat template.
-
-This module is pure Python (stdlib only) so it's unit-testable locally
-without torch / transformers.
+Actions are encoded in each row's URL, so we extract them by diffing
+successive URLs into (prompt, target_action) SFTExamples. Pure stdlib, so
+it's unit-testable without torch / transformers.
 """
 
 from __future__ import annotations
@@ -50,9 +40,8 @@ def _path_segments(url: str) -> list[str]:
 
 
 def _decode_query_list(encoded: str) -> list[str]:
-    """The URL-encoded query is a python-list-literal like
-    ``%5B%27red%27%2C%20%27dress%27%5D`` -> ``['red', 'dress']``. Decode
-    + ast.literal_eval.
+    """Decode a URL-encoded python-list-literal query, e.g.
+    ``%5B%27red%27%2C%20%27dress%27%5D`` -> ``['red', 'dress']``.
     """
     try:
         decoded = unquote(encoded)
@@ -65,20 +54,7 @@ def _decode_query_list(encoded: str) -> list[str]:
 
 
 def _action_from_url_transition(prev_url: str, next_url: str) -> str | None:
-    """Infer the WebShop ReAct action from `prev_url` -> `next_url`.
-
-    Diffs the two URLs to disambiguate transitions that look superficially
-    identical but represent different agent actions:
-
-      * index -> search_results -> search[<query>]
-      * search_results page=N -> page=N+1, same query -> click[Next >]
-      * search_results page=N -> page=N-1, same query -> click[< Prev]
-      * search_results -> search_results, different query -> search[<new>]
-      * search_results -> item_page -> click[<asin>]
-      * item_page -> item_page, same asin, mutated options -> click[<value>]
-      * item_page -> item_page, same asin, page suffix -> click[<tab name>]
-      * item_page -> search_results -> click[Back to Search]
-      * item_page -> done -> click[Buy Now]
+    """Infer the WebShop ReAct action from the `prev_url` -> `next_url` diff.
 
     Returns None for any unrecognized transition; callers abort the whole
     trajectory in that case so the prompt history can't desync.
@@ -89,7 +65,6 @@ def _action_from_url_transition(prev_url: str, next_url: str) -> str | None:
         return None
     page = next_segs[0]
 
-    # done / buy
     if page == "done":
         return "click[Buy Now]"
 
@@ -182,13 +157,10 @@ def _diff_options(prev_encoded: str, next_encoded: str) -> str | None:
 
 
 def _action_to_thought(action: str) -> str:
-    """Heuristic: synthesize a one-sentence ReAct 'Thought' from an action.
+    """Synthesize a one-sentence ReAct 'Thought' from an action.
 
-    Used by `synthesize_sft_target` so the SFT label is a full
-    `Thought: <reason>\nAction: <body>` block matching the runtime ReAct
-    template exactly. The original WebShop human-trajectory JSONL does not
-    record human thoughts, so we synthesize one consistent with each action
-    type.
+    The human-trajectory JSONL records no thoughts, so `synthesize_sft_target`
+    uses this to build a full Thought/Action SFT label.
     """
     if action.startswith("search["):
         query = action[len("search["):-1] if action.endswith("]") else action[len("search["):]
@@ -217,15 +189,11 @@ def default_render_prompt(
     history: list[tuple[str, str]],   # list of (observation, action) for past turns
     current_observation: str,
 ) -> str:
-    """SFT prompt renderer that delegates to the runtime ReAct renderer.
+    """Render an SFT prompt by delegating to the runtime ReAct renderer.
 
-    Adapts the SFT-side `(instruction, [(obs, act), ...], current_obs)`
-    shape into the runtime renderer's `(state, history)` shape via
-    `SimpleNamespace` shims, then calls
-    `src.envs.prompts.react_webshop.render_webshop_turn_prompt` so the
-    SFT prompt is byte-identical to the prompt seen during GRPO rollouts.
-    Using a single renderer avoids the template drift that previously sent
-    post-SFT reward to zero.
+    Shims the SFT-side `(instruction, history, current_obs)` into the
+    renderer's `(state, history)` shape so SFT prompts stay byte-identical to
+    GRPO rollout prompts.
     """
     from types import SimpleNamespace
 
@@ -234,10 +202,8 @@ def default_render_prompt(
     state = SimpleNamespace(
         observation_text=current_observation,
         instruction=instruction,
-        # SFT data (downloaded human trajectories) does not record the env's
-        # `valid_actions` whitelist, so we pass an empty list - matching the
-        # runtime renderer's behavior of omitting the `Valid actions:` line
-        # when the whitelist is unavailable.
+        # SFT data has no `valid_actions` whitelist, so pass an empty list;
+        # the renderer then omits the `Valid actions:` line.
         valid_actions=[],
     )
     history_objs = [
@@ -248,12 +214,10 @@ def default_render_prompt(
 
 
 def synthesize_sft_target(action: str) -> str:
-    """Build the multi-line SFT label matching the prompt's `Thought:` ending.
+    """Build the SFT label emitted after the prompt's trailing `Thought:`.
 
-    Returns the string the model should emit AFTER the prompt ends - i.e.
-    ` <synthesized thought>\\nAction: <action body>`. The leading space is
-    deliberate so it concatenates cleanly with the prompt's trailing
-    `Thought:` (which has no trailing whitespace).
+    Returns ` <thought>\\nAction: <action>`; the leading space concatenates
+    cleanly with the prompt's `Thought:` ending.
     """
     return f" {_action_to_thought(action)}\nAction: {action}"
 
@@ -262,15 +226,12 @@ def synthesize_sft_target(action: str) -> str:
 
 
 def _row_observation_text(row: dict[str, Any]) -> str:
-    """Extract a human-readable observation string from a trajectory row.
-
-    Falls back to a JSON dump of the `content` dict when no rendered
-    observation is available.
+    """Extract a human-readable observation from a row, falling back to a
+    JSON dump of `content` when none is available.
     """
     content = row.get("content")
     if isinstance(content, dict):
-        # WebShop typically stores the rendered text under content['text'] or
-        # content['observation']; if neither, dump JSON keys for context.
+        # Prefer a rendered-text field; otherwise dump the content keys.
         for key in ("observation", "text", "html_text", "rendered"):
             if key in content and isinstance(content[key], str):
                 return content[key]
@@ -319,12 +280,8 @@ def trajectory_to_sft_examples(
         nxt = rows[i + 1]
         action = _action_from_url_transition(cur.get("url", ""), nxt.get("url", ""))
         if action is None:
-            # Trajectory contains an un-recognised URL transition (e.g. an
-            # action type the loader doesn't understand yet). Aborting the
-            # WHOLE trajectory rather than skipping this single step keeps
-            # the prompt history aligned with the action labels - skipping
-            # would silently desync subsequent (obs, action) pairs and teach
-            # mis-grounded supervision. (Review item A7.)
+            # Unrecognized URL transition: abort the whole trajectory rather
+            # than skip one step, which would desync history from the labels.
             return []
         obs_text = _row_observation_text(cur)
         prompt = render_prompt(instruction, list(history), obs_text)
@@ -367,12 +324,9 @@ def load_sft_examples_from_jsonl(
 ) -> list[SFTExample]:
     """Load pre-rendered SFT examples from a single JSONL file.
 
-    Mirrors `src/datasets/sft_alfworld.py::load_sft_examples_from_jsonl`
-    and is the consumer side of the schema written by
-    `infra/app_webshop_sft_gen.py` (one row per turn). Rows are
-    pre-rendered by the runtime ReAct renderer so SFT prompts are
-    byte-identical to the GRPO rollout prompts. Drops rows with
-    `final_reward < min_reward`; malformed rows are skipped.
+    Rows are pre-rendered by the runtime ReAct renderer, so SFT prompts match
+    the GRPO rollout prompts. Drops rows with `final_reward < min_reward`;
+    malformed rows are skipped.
     """
     out: list[SFTExample] = []
     with open(path) as fh:

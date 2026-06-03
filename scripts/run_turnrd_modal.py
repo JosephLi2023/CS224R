@@ -1,58 +1,17 @@
 #!/usr/bin/env python3
 """Method-B (TurnRD) end-to-end orchestration on Modal.
 
-Coordinates the **producer** (parent H-GRPO `train_loop`) and the
-**standalone TurnRD trainer** in a round-robin so the H-GRPO policy
-keeps training while TurnRD's reward decomposition is periodically
-re-fitted from the accumulated replay buffer.
-
-  Round 0: warm-up
-    - train_loop emits replay rows (no TurnRD ckpt yet -> trainer's
-      refresh_fn logs a warning and skips the load; the in-memory
-      decomposer trains from random init).
-    - train_turnrd then fits TurnRD on the accumulated rows and writes
-      the first ckpt.
-  Round i >= 1: refresh-driven
-    - train_loop runs `--episodes-per-round` more episodes. The
-      trainer's refresh_fn (built by build_trainer_from_config when
-      `cfg.turnrd.ckpt_path` is set) loads the previous round's ckpt
-      at the configured cadence, so every group post-load uses the
-      latest decomposer.
-    - train_turnrd re-fits on the (now larger) replay buffer.
-
-The `/vol/...` paths are shared across Modal container instances via
-the cs224r project Volume - see `infra/common.py::volume`.
+Round-robins the producer (parent H-GRPO train_loop) and the standalone TurnRD
+trainer so the policy keeps training while TurnRD's reward decomposition is
+periodically re-fit from the accumulated replay buffer. /vol/... paths are
+shared across Modal containers via the project Volume.
 
 Usage:
   scripts/run_turnrd_modal.py --rounds 5 --episodes-per-round 40
   scripts/run_turnrd_modal.py --dry-run    # print commands only
-  scripts/run_turnrd_modal.py --rounds 1 --episodes-per-round 2 --turnrd-epochs 1   # tiny smoke
 
-Wall-clock budget (real protocol, real WebShop, K=4 trajectories):
-  Per round: ~12-15 min train_loop + ~30 s standalone fit ~ 13-16 min.
-  5-round protocol: ~65-80 min total (assume 90 min for safety).
-
-  - If running from a devmate session, set the execute_command timeout
-    to >= 7200000 ms (2 hours). The previous 60-min cap killed the
-    LOCAL polling subprocess at the boundary between Round 3 and
-    Round 4 - note that this only kills the local poller; the cloud
-    jobs themselves are detached so they continue, but the
-    orchestrator stops submitting subsequent rounds.
-  - For long unattended runs, prefer running this script under
-    `nohup` in a separate terminal so its lifetime is bounded only
-    by the actual orchestration, not by any IDE/agent session
-    timeout. Example:
-      nohup scripts/run_turnrd_modal.py --rounds 5 \
-        --episodes-per-round 40 --turnrd-epochs 3 --seed 11 \
-        --sft-adapter /vol/checkpoints/sft_v3_<ts> \
-        > /tmp/protocol_seed11.log 2>&1 &
-
-Requires `modal` on PATH. The two Modal app entrypoints invoked are:
-  - infra/app_train_loop.py::train_loop_smoke  (parent H-GRPO + producer)
-  - infra/app_train_turnrd.py::train_turnrd_run  (standalone TurnRD fit)
-
-Both already accept the `--config` / `--replay` / `--ckpt-out` flags
-this script needs.
+Requires `modal` on PATH. For long unattended runs, launch under nohup so the
+orchestration isn't bounded by an IDE/agent session timeout.
 """
 from __future__ import annotations
 
@@ -76,8 +35,8 @@ DEFAULT_CONFIG = REPO_ROOT / "configs" / "method_hgpo_turnrd.json"
 class OrchestrationConfig:
     """All knobs the orchestration loop needs.
 
-    Defaults match a 200-episode protocol run split into 5 rounds of 40
-    episodes each, with 3 epochs of TurnRD fitting between rounds.
+    Defaults: a 200-episode run split into 5 rounds of 40 episodes, with 3
+    epochs of TurnRD fitting between rounds.
     """
 
     config_path: Path = DEFAULT_CONFIG
@@ -88,88 +47,47 @@ class OrchestrationConfig:
     turnrd_mode: int = 1
     turnrd_batch_size: int = 16
     turnrd_lr: float = 1e-4
-    # Modal volume paths - must match `cfg.turnrd.replay_buffer_path`
-    # and `cfg.turnrd.ckpt_path` in the JSON config (we cross-check
-    # below to surface mismatches before launching anything on Modal).
+    # Modal volume paths; must match cfg.turnrd.replay_buffer_path / ckpt_path
+    # (cross-checked in _preflight).
     replay_path: str = "/vol/cache/turnrd_replay.jsonl"
     ckpt_path: str = "/vol/cache/turnrd_ckpt.pt"
     run_name_prefix: str = "method_b_orchestrated"
-    # Optional SFT-warm-started LoRA adapter on the Modal volume. When
-    # set, the parent train_loop loads it via PEFT.load_adapter() and
-    # syncs the merged weights into vLLM before the first episode.
-    # Without this, cold-start RL on real WebShop typically produces
-    # R~0 for hundreds of episodes - the protocol's TurnRD signal
-    # depends on having non-trivially-trained policy producing
-    # reward variance from episode 0.
+    # Optional SFT-warm-started LoRA adapter. Without it, cold-start RL on real
+    # WebShop typically produces R~0 for a long time.
     sft_adapter: str = ""
-    # Held-out eval pass appended to each train_loop call. Uses
-    # greedy sampling on a disjoint task range so the eval is stable
-    # AND comparable across rounds + methods + seeds. Default
-    # `[6500, 6550)` is INSIDE WebShop's ~6910-goal range AND disjoint
-    # from training task ranges (seed 11 -> [2200, 2400),
-    # seed 23 -> [4600, 4800)). Higher offsets like 10000 raise
-    # `IndexError` in WebShop's `web_agent_text_env.py:512`. Set
-    # --eval-episodes 0 to disable.
+    # Held-out eval pass appended to each train_loop call (greedy, disjoint
+    # task range). Set --eval-episodes 0 to disable.
     eval_episodes: int = 50
     eval_task_id_base: int = 6500
-    # Multi-seed protocol support. None -> no seed-specific offset
-    # applied (legacy single-run behavior). When set, each seed gets a
-    # disjoint task_id range so different seeds never train on the same
-    # WebShop tasks. Also tags the run-name-prefix with `_seed{N}`.
+    # Multi-seed protocol. None -> no seed offset (legacy single-run). When set,
+    # each seed gets a disjoint task_id range and a _seed{N} run-name suffix.
     seed: int | None = None
-    # Env-name dispatch (default `webshop` for backward compat with
-    # all prior single-env sweeps). When set to `alfworld`, the
-    # orchestrator calls `train_loop_alfworld.remote(...)` (binding
-    # the AlfWorld-runtime image) and the eval-task-id-range guard is
-    # widened - AlfWorld's adapter wraps task_id with `% len(games)`
-    # so any non-negative integer is safe, but training/eval ranges
-    # must still be disjoint per the same per-seed offset math.
+    # Env dispatch: 'webshop' (default) or 'alfworld' (routes to
+    # train_loop_alfworld and widens the eval-task-id guard).
     env_name: str = "webshop"
     dry_run: bool = False
     skip_warmup_fit: bool = False
     extra_train_loop_args: list[str] = field(default_factory=list)
-    # Multi-round protocol with policy carry-across:
-    # - When False (default), every round loads `cfg.sft_adapter` so the
-    #   policy resets to the SFT warm-start each round (legacy behavior).
-    # - When True, round 0 loads `sft_adapter`, but rounds N>=1 load the
-    #   adapter saved by round N-1 (path = `<adapter_dir>/<run_prefix>_round{N-1:02d}_adapter`).
-    #   The corresponding `--save-adapter-out` is added to every round's
-    #   train_loop call so each round persists its trained LoRA adapter.
-    #   This makes 8x40 ep act like 1x320 ep (continuous training)
-    #   instead of 8 independent shots from SFT.
+    # Carry-policy across rounds: when True, R0 loads cfg.sft_adapter and R_N>0
+    # loads R_{N-1}'s saved adapter (continuous training); each round adds
+    # --save-adapter-out. Default False resets to SFT each round.
     carry_policy_across_rounds: bool = False
     adapter_dir: str = "/vol/checkpoints"
-    # vLLM SamplingParams temperature for the K-trajectory training rollouts
-    # (eval stays greedy at T=0.0). Default 1.0 preserves legacy behavior
-    # for every existing launcher. Lower values (e.g. 0.7) reduce mode-
-    # collapse / dead-K on saturated policies where K=8 rollouts at T=1.0
-    # often produce all-same outcomes (so groups have zero advantage variance
-    # and contribute zero gradient).
+    # vLLM rollout temperature for K-trajectory training (eval stays greedy).
+    # Lower values (e.g. 0.7) reduce mode-collapse / dead-K on saturated policies.
     rollout_temperature: float = 1.0
-    # Cross-run carry-policy lineage. OPT-IN. When True (and
-    # `--carry-policy-across-rounds` is also set), the FIRST iterated
-    # round (`round_idx == cfg.start_round`) loads `cfg.sft_adapter`
-    # instead of the prefix-derived `<prefix>_round{start_round-1:02d}_adapter`
-    # path. Needed for cross-run warm-start where the new prefix has no
-    # prior adapter on disk. Default False preserves the legacy resume
-    # convention used by e.g. `run_alfworld_SOTA_10round_mlpr32_v3_extend_R10R12.sh`,
-    # which relies on `cfg.sft_adapter` being ignored at start_round so
-    # the orchestrator picks up the prior run's saved adapter.
+    # Cross-run lineage opt-in: with --carry-policy-across-rounds, the first
+    # iterated round loads cfg.sft_adapter instead of the prefix-derived path.
+    # Default False keeps the legacy resume convention.
     sft_adapter_overrides_derived: bool = False
     extra_turnrd_args: list[str] = field(default_factory=list)
 
     @property
     def base_task_id_offset(self) -> int:
-        """Per-seed deterministic task_id starting offset.
+        """Per-seed task_id offset = seed * rounds * episodes_per_round.
 
-        Each seed gets a slice of length `rounds * episodes_per_round`
-        starting at `seed * rounds * episodes_per_round`. Two seeds
-        are guaranteed to operate on disjoint task ranges as long as
-        the per-run cap stays the same.
-
-        When `seed is None`, returns 0 (legacy behavior - preserves
-        the single-run case where the caller may want to manually
-        thread a `--task-id-offset` through `--extra-train-loop-args`).
+        Guarantees disjoint task ranges across seeds. Returns 0 when seed is
+        None (legacy single-run behavior).
         """
         if self.seed is None:
             return 0
@@ -404,13 +322,9 @@ def _parse_args(argv: Sequence[str]) -> OrchestrationConfig:
 def _preflight(cfg: OrchestrationConfig) -> None:
     """Catch obvious mistakes before spending money on Modal.
 
-    1. Modal CLI is on PATH.
-    2. Config file exists and is parseable JSON.
-    3. Config's `turnrd.replay_buffer_path` and `turnrd.ckpt_path` match
-       the orchestration's `--replay-path` and `--ckpt-path` (otherwise
-       the producer writes to one path and the standalone trainer reads
-       from another - a silent split-brain).
-    4. Round count > 0.
+    Checks: modal CLI on PATH; config exists and is valid JSON; config's
+    replay/ckpt paths match --replay-path/--ckpt-path (else a silent
+    split-brain); round count > 0.
     """
     if shutil.which("modal") is None and not cfg.dry_run:
         raise SystemExit(
@@ -461,12 +375,8 @@ def _preflight(cfg: OrchestrationConfig) -> None:
             "fn never reads. Align them before launching."
         )
 
-    # Architecture version consistency: the parent train_loop and the
-    # standalone fitter MUST construct the SAME `TurnRD` vs `TurnRDv2`
-    # class for the refresh-fn ckpt load to succeed (state_dict keys
-    # differ across architectures). Both sides read `version` from the
-    # JSON; we just defensively reject obviously-wrong values here so
-    # a typo doesn't silently flip back to v1 default.
+    # Architecture version must match between parent and standalone fitter
+    # (state_dict keys differ across v1/v2). Reject obviously-wrong values.
     cfg_version = turnrd_cfg.get("version", "v1")
     if str(cfg_version).lower() not in ("v1", "v2"):
         raise SystemExit(
@@ -482,14 +392,9 @@ def _preflight(cfg: OrchestrationConfig) -> None:
             f"ERROR: --episodes-per-round must be positive; got {cfg.episodes_per_round}."
         )
 
-    # Env-aware eval-task-id range guard. WebShop's `web_agent_text_env.py`
-    # holds a finite `goals` list (~6910 with default `num_products=1000`);
-    # `eval_task_id_base + eval_episodes` must be within that range. AlfWorld
-    # has a much smaller eval pool (~140 valid_seen + ~140 valid_unseen) but
-    # the adapter wraps task_id with `% len(games)`, so any non-negative
-    # integer is technically safe. We still warn when the requested range
-    # overlaps the per-seed training slice, since training/eval should be
-    # disjoint regardless of env.
+    # Env-aware eval-task-id range guard. WebShop's goals list is finite
+    # (~6910 at num_products=1000); AlfWorld wraps task_id % len(games).
+    # Training/eval ranges must be disjoint regardless of env.
     if cfg.env_name == "webshop":
         WEBSHOP_GOALS_LEN = 6910  # at default num_products=1000
         if cfg.eval_task_id_base + cfg.eval_episodes > WEBSHOP_GOALS_LEN:
@@ -516,14 +421,10 @@ def _preflight(cfg: OrchestrationConfig) -> None:
 
 
 def _to_container_path(local_path: Path) -> str:
-    """Translate a local config path to its mounted location inside Modal.
+    """Translate a local config path to its mounted /workspace/... path.
 
-    `infra/image.py::_add_workspace` mounts the repo root at `/workspace`
-    inside the container. The orchestrator runs on the host with absolute
-    paths under `REPO_ROOT`; passing those raw to `modal run` would land
-    `open("/Users/.../config.json")` inside a container where that path
-    doesn't exist. Translate to `/workspace/<relative-to-repo>` so the
-    container reads from the mounted source tree.
+    image.py mounts the repo root at /workspace inside the container, so host
+    absolute paths must be rewritten to be found there.
     """
     abs_path = local_path.resolve()
     try:
@@ -541,11 +442,7 @@ _APP_ID_RE = re.compile(r"ap-[A-Za-z0-9]+")
 
 
 def _parse_app_id(modal_run_stdout: str) -> str | None:
-    """Extract the ephemeral app ID from `modal run --detach` output.
-
-    Modal prints e.g. `View run at https://modal.com/apps/shoupei/main/ap-...`
-    on stdout. We grep for the first `ap-XXXXX` token.
-    """
+    """Extract the ephemeral app ID (ap-XXXX) from `modal run --detach` output."""
     m = _APP_ID_RE.search(modal_run_stdout)
     return m.group(0) if m else None
 
@@ -558,12 +455,7 @@ def _wait_for_app_finish(
 ) -> int:
     """Poll `modal app list` until `app_id` leaves the running state.
 
-    Returns 0 if the app finished cleanly, non-zero on timeout / unknown
-    state. Streams a heartbeat every `poll_interval_s` seconds so the
-    user sees progress.
-
-    Default timeout is 3 hours, sufficient for AlfWorld K=8 with 200-eps
-    eval (~70-90 min/round) and WebShop K=8 (~30-40 min/round).
+    Returns 0 on clean finish, non-zero on timeout/unknown. Default timeout 3h.
     """
     print(f"   polling {app_id} ({label})...")
     t0 = time.time()
@@ -592,9 +484,7 @@ def _wait_for_app_finish(
         state = None
         for line in res.stdout.splitlines():
             if app_id in line:
-                # Heuristic: strip ANSI/box-drawing chars and look for
-                # known states. State is one of: ephemeral, stopped,
-                # stopping..., (running labels we treat as not-done).
+                # Strip noise and look for a known lifecycle state.
                 if "stopped" in line:
                     state = "stopped"
                 elif "stopping" in line:
@@ -608,8 +498,7 @@ def _wait_for_app_finish(
             print(f"   OK {app_id} finished after {elapsed:.0f}s.")
             return 0
         if state is None:
-            # Newly-submitted apps may not appear in `app list` for a
-            # few seconds - keep waiting rather than fail.
+            # Newly-submitted apps may not appear for a few seconds; keep waiting.
             print(
                 f"   {app_id} not yet visible in app list (elapsed: {elapsed:.0f}s)..."
             )
@@ -623,25 +512,10 @@ def _wait_for_app_finish(
 def _has_app_traceback(app_id: str) -> bool:
     """Best-effort detection of an unhandled exception inside the app.
 
-    Modal marks a function as "stopped" even when its Python process raised
-    - the `_wait_for_app_finish` polling above just checks the lifecycle
-    state and can't tell crashed apart from clean exit. That's exactly the
-    bug that bit the AlfWorld SOTA 8-round run twice: R4's `save_adapter`
-    raised `RuntimeError: CUDA error: an illegal memory access`, but the
-    container exited cleanly so the orchestrator treated R4 as success and
-    cascaded into R5/R6/R7 (each loading a half-written adapter dir and
-    failing identically with `HFValidationError`).
-
-    We grep `modal app logs <app_id>` for a Python traceback. False
-    positives are unlikely - train_loop and train_turnrd don't normally
-    print "Traceback (most recent call last)" on success. False negatives
-    (a non-Python crash or a swallowed exception that still rewrites state)
-    are possible but acceptable; the per-tensor CPU fallback in
-    `save_adapter` is the primary defense.
-
-    Returns True iff a traceback or known cascade-failure signature was
-    found in the cloud-side logs. Returns False on any error fetching the
-    logs (we prefer to NOT block on log fetch issues).
+    Modal marks a crashed function as "stopped" too, so lifecycle state alone
+    can't tell a crash from a clean exit (this caused a silent R4 cascade once).
+    Greps `modal app logs` for known crash signatures. Returns False on any log
+    fetch error.
     """
     try:
         res = subprocess.run(
@@ -667,28 +541,13 @@ def _has_app_traceback(app_id: str) -> bool:
 
 
 def _train_loop_cmd(cfg: OrchestrationConfig, round_idx: int) -> list[str]:
-    """`modal run --detach infra/app_train_loop.py --config <cfg> --n-episodes M ...`
+    """Build `modal run --detach app_train_loop.py::train_loop_<env> ...`.
 
-    The `app_train_loop.py::main()` entrypoint accepts:
-      --n-episodes / --k / --max-turns / --task-id-offset / --num-products /
-      --sync-every / --run-name / --sft-adapter / --use-sft-as-ref /
-      --kl-warmup-episodes / --gpu-mem-util / --config
-
-    We rely on the JSON config to set most of these via the `--config`
-    switch; only `--n-episodes`, `--k`, `--task-id-offset`,
-    and `--run-name` are overridden round-by-round (and seed-by-seed).
-    `--k` is read from `cfg.config_path` JSON's
-    `train.K_trajectories_per_task` so the protocol K matches what the
-    user configured (the JSON-driven app no longer overrides this on
-    its own).
-
-    `--config` is translated to its in-container `/workspace/...` path
-    so `open(...)` inside the Modal function actually finds the file.
-
-    `--detach` is passed to `modal run` so the cloud function keeps
-    running even if the local orchestrator process dies. The
-    orchestrator polls for completion via `modal app list` between
-    rounds (see `_wait_for_app_finish`).
+    Most knobs come from the JSON --config; only --n-episodes, --k,
+    --task-id-offset, and --run-name are overridden per round/seed. --k is read
+    from train.K_trajectories_per_task. --config is rewritten to its in-container
+    /workspace path. --detach keeps the cloud function alive if the local
+    orchestrator dies (we poll via _wait_for_app_finish).
     """
     # Read K from the JSON; default to the app's own default (4) if
     # the key is absent.
@@ -713,38 +572,21 @@ def _train_loop_cmd(cfg: OrchestrationConfig, round_idx: int) -> list[str]:
         "--run-name", f"{cfg.effective_run_name_prefix}_round{round_idx:02d}",
         "--round-idx", str(round_idx),
     ]
-    # `gpu_mem_util` from the JSON's train block, when present. This
-    # caps vLLM's KV cache so the trainer has enough activation room
-    # for grad-tracking forward passes (OOM mitigation).
+    # gpu_mem_util from the JSON train block: caps vLLM KV cache (OOM mitigation).
     gpu_mem_util_cfg = (cfg_json.get("train", {}) or {}).get("gpu_mem_util")
     if gpu_mem_util_cfg is not None:
         cmd.extend(["--gpu-mem-util", str(float(gpu_mem_util_cfg))])
-    # `sync_every` from the JSON's train block. Default in app_train_loop
-    # is 1 (sync vLLM after every episode), which uploads weights on EVERY
-    # episode even when the optimizer didn't step (wasted cycles that
-    # consume vLLM's ~30-sync state-corruption budget per
-    # src/policy/vllm_runner.py). Setting sync_every = K_trajectories_per_task
-    # = 8 aligns syncs to actual optimizer steps and reduces in-round
-    # sync count by 8x - critical for the rank-32 MLP+attn experiment
-    # where larger per-sync payload accelerates the corruption.
+    # sync_every from the JSON train block: aligns vLLM syncs to optimizer steps
+    # (default 1 syncs every episode, wasting vLLM's sync budget).
     sync_every_cfg = (cfg_json.get("train", {}) or {}).get("sync_every")
     if sync_every_cfg is not None:
         cmd.extend(["--sync-every", str(int(sync_every_cfg))])
     # Adapter routing:
-    # - Legacy (carry_policy_across_rounds=False): every round loads the
-    #   same `cfg.sft_adapter`, resetting the policy to SFT each round.
-    # - Carry-policy mode (carry_policy_across_rounds=True): round 0
-    #   loads `cfg.sft_adapter`; rounds N>=1 load the previous round's
-    #   saved adapter so training accumulates across rounds. Each round
-    #   also writes its trained adapter to `--save-adapter-out` for the
-    #   NEXT round to consume.
-    #
-    #   Cross-run lineage opt-in: when `--sft-adapter-overrides-derived`
-    #   is set, the FIRST iterated round (`round_idx == cfg.start_round`)
-    #   loads `cfg.sft_adapter` instead of the prefix-derived path. This
-    #   covers WebShop attention v2 R7 <- v1 R7. Default off preserves the
-    #   legacy `<prefix>_round{N-1}_adapter` resume convention used by
-    #   e.g. `scripts/run_alfworld_SOTA_10round_mlpr32_v3_extend_R10R12.sh`.
+    # - Legacy: every round loads cfg.sft_adapter (resets to SFT each round).
+    # - Carry-policy: R0 loads cfg.sft_adapter; R_N>0 loads R_{N-1}'s saved
+    #   adapter and each round writes --save-adapter-out for the next round.
+    #   Cross-run opt-in (--sft-adapter-overrides-derived): the first iterated
+    #   round loads cfg.sft_adapter instead of the prefix-derived path.
     if cfg.carry_policy_across_rounds:
         cross_run_warm_start = (
             cfg.sft_adapter_overrides_derived
@@ -768,31 +610,19 @@ def _train_loop_cmd(cfg: OrchestrationConfig, round_idx: int) -> list[str]:
         cmd.extend(["--sft-adapter", cfg.sft_adapter])
     cmd.extend(["--eval-episodes", str(cfg.eval_episodes)])
     cmd.extend(["--eval-task-id-base", str(cfg.eval_task_id_base)])
-    # Forward `rollout_temperature` to the modal entrypoint. Modal's CLI
-    # auto-derives `--rollout-temperature` from the entrypoint's kwarg, so
-    # no additional plumbing is required on the modal side beyond the
-    # train_loop_{webshop,alfworld} signature exposing the kwarg.
+    # Forward rollout_temperature; Modal auto-derives --rollout-temperature
+    # from the entrypoint kwarg.
     cmd.extend(["--rollout-temperature", str(float(cfg.rollout_temperature))])
     cmd.extend(cfg.extra_train_loop_args)
     return cmd
 
 
 def _train_turnrd_cmd(cfg: OrchestrationConfig, round_idx: int = 0) -> list[str]:
-    """`modal run --detach infra/app_train_turnrd.py --replay <p> --mode N ...`
+    """Build `modal run --detach app_train_turnrd.py ...`.
 
-    Round-independent: every round reads and writes the same shared
-    paths on the Modal Volume. The replay file accumulates across
-    rounds; the ckpt is overwritten so the parent's refresh_fn always
-    loads the freshest fit.
-
-    Detached for the same reason as `_train_loop_cmd`.
-
-    Forwards aux-loss knobs (`lambda_value`, `gamma`, `lambda_entropy`)
-    + architecture knobs (`causal`, `value_head`, larger `layers`/
-    `hidden_size`) from the JSON config so the standalone trainer
-    matches what the parent's TurnRD model was built with. Without
-    these, the standalone trainer would fall back to its own defaults
-    and produce an architecturally-mismatched ckpt.
+    Round-independent: reads/writes the same shared Volume paths; replay
+    accumulates, ckpt is overwritten. Forwards aux-loss + architecture knobs
+    from the JSON so the standalone trainer matches the parent's TurnRD model.
     """
     # Read TurnRD knobs from the JSON; fall back to standalone-trainer defaults.
     try:
@@ -814,9 +644,8 @@ def _train_turnrd_cmd(cfg: OrchestrationConfig, round_idx: int = 0) -> list[str]
         "--lr", str(effective_turnrd_lr),
         "--ckpt-out", cfg.ckpt_path,
     ]
-    # Architecture: must match what the parent train_loop's
-    # build_trainer_from_config built, otherwise refresh-fn ckpt load
-    # will silently break (state_dict keys mismatch).
+    # Architecture: must match build_trainer_from_config or the refresh-fn ckpt
+    # load breaks (state_dict key mismatch).
     for cli, jkey, default in [
         ("--version", "version", None),
         ("--layers", "layers", None),
@@ -833,19 +662,13 @@ def _train_turnrd_cmd(cfg: OrchestrationConfig, round_idx: int = 0) -> list[str]
         ("--lambda-rank", "lambda_rank", None),
         ("--lambda-progress", "lambda_progress", None),
         ("--rank-margin", "rank_margin", None),
-        # Recency-decay knobs. Forwarded only when present in the JSON's
-        # turnrd block so existing configs without these keys preserve
-        # legacy behavior (decay disabled). When `recency_decay_half_life`
-        # > 0, the standalone trainer's per-batch loss-scaling path
-        # activates; rows from older rounds contribute proportionally
-        # less to each optimizer step instead of being physically dropped.
+        # Recency-decay knobs. Forwarded only when present so configs without
+        # them keep legacy behavior (decay disabled).
         ("--recency-decay-half-life", "recency_decay_half_life", None),
         ("--legacy-decay-weight", "legacy_decay_weight", None),
         ("--min-batch-weight", "min_batch_weight", None),
         # LR schedule + fresh-emphasis (plan: turnrd_v2_continual_larger).
-        # Forwarded only when present in the JSON's turnrd block so configs
-        # without these keys preserve legacy behavior (constant LR, no
-        # fresh-emphasis pass).
+        # Forwarded only when present; legacy default is constant LR.
         ("--warmup-steps", "warmup_steps", None),
         ("--lr-schedule", "lr_schedule", None),
         ("--fresh-emphasis-window-rounds", "fresh_emphasis_window_rounds", None),
@@ -853,9 +676,7 @@ def _train_turnrd_cmd(cfg: OrchestrationConfig, round_idx: int = 0) -> list[str]
     ]:
         if jkey in turnrd_block:
             cmd.extend([cli, str(turnrd_block[jkey])])
-    # Boolean flags use Click/Modal convention: `--flag` (true) /
-    # `--no-flag` (false), NOT `--flag value`. Translate the JSON's
-    # bool to the right form.
+    # Boolean flags use --flag / --no-flag (not --flag value).
     def _bool_flag(name: str, value: bool) -> list[str]:
         return [f"--{name}" if value else f"--no-{name}"]
 
@@ -868,12 +689,9 @@ def _train_turnrd_cmd(cfg: OrchestrationConfig, round_idx: int = 0) -> list[str]
             "goal-conditioned-value-head",
             bool(turnrd_block["goal_conditioned_value_head"]),
         ))
-    # Cumulative warm-start (plan: turnrd_v2_continual_larger).
-    # When `turnrd.cumulative_train` is true AND we're past round 0,
-    # pass `--ckpt-in <cfg.ckpt_path>` so the standalone trainer warm-
-    # starts from the prior round's saved ckpt instead of cold-restart
-    # from `torch.manual_seed(0)`. Default (key absent or false) is
-    # byte-for-byte legacy cold-start.
+    # Cumulative warm-start: when turnrd.cumulative_train is true and round>=1,
+    # pass --ckpt-in so the trainer warm-starts from the prior ckpt instead of
+    # cold-restarting. Default is legacy cold-start.
     if bool(turnrd_block.get("cumulative_train", False)) and int(round_idx) >= 1:
         cmd.extend(["--ckpt-in", cfg.ckpt_path])
     cmd.extend(cfg.extra_turnrd_args)
@@ -884,27 +702,12 @@ def _train_turnrd_cmd(cfg: OrchestrationConfig, round_idx: int = 0) -> list[str]
 
 
 def _run(cmd: list[str], *, dry_run: bool, label: str) -> int:
-    """Submit a `modal run --detach ...` command, parse its app ID, then
-    poll `modal app list` until that app finishes.
+    """Submit a detached `modal run`, parse its app ID, then poll until done.
 
-    Returns 0 on success, non-zero on failure.
-
-    Two-phase shape: we want each cloud function to keep running even
-    if this orchestrator process dies, so each `modal run` is detached
-    (the local CLI returns immediately after submitting). We then
-    wait on the cloud-side state via `_wait_for_app_finish`, which
-    only requires the local CLI to be alive *for polling* (not for
-    the actual compute). If the orchestrator dies mid-poll, the cloud
-    job continues; `modal app logs <app_id>` can be used to recover.
-
-    Robustness: a non-zero CLI exit DOES NOT mean the cloud function
-    failed. The Modal CLI can exit non-zero on transient
-    upload/download glitches (e.g. DNS hiccup at the very end of a
-    long run) even though the cloud function completed successfully.
-    Whenever we can parse an app ID from the CLI output, we trust the
-    CLOUD STATE (via `_wait_for_app_finish`) rather than the LOCAL
-    CLI exit code. Only a missing app ID is treated as a hard
-    submission failure.
+    Returns 0 on success, non-zero on failure. The cloud function keeps running
+    even if this orchestrator dies; we trust the cloud state over the local CLI
+    exit code (unreliable on transient glitches) whenever an app ID is
+    parseable. Only a missing app ID is a hard submission failure.
     """
     print(f"\n-- {label}")
     print(f"   $ {' '.join(cmd)}")
@@ -914,21 +717,10 @@ def _run(cmd: list[str], *, dry_run: bool, label: str) -> int:
     t0 = time.time()
     # Phase 1: submit detached. Capture stdout so we can parse the app ID.
     #
-    # NOTE: We use blocking subprocess.run rather than Popen+SIGTERM
-    # because Modal's --detach mode does NOT actually decouple the
-    # cloud function from the local CLI. The cloud functions in
-    # infra/app_train_loop.py use `.remote()` internally, which Modal
-    # warns "may be canceled when the local caller disconnects."
-    # Killing the local CLI subprocess (e.g. via SIGTERM after parsing
-    # app_id) propagates a cancel to the cloud function - the cloud
-    # app shows up as "stopped" with no work done.
-    #
-    # Proper fix would be in infra/app_*.py: use `.spawn()` + manual
-    # polling for results. That's a separate refactor.
-    #
-    # For now, accept the blocking behavior. The trade-off: if Modal
-    # heartbeat drops mid-call, subprocess.run hangs forever. The
-    # workaround is manual kill + resume from the latest saved adapter.
+    # Blocking subprocess.run (not Popen+SIGTERM): Modal's --detach does not
+    # actually decouple the cloud function from the local CLI, so killing the
+    # CLI cancels the cloud function. Trade-off: if the heartbeat drops, this
+    # hangs; recover by manual kill + resume from the latest saved adapter.
     submit = subprocess.run(
         cmd, cwd=REPO_ROOT, capture_output=True, text=True
     )
@@ -956,13 +748,9 @@ def _run(cmd: list[str], *, dry_run: bool, label: str) -> int:
     # Phase 2: poll for completion.
     rc = _wait_for_app_finish(app_id, label=label)
     elapsed = round(time.time() - t0, 2)
-    # Phase 3 (added 2026-05-20 after the AlfWorld SOTA R4 cascade):
-    # `_wait_for_app_finish` only checks the lifecycle state, so a crashed
-    # cloud function returns rc=0 just like a clean run. Inspect the cloud
-    # logs for an unhandled traceback / known-bad signature; promote to a
-    # non-zero rc so the orchestration loop aborts instead of silently
-    # marching into the next round (which then fails to load a partial
-    # adapter and cascades).
+    # Phase 3: _wait_for_app_finish only checks lifecycle state, so a crashed
+    # function looks like a clean rc=0. Promote to non-zero if logs show a
+    # traceback, to stop a silent cascade into the next round.
     if rc == 0 and _has_app_traceback(app_id):
         print(
             f"WARNING: {app_id} state=stopped but logs contain a Python traceback "

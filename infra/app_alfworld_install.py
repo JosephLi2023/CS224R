@@ -1,20 +1,8 @@
 """Modal app: download AlfWorld data into the shared Volume.
 
-Mirrors `infra/app_webshop_install.py` but for AlfWorld. AlfWorld provides a
-CLI (`alfworld-download`) that downloads the TextWorld game files +
-optional THOR/embodied scene assets to `$ALFWORLD_DATA`. We set
-`ALFWORLD_DATA=/vol/data/alfworld/` in the image so the download lands on
-the persistent Modal Volume, then `volume.commit()` so subsequent training
-containers see the populated data tree.
-
-One-shot. Cost: ~$1, ~5 min.
-
-  modal run infra/app_alfworld_install.py --action download
-
-Verify with:
-  modal volume ls cs224r-hgpo-vol /data/alfworld/json_2.1.1/train
-
-Should return >100 game directories.
+Runs `alfworld-download --extra` (TextWorld games + THOR assets, which carry the
+PDDL logic/grammar files the configs reference) with `$ALFWORLD_DATA` pointed at
+the Volume, then commits. One-shot.
 """
 from __future__ import annotations
 
@@ -28,14 +16,10 @@ app = modal.App("cs224r-hgpo-alfworld-install")
 
 @app.function(image=alfworld_image, volumes={VOLUME_MOUNT: volume}, timeout=30 * 60)
 def download_alfworld_data() -> dict:
-    """Run `alfworld-download --extra` against `$ALFWORLD_DATA` and commit
-    the result to the shared Volume.
+    """Run `alfworld-download --extra` and commit to the Volume.
 
-    `--extra` brings the THOR scene assets in addition to the base text-only
-    game files. Even though we only run the text branch (`AlfredTWEnv`), the
-    extra assets ship the PDDL logic + grammar files referenced by
-    `configs/env_alfworld.json::env_kwargs.config.logic.{domain,grammar}`,
-    so they're not optional in practice.
+    `--extra` is required: it ships the PDDL logic/grammar files the configs
+    reference, even though we only run the text env.
     """
     import os
     import subprocess
@@ -80,26 +64,12 @@ def trim_data_dir(
     keep_eval_seen: int = 50,
     keep_eval_unseen: int = 50,
 ) -> dict:
-    """Physically remove all but the first N game directories from each
-    split under `$ALFWORLD_DATA/json_2.1.1/`.
+    """Remove all but the first N game dirs per split under
+    `$ALFWORLD_DATA/json_2.1.1/`.
 
-    Why this exists: AlfWorld's `AlfredTWEnv.__init__` walks the entire
-    data tree on EVERY adapter construction (~8810 PDDL/JSON entries
-    iterated at ~2-3 it/s = ~30-60 min per env). With K=4 parallel
-    rollouts in H-GRPO, that's hours of pure setup before any episode
-    runs. The `num_train_games` config knob does NOT short-circuit the
-    walk - it only truncates the final list. The walk is bounded by
-    the physical size of the data dir.
-
-    Solution: trim the data dir once. Subsequent env constructions only
-    iterate the kept set (~300 entries x 0.5 s/entry = ~3 min/env vs
-    ~60 min/env at full size).
-
-    The deletion is destructive but easily reversed via
-    `download_alfworld_data` (re-runs `alfworld-download --extra
-    --force`).
-
-    Returns a manifest of what was kept.
+    AlfredTWEnv.__init__ walks the entire data tree on every construction
+    (~30-60 min at full size), and `num_train_games` doesn't short-circuit it;
+    trimming once cuts that to ~3 min/env. Reversible via download_alfworld_data.
     """
     import os
     import shutil
@@ -123,8 +93,7 @@ def trim_data_dir(
         task_dirs = sorted(
             entry.path for entry in os.scandir(split_dir) if entry.is_dir()
         )
-        # Each task_dir contains many trial subdirs. Flatten + sort so we
-        # keep deterministic which trials survive.
+        # Flatten + sort trial subdirs so the kept set is deterministic.
         all_trials: list[str] = []
         for tdir in task_dirs:
             for trial in sorted(
@@ -155,18 +124,12 @@ def trim_data_dir(
 
 @app.function(image=alfworld_image, volumes={VOLUME_MOUNT: volume}, timeout=10 * 60)
 def reset_smoke() -> dict:
-    """Smoke: instantiate AlfredTWEnv (train split) and call reset().
-
-    Confirms the install is usable end-to-end before we point the training
-    loop at it. Reads the same config dict shape that
-    `configs/env_alfworld.json::env_kwargs.config` carries.
-    """
+    """Smoke: instantiate AlfredTWEnv (train split) and call reset()."""
     import os
 
     os.environ.setdefault("ALFWORLD_DATA", ALFWORLD_DATA_DIR)
 
-    # Minimal config dict - mirrors the upstream example YAML enough to
-    # boot a single text-env.
+    # Minimal config dict to boot a single text-env.
     config = {
         "dataset": {
             "data_path": "$ALFWORLD_DATA/json_2.1.1/train",

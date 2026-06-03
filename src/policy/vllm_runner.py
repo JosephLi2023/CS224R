@@ -24,16 +24,13 @@ class VLLMRunnerConfig:
     seed: int = 0
     enforce_eager: bool = False
     download_dir: str | None = None  # HF download cache; align with LoRAPolicy.cache_dir
-    # Disable CPU/GPU KV-block swapping. This avoids swap-path instability in
-    # vLLM 0.6.3.post1 during repeated weight synchronization and is safe for
-    # our rollout sizes (K <= 8, max generated tokens <= 48).
+    # Disable KV-block swapping (avoids swap-path instability in vLLM
+    # 0.6.3.post1; safe for K <= 8, max generated tokens <= 48).
     swap_space_gib: int = 0
-    # Cap scheduler concurrency to match the rollout group size and keep KV
-    # cache pressure stable across repeated weight-sync cycles.
+    # Cap scheduler concurrency to the rollout group size.
     max_num_seqs: int = 8
-    # Optional hard override for vLLM's KV-cache block count. When set,
-    # vLLM skips memory profiling and uses this value directly, avoiding
-    # allocator-profile failures after repeated train/eval handoffs.
+    # Hard override for vLLM's KV-cache block count; skips memory profiling
+    # to avoid allocator-profile failures after train/eval handoffs.
     num_gpu_blocks_override: int | None = None
 
 
@@ -44,12 +41,10 @@ class SamplingParams:
     top_p: float = 0.95
     max_tokens: int = 256
     stop: list[str] = field(default_factory=list)
-    # When True, generate_rich() pulls per-token logprobs back from vLLM. Costs
-    # a small amount of extra CPU but is required by the GRPO trainer's
+    # Pull per-token logprobs back from vLLM; required by the GRPO trainer's
     # importance-weight calculation.
     return_logprobs: bool = True
-    # If None, vLLM uses fresh randomness on every call (preferred for
-    # diverse K-trajectory rollouts). Set to an int for deterministic tests.
+    # None -> fresh randomness each call; set an int for deterministic tests.
     seed: int | None = None
 
 
@@ -161,11 +156,8 @@ class VLLMRunner:
     def shutdown(self) -> None:
         """Cleanly tear down vLLM to free GPU memory.
 
-        Used by the train_loop orchestrator between train and eval phases:
-        a fresh vLLM instance for eval avoids the state-corruption bugs
-        that accumulate after many `sync_weights` cycles during training
-        (CUDA illegal memory access in `prepare_model_input`, AssertionError
-        in scheduler, etc.).
+        A fresh instance for eval avoids state-corruption bugs that accumulate
+        after many sync_weights cycles.
         """
         import gc
         try:
@@ -193,8 +185,7 @@ class VLLMRunner:
         policies can use `iter_merged_weights()` without materializing the
         full merged state-dict in memory (fixes sync_weights OOM at scale).
         """
-        # Force a synchronize so deferred (async-reported) CUDA errors are
-        # raised here with the sync_weights stack rather than buried inside
+        # Synchronize so deferred CUDA errors surface here, not inside
         # vLLM's load_weights copy.
         import torch  # type: ignore[import-not-found]
         try:

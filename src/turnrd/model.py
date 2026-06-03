@@ -1,19 +1,8 @@
 """TurnRD model - learned per-turn reward decomposer (Method B).
 
-Architecture:
-- `input_proj`: linear `[input_dim -> hidden_size]`.
-- `pos_embed`: positional embedding for turn index `0..max_turns-1`.
-- `encoder`: stacked self-attention over the turn sequence. No [CLS] token;
-  the [CLS] role is done by a separate cross-attention pool.
-- `cls_pool`: a single cross-attention layer where a learned `cls_query`
-  attends over the encoder outputs. Its softmax weights ARE the `alpha_t`
-  (non-negative, sum-to-1 along T, mask-respecting). nn.TransformerEncoder
-  does not surface per-layer attention, hence the separate pool.
-- `r_head`: linear `[hidden_size -> 1]` from the pooled [CLS] vector to
-  `predicted_R`.
-
-Per-turn rewards are `r_hat_t = alpha_t * R` via `TurnRDOutput.decompose(R)`.
-Since `sum_t alpha_t = 1` (masked softmax), `sum_t r_hat_t = R` holds exactly.
+A small Transformer encodes per-turn embeddings; a [CLS] cross-attention pool
+produces softmax weights `alpha_t` and a predicted reward. Per-turn rewards are
+`r_hat_t = alpha_t * R` (via `decompose`), so `sum_t r_hat_t = R`.
 """
 from __future__ import annotations
 
@@ -27,13 +16,8 @@ import torch.nn.functional as F
 
 @dataclass(frozen=True)
 class TurnRDConfig:
-    """Hyperparameters for the TurnRD model.
-
-    Defaults size a small Transformer trainable alongside the LoRA policy on
-    one A100.
-    - `value_head=True`: adds an auxiliary `V(h_t) -> scalar` head trained
-      against the discounted future return `gamma^(T-t-1)*R` per turn, giving
-      credit-relevant supervision from sparse R alone.
+    """Hyperparameters for the TurnRD model. `value_head=True` adds an auxiliary
+    per-turn `V(h_t)` head trained against `gamma^(T-t-1)*R`.
     """
 
     n_layers: int = 4
@@ -49,16 +33,11 @@ class TurnRDConfig:
 class TurnRDOutput:
     """Forward-pass outputs of `TurnRD.forward`.
 
-    `predicted_R: [B]`         - scalar R from the pooled [CLS] vector.
-    `cls_attn_weights: [B, T]` - softmax weights, sum to 1 along T per row,
-                                 padded positions == 0.
-    `predicted_per_turn_R`     - `[B, T]` per-turn V-head predictions; `None`
-                                 when `cfg.value_head=False`. Trained against
-                                 `gamma^(T-t-1)*R` per turn.
-    `encoder_hidden`           - `[B, T, H]` per-turn encoder outputs, for the
-                                 contrastive aux loss. Always populated.
-    `per_turn_rewards`         - None at construction; populated by callers via
-                                 `decompose(R)`.
+    - `predicted_R: [B]` scalar reward.
+    - `cls_attn_weights: [B, T]` softmax weights (sum to 1 along T; pad == 0).
+    - `predicted_per_turn_R: [B, T]` V-head predictions, or `None`.
+    - `encoder_hidden: [B, T, H]` per-turn encoder outputs (for contrastive loss).
+    - `per_turn_rewards`: `None` until set by `decompose(R)`.
     """
 
     predicted_R: torch.Tensor
@@ -68,11 +47,8 @@ class TurnRDOutput:
     per_turn_rewards: Optional[torch.Tensor] = None
 
     def decompose(self, final_reward: torch.Tensor) -> torch.Tensor:
-        """Return `[B, T]` per-turn rewards `r_hat_t = alpha_t * R`, masked.
-
-        `final_reward: [B]`. Returns a fresh tensor (no aliasing of
-        `cls_attn_weights`). `sum_t r_hat_t = R` holds since `sum_t alpha_t = 1`
-        and padded positions are zeroed.
+        """Return `[B, T]` masked per-turn rewards `r_hat_t = alpha_t * R`
+        (`final_reward: [B]`). Fresh tensor; `sum_t r_hat_t = R`.
         """
         if final_reward.dim() != 1:
             raise ValueError(
@@ -92,15 +68,8 @@ class TurnRDOutput:
 class TurnRD(nn.Module):
     """Small Transformer + [CLS] cross-attention head over per-turn embeddings.
 
-    `forward(turn_embeds: [B, T, input_dim], attention_mask: [B, T])
-        -> TurnRDOutput`.
-
-    Two training modes (see `loss_mode_1`, `loss_mode_2` below):
-    - Mode 1: regress `predicted_R` against ground-truth final reward `R`
-      (MSE). Trains the encoder + r_head end-to-end via the [CLS] pool.
-    - Mode 2: supervise `decompose(R)` against externally-supplied per-turn
-      labels (e.g. cached judge scores from a prior Method A run). Trains
-      the [CLS] attention to match a teacher's decomposition.
+    Mode 1 regresses `predicted_R` against `R`; Mode 2 supervises `decompose(R)`
+    against external per-turn labels (see `loss_mode_1`, `loss_mode_2`).
     """
 
     def __init__(self, cfg: TurnRDConfig, input_dim: int) -> None:
@@ -131,9 +100,7 @@ class TurnRD(nn.Module):
         self.cls_query = nn.Parameter(torch.zeros(1, 1, cfg.hidden_size))
         nn.init.normal_(self.cls_query, mean=0.0, std=0.02)
 
-        # Single cross-attention layer: cls_query attends over encoded turns.
-        # The returned attention weights ARE alpha_t (softmax-normalized,
-        # mask-respecting via key_padding_mask).
+        # cls_query attends over encoded turns; the returned weights ARE alpha_t.
         self.cls_pool = nn.MultiheadAttention(
             embed_dim=cfg.hidden_size,
             num_heads=cfg.n_heads,
@@ -143,8 +110,7 @@ class TurnRD(nn.Module):
 
         self.r_head = nn.Linear(cfg.hidden_size, 1)
 
-        # Auxiliary per-turn value head. Trained against gamma^(T-t-1)*R per
-        # turn - a credit-relevant signal under sparse R alone.
+        # Auxiliary per-turn value head; trained against gamma^(T-t-1)*R.
         if cfg.value_head:
             self.value_head = nn.Linear(cfg.hidden_size, 1)
         else:
@@ -182,8 +148,7 @@ class TurnRD(nn.Module):
                 f"forward: T={T} exceeds cfg.max_turns={self.cfg.max_turns}; "
                 "either truncate the trajectory or rebuild the model with a larger max_turns."
             )
-        # Reject fully-padded rows: an all-True src_key_padding_mask row makes
-        # the encoder softmax produce NaN. Fail loudly rather than emit NaN.
+        # Reject fully-padded rows: they make the encoder softmax produce NaN.
         if not bool((attention_mask.sum(dim=-1) > 0).all().item()):
             raise ValueError(
                 "forward: every row of attention_mask must have at least one real "
@@ -191,15 +156,12 @@ class TurnRD(nn.Module):
                 "softmax. Drop empty trajectories before batching."
             )
 
-        # 1. Project to internal hidden_size.
         h = self.input_proj(turn_embeds)  # [B, T, H]
 
-        # 2. Add positional embedding for turn indices 0..T-1.
         positions = torch.arange(T, device=h.device, dtype=torch.long)
         h = h + self.pos_embed(positions).unsqueeze(0)  # [B, T, H]
 
-        # 3. PyTorch convention: True == masked out. attention_mask is 1 for
-        #    real turns, so invert. Build both masks as boolean (True = block).
+        # PyTorch convention: True == masked out, so invert attention_mask.
         key_padding_mask = ~attention_mask.bool()  # [B, T] bool
         causal_attn_mask: torch.Tensor | None = None
         if self.cfg.causal:
@@ -209,20 +171,15 @@ class TurnRD(nn.Module):
                 diagonal=1,
             )
 
-        # 4. Self-attention over turns. Padded positions are masked out.
         h = self.encoder(
             h,
             mask=causal_attn_mask,
             src_key_padding_mask=key_padding_mask,
         )  # [B, T, H]
 
-        # 5. Build the [CLS] query: replicate the learned scalar query per row.
         cls_q = self.cls_query.expand(B, -1, -1)  # [B, 1, H]
 
-        # 6. Single cross-attention pool. Returns:
-        #    - pooled: [B, 1, H]
-        #    - attn:   [B, 1, T]   (averaged over heads via average_attn_weights=True)
-        #    The softmax attention weights ARE alpha_t.
+        # Cross-attention pool; the returned attn weights ARE alpha_t.
         pooled, attn = self.cls_pool(
             cls_q,
             h,
@@ -232,11 +189,10 @@ class TurnRD(nn.Module):
             average_attn_weights=True,
         )
 
-        # 7. Squeeze the cls-query dim.
         cls_attn_weights = attn.squeeze(1)  # [B, T]
 
-        # 7a. Re-mask defensively: MHA can leak float noise into masked
-        #     positions. Zero them and re-normalize so sum_t alpha_t == 1.
+        # Re-mask defensively (MHA can leak noise into masked positions) and
+        # re-normalize so sum_t alpha_t == 1.
         float_mask = attention_mask.to(dtype=cls_attn_weights.dtype)
         cls_attn_weights = cls_attn_weights * float_mask
         # Clamp row sum to avoid NaN on degenerate all-masked rows.
@@ -248,7 +204,7 @@ class TurnRD(nn.Module):
         # 8. Predicted final reward from the pooled [CLS] vector.
         predicted_R = self.r_head(pooled.squeeze(1)).squeeze(-1)  # [B]
 
-        # 9. Optional per-turn V(h_t) predictions. Padded positions zeroed.
+        # Optional per-turn V(h_t) predictions (padded positions zeroed).
         predicted_per_turn_R: Optional[torch.Tensor] = None
         if self.value_head is not None:
             v = self.value_head(h).squeeze(-1)  # [B, T]
@@ -267,10 +223,7 @@ class TurnRD(nn.Module):
 
 
 def loss_mode_1(out: TurnRDOutput, target_R: torch.Tensor) -> torch.Tensor:
-    """Mode 1 (regress final reward): MSE between `predicted_R` and ground-truth `R`.
-
-    `target_R: [B]`. Returns a scalar tensor.
-    """
+    """Mode 1: MSE between `predicted_R` and ground-truth `R` (`target_R: [B]`)."""
     return F.mse_loss(out.predicted_R, target_R.to(dtype=out.predicted_R.dtype))
 
 
@@ -280,11 +233,8 @@ def loss_mode_2(
     R: torch.Tensor,
     attention_mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Mode 2 (supervise decomposition): MSE between `alpha*R` and an external
-    per-turn target (e.g. judge labels from a prior Method A cache).
-
-    `target_per_turn: [B, T]`, `R: [B]`, `attention_mask: [B, T]`.
-    Loss is averaged over real (unmasked) entries only.
+    """Mode 2: MSE between `alpha*R` and an external per-turn target, averaged
+    over real turns. `target_per_turn: [B, T]`, `R: [B]`, `attention_mask: [B, T]`.
     """
     pred = out.decompose(R)  # [B, T]
     float_mask = attention_mask.to(dtype=pred.dtype)
@@ -301,12 +251,8 @@ def loss_value_head(
     *,
     gamma: float = 0.95,
 ) -> torch.Tensor:
-    """Auxiliary per-turn value loss.
-
-    Trains `V(h_t)` to predict the discounted future return `gamma^(T-t-1)*R`
-    per real (unmasked) turn. `out` must have `predicted_per_turn_R` populated
-    (`cfg.value_head=True`); `R: [B]`, `attention_mask: [B, T]`. Returns a
-    scalar MSE over real turns, or `0` when built without `value_head`.
+    """Auxiliary per-turn value loss: MSE of `V(h_t)` against `gamma^(T-t-1)*R`
+    over real turns. Returns `0` when the model has no `value_head`.
     """
     if out.predicted_per_turn_R is None:
         # value_head=False: return 0 so callers can multiply by a coefficient.
@@ -314,9 +260,8 @@ def loss_value_head(
     pred_v = out.predicted_per_turn_R  # [B, T]
     float_mask = attention_mask.to(dtype=pred_v.dtype)  # [B, T]
     B, T = pred_v.shape
-    # Discount uses per-row trajectory length T_i, not batch-global T_max, so
-    # short trajectories get gamma^0*R = R at their real final turn. Padded
-    # positions are masked out after target construction.
+    # Discount uses per-row length T_i (not batch T_max), so a row's final real
+    # turn gets gamma^0*R = R.
     t_idx = torch.arange(T, device=pred_v.device, dtype=pred_v.dtype)  # [T]
     T_i = float_mask.sum(dim=-1, keepdim=True)  # [B, 1] real turn count per row
     # exponent[b, t] = max(0, T_i[b] - 1 - t); clamp guards padded positions.
@@ -329,12 +274,8 @@ def loss_value_head(
 
 
 def alpha_entropy(out: TurnRDOutput, attention_mask: torch.Tensor) -> torch.Tensor:
-    """Average entropy of alpha across the batch.
-
-    Returns `Hbar = mean_b (-sum_t alpha_{b,t} * log alpha_{b,t})` over real
-    positions only. Lower entropy = alpha concentrating credit on fewer turns.
-    Also used as the negative-entropy regularization target (subtract
-    beta*entropy from the trainer loss to discourage uniform alpha).
+    """Mean entropy of alpha over real positions. Lower entropy = credit on
+    fewer turns; also used as a negative-entropy regularizer.
     """
     alpha = out.cls_attn_weights  # [B, T]
     float_mask = attention_mask.to(dtype=alpha.dtype)
@@ -344,58 +285,35 @@ def alpha_entropy(out: TurnRDOutput, attention_mask: torch.Tensor) -> torch.Tens
     return H.mean()
 
 
-# TurnRDv2 - simplified credit-assignment decomposer.
-#
-# Differences from v1:
-#   1. Bidirectional self-attention (credit is retrospective: turn t's value
-#      depends on what happens after t).
-#   2. Predicts `R_hat = sum_t alpha_t * v_t` directly (no CLS-pool
-#      bottleneck), so dloss/dalpha_t is identifiable.
-#   3. Pluggable V-target slot (callers can feed counterfactual targets).
-#   4. Score head inits to a Method-C "progress" prior (linear in t/T) so the
-#      untrained alpha is sensible rather than uniform.
-#
-# Architecture:
-#   input_proj : Linear(D -> H)
-#   pos_embed  : Embedding(max_turns, H)
-#   encoder    : 2-layer bidirectional TransformerEncoder
-#   score_head : MLP(H -> 1)   # per-turn alpha-score; alpha = softmax(scores)
-#   value_head : MLP(H -> 1)   # per-turn v_t; R_hat = sum alpha*v
-# Same `TurnRDOutput` shape, so `TurnRDDecomposer` is unchanged.
+# TurnRDv2 - simplified credit-assignment decomposer. Bidirectional encoder
+# with per-turn score + value heads (no CLS bottleneck), so
+# `predicted_R = sum_t alpha_t * v_t` is identifiable for alpha. The score head
+# inits to a progress prior (alpha linear in t/T) rather than uniform. Same
+# `TurnRDOutput` shape as v1, so `TurnRDDecomposer` is unchanged.
 
 
 @dataclass(frozen=True)
 class TurnRDv2Config:
-    """Hyperparameters for `TurnRDv2`. Smaller defaults than v1: the direct
-    score/value heads need no wide hidden_size, and the bidirectional encoder
-    is sample-efficient at short sequence lengths (T <= 10).
-    """
+    """Hyperparameters for `TurnRDv2` (smaller defaults than v1)."""
 
     n_layers: int = 2
     hidden_size: int = 128
     n_heads: int = 4
     max_turns: int = 64
     dropout: float = 0.1
-    # Non-causal attention is the default because TurnRD analyzes completed trajectories.
+    # Non-causal by default: TurnRD analyzes completed trajectories.
     causal: bool = False
-    # Strength of the progress-prior initialization bias on the score head.
-    # A value of 0 disables the prior.
+    # Progress-prior init bias strength on the score head; 0 disables.
     progress_prior_strength: float = 1.0
-    # Optional FiLM goal conditioning. When enabled, `forward(...)` takes a
-    # per-trajectory goal embedding to modulate encoder states before the
-    # score/value heads. FiLM layers are zero-initialized so the conditioned
-    # path starts identical to the unconditioned one.
+    # Optional FiLM goal conditioning: modulate encoder states by a goal
+    # embedding before the heads. Zero-init so it starts as a no-op.
     goal_conditioned_value_head: bool = False
 
 
 class TurnRDv2(nn.Module):
     """v2: bidirectional encoder + per-turn score head, no CLS bottleneck.
-
-    Forward signature matches v1 so `TurnRDDecomposer` is unchanged. Two
-    semantic differences:
-      * `predicted_R` is `sum_t alpha_t * v_t` (identifiable for alpha).
-      * `predicted_per_turn_R` is `v_t` directly (always populated), the slot
-        for counterfactual supervision.
+    `predicted_R = sum_t alpha_t * v_t` (identifiable for alpha) and
+    `predicted_per_turn_R = v_t`. Forward signature matches v1.
     """
 
     def __init__(self, cfg: TurnRDv2Config, input_dim: int) -> None:
@@ -421,40 +339,36 @@ class TurnRDv2(nn.Module):
             enable_nested_tensor=False,
         )
 
-        # Per-turn alpha-score head: MLP(H -> 1), two-layer with GELU.
+        # Per-turn alpha-score head.
         self.score_head = nn.Sequential(
             nn.Linear(cfg.hidden_size, cfg.hidden_size),
             nn.GELU(),
             nn.Linear(cfg.hidden_size, 1),
         )
 
-        # Per-turn value head: MLP(H -> 1). Kept separate from score_head so
-        # alpha and v don't share a final layer (avoids v1's coupling).
+        # Per-turn value head, kept separate from score_head so alpha and v
+        # don't share a final layer.
         self.value_head = nn.Sequential(
             nn.Linear(cfg.hidden_size, cfg.hidden_size),
             nn.GELU(),
             nn.Linear(cfg.hidden_size, 1),
         )
 
-        # Progress prior: bias scores by ~t/T at init so the untrained alpha is
-        # Method-C-like (linear in t/T after softmax) rather than uniform.
+        # Progress prior: bias scores by ~t/T so untrained alpha is linear in
+        # t/T rather than uniform.
         if cfg.progress_prior_strength != 0.0:
             with torch.no_grad():
-                # Prior is injected as a per-turn additive bias on scores
-                # (see `_progress_prior_bias`), not on the head itself.
+                # Injected as an additive score bias (see `_progress_prior_bias`).
                 self._has_progress_bias = True
         else:
             self._has_progress_bias = False
         # The per-turn bias is computed on the fly at forward time, not stored.
 
-        # Optional FiLM goal conditioning. The FiLM layers exist only when
-        # enabled, and zero initialization makes the conditioned path start
-        # as the unconditioned model.
+        # FiLM goal-conditioning layers (zero-init -> identity at start).
         if cfg.goal_conditioned_value_head:
             self.goal_proj = nn.Linear(input_dim, cfg.hidden_size)
             self.goal_gamma = nn.Linear(cfg.hidden_size, cfg.hidden_size)
             self.goal_beta = nn.Linear(cfg.hidden_size, cfg.hidden_size)
-            # Zero initialization makes the initial FiLM modulation an identity.
             with torch.no_grad():
                 nn.init.zeros_(self.goal_gamma.weight)
                 nn.init.zeros_(self.goal_gamma.bias)
@@ -471,8 +385,8 @@ class TurnRDv2(nn.Module):
         if not self._has_progress_bias:
             return torch.zeros(T, device=device, dtype=dtype)
         positions = torch.arange(T, device=device, dtype=dtype)
-        # Normalize by actual sequence length (not max_turns) so the bias
-        # spans [0, prior_strength] for short trajectories.
+        # Normalize by actual length (not max_turns) so the bias spans
+        # [0, prior_strength].
         denom = max(1.0, float(T - 1))
         return (positions / denom) * float(self.cfg.progress_prior_strength)
 
@@ -512,14 +426,12 @@ class TurnRDv2(nn.Module):
                 "TurnRDv2.forward: every row must have at least one real (unmasked) turn."
             )
 
-        # 1. Project to internal hidden_size.
         h = self.input_proj(turn_embeds)  # [B, T, H]
 
-        # 2. Add positional embedding.
         positions = torch.arange(T, device=h.device, dtype=torch.long)
         h = h + self.pos_embed(positions).unsqueeze(0)  # [B, T, H]
 
-        # 3. Bidirectional self-attention (or causal if explicitly enabled).
+        # Bidirectional self-attention (causal if enabled).
         key_padding_mask = ~attention_mask.bool()  # True == block
         causal_attn_mask: torch.Tensor | None = None
         if self.cfg.causal:
@@ -535,8 +447,7 @@ class TurnRDv2(nn.Module):
         )  # [B, T, H]
 
         # 4. Per-turn scores -> alpha via masked softmax.
-        # Apply FiLM before the score head so alpha can depend on both the
-        # turn representation and the goal.
+        # FiLM before the score head so alpha depends on (turn, goal).
         if (
             self.cfg.goal_conditioned_value_head
             and goal_emb is not None
@@ -570,10 +481,9 @@ class TurnRDv2(nn.Module):
             h_cond = h
 
         scores = self.score_head(h_cond).squeeze(-1)  # [B, T]
-        # Add the progress-prior bias - broadcasts across batch.
+        # Add the progress-prior bias.
         scores = scores + self._progress_prior_bias(T, scores.device, scores.dtype).unsqueeze(0)
-        # Mask before softmax: set padded positions to a large negative value
-        # (not -inf, for bf16/fp16 safety) so they get ~0 mass.
+        # Mask before softmax: padded positions -> large negative (bf16-safe).
         neg_large = torch.tensor(-1e9, dtype=scores.dtype, device=scores.device)
         scores = torch.where(attention_mask.bool(), scores, neg_large)
         alpha = torch.softmax(scores, dim=-1)  # [B, T], sums to 1 along T
@@ -581,17 +491,16 @@ class TurnRDv2(nn.Module):
         # Defensive: zero padded positions explicitly (softmax gives ~0, not 0).
         float_mask = attention_mask.to(dtype=alpha.dtype)
         alpha = alpha * float_mask
-        # Re-normalize (numerical safety; shouldn't shift values noticeably).
+        # Re-normalize (numerical safety).
         row_sum = alpha.sum(dim=-1, keepdim=True).clamp_min(1e-12)
         alpha = alpha / row_sum
         alpha = alpha * float_mask  # re-zero in case the divide drifted
 
-        # 5. Per-turn value v_t. Reuses h_cond so alpha and v_t share the FiLM
-        #    modulation; h_cond == h when goal conditioning is off.
+        # Per-turn value v_t (reuses h_cond; h_cond == h when goal cond. off).
         v = self.value_head(h_cond).squeeze(-1)  # [B, T]
         v = v * float_mask
 
-        # 6. R_hat = sum_t alpha_t * v_t. Identifiable: dL/dalpha_t = 2(R_hat-R)*v_t.
+        # R_hat = sum_t alpha_t * v_t (identifiable for alpha).
         predicted_R = (alpha * v).sum(dim=-1)  # [B]
 
         return TurnRDOutput(
@@ -607,11 +516,8 @@ class TurnRDv2(nn.Module):
 
 
 def loss_v2_pred(out: TurnRDOutput, target_R: torch.Tensor) -> torch.Tensor:
-    """v2 R-prediction loss: MSE(sum alpha*v, R).
-
-    The gradient flows directly into alpha (no `r_head` to absorb scale), so
-    alpha upweights turns whose v_t is informative about R. Primary
-    credit-assignment signal for v2.
+    """v2 R-prediction loss: MSE(sum alpha*v, R). Gradient flows directly into
+    alpha (no `r_head` to absorb scale).
     """
     return F.mse_loss(out.predicted_R, target_R.to(dtype=out.predicted_R.dtype))
 
@@ -621,10 +527,8 @@ def loss_v2_value(
     target_per_turn: torch.Tensor,
     attention_mask: torch.Tensor,
 ) -> torch.Tensor:
-    """v2 per-turn value loss: MSE(v_t, target_t) over real turns.
-
-    `target_per_turn` is pluggable (e.g. counterfactual per-turn deltas, or an
-    R/T uniform fallback). Skip with a coefficient of 0.
+    """v2 per-turn value loss: MSE(v_t, target_t) over real turns
+    (`target_per_turn` is pluggable).
     """
     if out.predicted_per_turn_R is None:
         # v2 always populates this; return 0 (not raise) if a v1 output is passed.
@@ -642,11 +546,8 @@ def loss_v2_rank(
     *,
     margin: float = 0.1,
 ) -> torch.Tensor:
-    """Within-batch pairwise hinge: rank R_hat of high-R rows above low-R.
-
-    For pairs (i, j) with R_i > R_j, push `R_hat_i >= R_hat_j + margin`. A
-    relative-ordering complement to `loss_v2_pred`, robust to R-scale drift.
-    Returns 0 when the batch has no contrastive pair.
+    """Within-batch pairwise hinge: for pairs R_i > R_j, push
+    `R_hat_i >= R_hat_j + margin`. Returns 0 when no pair exists.
     """
     R_pred = out.predicted_R  # [B]
     R_true = R.to(dtype=R_pred.dtype, device=R_pred.device)  # [B]
@@ -657,7 +558,7 @@ def loss_v2_rank(
     # diff[i, j] = R_true[i] - R_true[j]
     diff_true = R_true.unsqueeze(1) - R_true.unsqueeze(0)  # [B, B]
     diff_pred = R_pred.unsqueeze(1) - R_pred.unsqueeze(0)  # [B, B]
-    # Pair (i, j) is positive iff R_true[i] > R_true[j] (by margin).
+    # Positive pair iff R_true[i] > R_true[j].
     pos_mask = (diff_true > 1e-6).to(dtype=R_pred.dtype)  # [B, B]
     n_pairs = pos_mask.sum().clamp_min(1.0)
     # Hinge: max(0, margin - (R_hat_i - R_hat_j)) when the pair is positive.
@@ -669,10 +570,8 @@ def loss_v2_progress_prior(
     out: TurnRDOutput,
     attention_mask: torch.Tensor,
 ) -> torch.Tensor:
-    """KL(alpha || softmax(t/T)) - a soft pull toward the Method-C prior.
-
-    Keeps alpha anchored near the progress prior (beta ~= 0.01) unless the
-    data demands otherwise. Returns 0 on degenerate (T=0) rows.
+    """KL(alpha || softmax(t/T)): a soft pull toward the progress prior.
+    Returns 0 on degenerate (T=0) rows.
     """
     alpha = out.cls_attn_weights  # [B, T]
     float_mask = attention_mask.to(dtype=alpha.dtype)  # [B, T]
@@ -687,7 +586,7 @@ def loss_v2_progress_prior(
     raw_masked = torch.where(attention_mask.bool(), raw, neg_large)
     prior = torch.softmax(raw_masked, dim=-1) * float_mask
     prior = prior / prior.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-    # KL(alpha || prior) summed over real positions, averaged over batch.
+    # KL summed over real positions, averaged over batch.
     eps = 1e-12
     kl_per_pos = alpha * (torch.log(alpha.clamp_min(eps)) - torch.log(prior.clamp_min(eps)))
     kl_per_pos = kl_per_pos * float_mask
@@ -702,14 +601,10 @@ def loss_contrastive(
     temperature: float = 0.1,
     success_threshold: float = 0.0,
 ) -> torch.Tensor:
-    """InfoNCE-style contrastive loss on per-turn encoder hidden states.
-
-    Pulls together turn embeddings from successful trajectories
-    (R > `success_threshold`) and pushes them apart from unsuccessful ones,
-    so the encoder learns outcome-discriminative features for alpha to attend
-    over. `out.encoder_hidden` must be `[B, T, H]`; `R: [B]`;
-    `attention_mask: [B, T]`. `temperature` (default 0.1) scales the InfoNCE
-    log-likelihood. Returns 0 when no valid success/failure pair exists.
+    """InfoNCE-style contrastive loss on per-turn encoder hidden states: pulls
+    success-trajectory turns together and pushes failures apart, so the encoder
+    learns outcome-discriminative features. Returns 0 when no success/failure
+    pair exists.
     """
     if out.encoder_hidden is None:
         return torch.zeros((), dtype=R.dtype, device=R.device)
@@ -727,7 +622,7 @@ def loss_contrastive(
     # Flatten (B, T) -> (B*T) and filter unmasked turns only.
     H_flat = H_state.reshape(B * T, -1)  # [B*T, H]
     mask_flat = float_mask.reshape(B * T)  # [B*T]
-    # Per-turn success label (broadcast trajectory R to all its turns).
+    # Per-turn success label (broadcast from trajectory R).
     succ_flat = (
         is_success.unsqueeze(-1).expand(-1, T).reshape(B * T)
     )  # [B*T] bool
@@ -751,27 +646,24 @@ def loss_contrastive(
 
     # Pairwise similarity matrix [N, N], temperature-scaled.
     sim = H_norm @ H_norm.T / float(temperature)  # [N, N]
-    # Mask out self-similarities (diagonal) so an anchor can't be its own positive.
+    # Mask the diagonal so an anchor isn't its own positive.
     eye = torch.eye(sim.shape[0], dtype=torch.bool, device=sim.device)
     sim = sim.masked_fill(eye, float("-inf"))
 
-    # For each success-anchor i:
-    #   numerator   = sum over success j != i of exp(sim[i, j])
-    #   denominator = sum over ALL j != i of exp(sim[i, j])
-    #   L_i = -log(numerator / denominator)
-    # Use logsumexp for numerical stability.
+    # Per success-anchor: L_i = -log(sum_{success j!=i} exp(sim) / sum_{all j!=i} exp(sim)),
+    # via logsumexp for stability.
     succ_idx = succ_keep.nonzero(as_tuple=True)[0]  # indices of successes
     sim_anchors = sim[succ_idx]  # [n_succ, N]
 
-    # Numerator mask: only success-success pairs (exclude self via the eye mask above).
+    # Numerator: success-success pairs only.
     succ_row_mask = succ_keep.unsqueeze(0).expand(n_succ, -1)  # [n_succ, N]
-    # Set non-positive entries to -inf for the numerator's logsumexp.
+    # -inf on non-positive entries for the numerator logsumexp.
     sim_pos = sim_anchors.masked_fill(~succ_row_mask, float("-inf"))
 
     log_num = torch.logsumexp(sim_pos, dim=-1)  # [n_succ]
     log_den = torch.logsumexp(sim_anchors, dim=-1)  # [n_succ]
     loss_per_anchor = -(log_num - log_den)
-    # Filter out anchors whose log_num was -inf (no positives left after self-mask).
+    # Drop anchors with no positives left (log_num == -inf).
     valid = ~torch.isinf(log_num)
     if int(valid.sum().item()) == 0:
         return torch.zeros((), dtype=R.dtype, device=R.device)

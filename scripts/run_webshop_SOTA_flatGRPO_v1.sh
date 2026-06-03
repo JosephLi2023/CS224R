@@ -1,38 +1,15 @@
 #!/usr/bin/env bash
 # WebShop SOTA - Flat GRPO v1.
-#
-# Recipe-transplant from AlfWorld SOTA (rank-32 + MLP target modules,
-# K=8, kl=0.04, lr=5e-6, T=1.0) PLUS the WebShop-specific attribute-progress
-# dense signal (env.use_attribute_progress_intermediate_reward=true).
+# Recipe-transplant from AlfWorld SOTA + WebShop attribute-progress dense signal.
 # alpha=1.0 (turn-level signal off), decomposer=progress (inert at alpha=1.0).
-# See plan /Users/shoupeili/.llms/plans/webshop_sota_recipe_transplant_dense_signal.plan.md.
-#
-# Even though Flat GRPO doesn't use the turn-level decomposition, the dense
-# signal feeds the per-turn raw_env_reward field, which the trajectory-level
-# advantage still benefits from (non-zero progress on intermediate turns gives
-# a sharper gradient than the all-zeros-then-terminal-spike Phase 0 signal).
-#
-# Geometry (seed=23, rounds=10, eps=80):
-#   base_task_id_offset = 23 * 10 * 80 = 18400
-#   train task range    = [18400, 19200)
-#   eval task range     = [6500, 6600)   (disjoint)
-#   disjoint from attention v1 (seed=11) and LLMJudge v1 (seed=31)
-#
-# ~2.5-3 hours wall-clock. K=8 + 100-eps eval, 10 rounds * 80 eps. Slightly
-# faster than the attention variant since there's no TurnRD step per round.
+# The dense signal still sharpens the trajectory-level gradient. seed=23, rounds=10, eps=80.
+# Override via env vars: SFT_ADAPTER, CONFIG, RUN_PREFIX, ROUNDS, etc.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-# Warm-start adapter at R0. Default points at the WebShop SFT v3
-# rank-32 + 7-MLP-target adapter produced by
-# `scripts/run_webshop_sft_v3_mlpr32.sh` (see
-# ~/.llms/plans/webshop_sft_mlpr32_oracle_baseline.plan.md).
-#
-# PLACEHOLDER - replace `REPLACE_WITH_TS_FROM_PHASE4` with the
-# timestamp suffix of the actual adapter dir produced by Phase 4,
-# or override at invocation time:
-#   SFT_ADAPTER=/vol/checkpoints/sft_webshop_v3_mlpr32_<ts> \
-#     bash scripts/run_webshop_SOTA_flatGRPO_v1.sh
+# Warm-start adapter at R0 (WebShop SFT v3 rank-32 + 7-MLP, from
+# scripts/run_webshop_sft_v3_mlpr32.sh). Replace REPLACE_WITH_TS_FROM_PHASE4 or
+# override via SFT_ADAPTER=/vol/checkpoints/sft_webshop_v3_mlpr32_<ts>.
 SFT_ADAPTER="${SFT_ADAPTER:-/vol/checkpoints/sft_webshop_v3_mlpr32_REPLACE_WITH_TS_FROM_PHASE4}"
 
 CONFIG=${CONFIG:-configs/flatGRPO_webshop_SOTA_10round_mlpr32_v1.json}
@@ -57,13 +34,8 @@ fi
 BASE_OFFSET=$(( SEED * ROUNDS * EPS_PER_ROUND ))
 TRAIN_HI=$(( BASE_OFFSET + ROUNDS * EPS_PER_ROUND ))
 
-# Read K_trajectories_per_task + gpu_mem_util + sync_every from the JSON
-# config so we mirror the orchestrator's flag-derivation logic for
-# train_loop_webshop. (Flat GRPO has no TurnRD trainer to coordinate, so
-# we invoke `modal run infra/app_train_loop.py::train_loop_webshop`
-# directly in a per-round bash for-loop. This matches the orchestrator's
-# error-message guidance: "non-TurnRD configs should run directly via
-# `modal run infra/app_train_loop.py --config ...`.")
+# Read K/gpu_mem_util/sync_every from the JSON config (non-TurnRD configs run
+# app_train_loop.py per round directly; no TurnRD trainer to coordinate).
 read -r K_PER_TASK GPU_MEM_UTIL SYNC_EVERY < <(python -c "
 import json, sys
 with open('${CONFIG}') as f: c = json.load(f)
@@ -103,10 +75,7 @@ echo "                       decomposer='progress' is incompatible with run_turn
 echo "  Parallel-safe      : YES - disjoint task ranges + adapter run-name prefix."
 echo "========================================"
 
-# In-bash per-round driver. Adapter chaining mirrors run_turnrd_modal.py's
-# carry-policy mode: R0 loads ${SFT_ADAPTER}; R_N>0 loads R_{N-1}'s saved
-# adapter. Each round saves to ${ADAPTER_DIR}/<prefix>_seed<S>_round<NN>_adapter
-# so the chain is deterministic + recoverable.
+# Per-round driver: R0 loads ${SFT_ADAPTER}; R_N>0 loads R_{N-1}'s saved adapter.
 run_rounds () {
     local rc
     for round_idx in $(seq "${START_ROUND}" $((ROUNDS - 1))); do
@@ -122,9 +91,7 @@ run_rounds () {
             load_adapter="${ADAPTER_DIR}/${RUN_PREFIX}_seed${SEED}_round${prev_pad}_adapter"
         fi
 
-        # Build the modal run command. `_to_container_path` analog: the
-        # local repo gets mounted at /workspace inside the container, so
-        # `configs/foo.json` -> `/workspace/configs/foo.json`.
+        # Repo is mounted at /workspace; configs/foo.json -> /workspace/configs/foo.json.
         local config_container="/workspace/${CONFIG}"
         local cmd=(
             modal run --detach

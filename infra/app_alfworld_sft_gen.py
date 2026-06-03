@@ -1,33 +1,9 @@
 """Modal app: generate ALFWorld SFT trajectories using the handcoded expert.
 
-  modal run infra/app_alfworld_sft_gen.py                  # generate
-  modal run infra/app_alfworld_sft_gen.py --action inspect # peek + cardinality
-
-Drives `ALFWorldAdapter` over the (trimmed) train games using the
-upstream handcoded PDDL expert. The expert exposes its full optimal
-plan via `info["extra.expert_plan"]` after every reset/step. We pop one
-action at a time (`expert_plan[0]`) so we always re-read the plan
-after each `env.step()` - robust to upstream re-planning if a step
-nondeterministically fails.
-
-For every step we emit one JSONL row with:
-  - prompt  - pre-rendered by `render_alfworld_turn_prompt` (the SAME
-              renderer the runtime ReAct collector uses; this is the
-              critical anti-template-drift guarantee).
-  - action  - the expert plan action string just executed.
-  - step_idx, trajectory_id, instruction, final_reward - bookkeeping.
-
-We KEEP only trajectories where the env reports `won=True` (or
-equivalent: episode terminated with reward > 0). If the expert plan
-ever exhausts before `won`, we DROP the partial trajectory entirely
-rather than write half-grounded supervision.
-
-Cost: ~$1 / ~15-30 min on a single CPU container (no GPU needed).
-
-Schema reference: `src/datasets/sft_alfworld.py::SFTExample`. The
-SFT trainer (`infra/app_sft_train_alfworld.py`) reads these rows via
-`load_sft_examples_from_jsonl(...)` and tokenizes prompt+action with
-the standard masked-CE loss, mirroring `infra/app_sft_train.py`.
+Drives `ALFWorldAdapter` over the trimmed train games using the upstream PDDL
+expert, emitting one JSONL row per step (prompt pre-rendered by the runtime
+`render_alfworld_turn_prompt` to avoid template drift). Only `won` trajectories
+are kept; partial ones are dropped. Schema: `src/datasets/sft_alfworld.py`.
 """
 from __future__ import annotations
 
@@ -39,20 +15,16 @@ from infra.image import ALFWORLD_DATA_DIR, alfworld_image
 app = modal.App("cs224r-hgpo-alfworld-sft-gen")
 
 
-# Where the gen app writes the SFT trajectories on the shared Volume.
-# Path mirrors the WebShop pipeline's `/vol/data/webshop/human_trajs/`
-# location but is a single JSONL (AlfWorld emits one row per step
-# rather than one file per trajectory) so the loader is a one-shot read.
+# Single JSONL on the shared Volume (one row per step), unlike WebShop's
+# directory-of-files layout.
 SFT_OUTPUT_PATH = "/vol/data/alfworld/sft_trajs.jsonl"
 
 
 def _build_alfworld_config_dict() -> dict:
     """Build the upstream `AlfredTWEnv` config dict.
 
-    Mirrors `configs/env_alfworld.json::env_kwargs.config` so the SFT
-    gen env matches the runtime env exactly. Hard-coded here (rather
-    than read from the JSON) so the gen app has no external file
-    dependency at Modal-call time.
+    Mirrors `configs/env_alfworld.json::env_kwargs.config`, hard-coded here so
+    the gen app has no external file dependency at Modal-call time.
     """
     return {
         "dataset": {
@@ -119,13 +91,8 @@ def _build_alfworld_config_dict() -> dict:
 def _extract_expert_plan(info: dict) -> list[str]:
     """Pull the next-action list from the env info dict.
 
-    AlfWorld's handcoded expert exposes its plan under several
-    possible keys depending on upstream version / wrapper layer:
-      - `extra.expert_plan` (TextWorld batched info convention)
-      - `expert_plan`        (some non-batched wrappers)
-
-    Returns the first non-empty list found, normalized to list[str].
-    Returns [] when no plan is available (caller drops trajectory).
+    Checks `extra.expert_plan` then `expert_plan`, normalized to list[str];
+    returns [] when no plan is available (caller drops the trajectory).
     """
     if not isinstance(info, dict):
         return []
@@ -142,12 +109,7 @@ def _extract_expert_plan(info: dict) -> list[str]:
 
 
 def _extract_won(info: dict) -> bool:
-    """Check the upstream `won` flag (terminal success indicator).
-
-    AlfWorld marks task completion via `info["won"]` (True/False).
-    Returns False when the key is absent so callers err on the side of
-    dropping trajectories rather than emitting partial demos.
-    """
+    """Check the upstream `won` flag; returns False when absent."""
     if not isinstance(info, dict):
         return False
     won = info.get("won")
@@ -169,27 +131,9 @@ def generate_sft_trajectories(
 ) -> dict:
     """Iterate game indices [0, n_games), drive the expert, write JSONL.
 
-    Args:
-        n_games: how many distinct games to attempt. Each iteration calls
-                 `adapter.reset(task_id=i)` which (via `_select_task`)
-                 maps to game-index `i % len(game_files)`. Cap at the
-                 trimmed-train-set cardinality (default 200).
-        output_path: where to write the JSONL on the shared Volume.
-                     Truncated on entry - re-running this app produces a
-                     fresh dataset.
-        max_history_turns: forwarded to the runtime renderer to bound
-                           prompt context. MUST match what the runtime
-                           collector uses or the SFT prompt template
-                           will drift from inference time. Default 3 is
-                           the runtime default in
-                           `render_alfworld_turn_prompt`.
-        max_steps_per_episode: hard cap on adapter steps per episode.
-                               If the expert hasn't won by then we drop
-                               the trajectory.
-
-    Returns:
-        manifest dict with cardinalities (n_games_attempted,
-        n_games_won, n_games_dropped, n_examples_written, etc.).
+    Each game maps to `i % len(game_files)`; `max_history_turns` MUST match the
+    runtime renderer or the SFT prompt drifts from inference time. Returns a
+    manifest with per-status cardinalities.
     """
     import json
     import os
@@ -237,9 +181,8 @@ def generate_sft_trajectories(
             n_dropped_no_plan += 1
             continue
 
-        # Trajectory id derived from the resolved game index AND the
-        # game-file path basename (when available) so re-runs land on
-        # consistent IDs even if the trimmed-dir cardinality changes.
+        # Trajectory id from the resolved game index + file basename so re-runs
+        # land on consistent IDs even if the trimmed-dir cardinality changes.
         last_idx = adapter._last_task_idx if adapter._last_task_idx is not None else game_idx
         if 0 <= last_idx < n_available:
             traj_id = f"{last_idx:04d}_{Path(str(games[last_idx])).name}"
@@ -253,8 +196,7 @@ def generate_sft_trajectories(
             n_dropped_no_plan += 1
             continue
 
-        # Buffer rows for THIS trajectory; we only flush when `won=True`
-        # so partial demos never reach disk.
+        # Buffer rows; only flush when won=True so partial demos never hit disk.
         instruction_text = state.observation_text or ""
         history: list = []
         traj_rows: list[dict] = []
@@ -267,17 +209,13 @@ def generate_sft_trajectories(
                 truncated = True
                 break
 
-            # Render the prompt with the runtime renderer (same module
-            # `infra/app_train_loop.py::_resolve_env_bindings` uses for
-            # AlfWorld). This guarantees zero template drift between
-            # SFT-time and rollout-time.
+            # Render with the runtime renderer to guarantee zero template drift.
             prompt = render_alfworld_turn_prompt(
                 state, history, max_history_turns=max_history_turns,
             )
             action = plan[0]
 
-            # Record the (prompt, action) pair BEFORE stepping; we write
-            # to disk only if the trajectory ultimately wins.
+            # Record the (prompt, action) pair BEFORE stepping; flushed only on win.
             traj_rows.append({
                 "prompt": prompt,
                 "action": action,
@@ -288,10 +226,8 @@ def generate_sft_trajectories(
                 "final_reward": 0.0,
             })
 
-            # Append a TurnRecord-shaped object to history so the next
-            # render sees the prior (obs, action). Use a dataclass-lite
-            # SimpleNamespace - `_format_history` uses getattr so any
-            # object exposing observation_text + action_text works.
+            # Append to history so the next render sees the prior (obs, action);
+            # SimpleNamespace suffices since `_format_history` uses getattr.
             from types import SimpleNamespace
             history.append(SimpleNamespace(
                 observation_text=state.observation_text,
@@ -308,8 +244,7 @@ def generate_sft_trajectories(
 
             won = _extract_won(info)
             if won or done:
-                # Re-read plan from the post-step info; if won, we'll
-                # flush below. If done-but-not-won, we drop.
+                # Re-read plan from post-step info; flush below if won, else drop.
                 break
 
             new_plan = _extract_expert_plan(info)
@@ -362,11 +297,7 @@ def generate_sft_trajectories(
     timeout=10 * 60,
 )
 def inspect_sft_dataset(path: str = SFT_OUTPUT_PATH) -> dict:
-    """Peek at the SFT dataset: cardinality + first row's prompt+action.
-
-    Useful smoke test after `generate_sft_trajectories` to confirm the
-    file is non-trivial before kicking off the SFT trainer.
-    """
+    """Peek at the SFT dataset: cardinality + first row's prompt+action."""
     import os
     import sys
 
@@ -405,12 +336,7 @@ def main(
     max_history_turns: int = 3,
     max_steps_per_episode: int = 50,
 ) -> None:
-    """Local entrypoint dispatching on `--action`.
-
-    Actions:
-      generate (default) - run `generate_sft_trajectories(...)`
-      inspect            - pretty-print the dataset summary + first row
-    """
+    """Local entrypoint; dispatch on --action (generate | inspect)."""
     import json as _json
     if action == "generate":
         res = generate_sft_trajectories.remote(

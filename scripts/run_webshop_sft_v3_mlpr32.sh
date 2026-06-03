@@ -1,55 +1,17 @@
 #!/usr/bin/env bash
 # run_webshop_sft_v3_mlpr32.sh - WebShop SFT v3 baseline at LoRA rank-32 + 7 MLP targets.
-#
-# Background:
-# The 3 WebShop SOTA RL launchers (run_webshop_SOTA_attention_v1.sh,
-# run_webshop_SOTA_flatGRPO_v1.sh, run_webshop_SOTA_LLMJudge_v1.sh) all
-# declare a rank-32 + 7-MLP-target LoRA arch (the AlfWorld SOTA recipe
-# transplant) but warm-start from /vol/checkpoints/sft_v3_20260504_154752
-# which was trained at rank-16 attention-only. The mismatched
-# policy.load_adapter(...) silently keeps the attention slice and leaves
-# the MLP LoRAs randomly-initialised. This launcher produces a rank-32 +
-# 7-MLP SFT adapter trained on a larger oracle-generated corpus so the
-# warm-start matches the RL arch.
-#
-# Pipeline (4 steps):
-#   1. install - WebShop env (pip-install editable + spaCy + BM25 index).
-#                Idempotent on the Modal volume; ~20 min the first time.
-#   2. gen     - infra/app_webshop_sft_gen.py runs a deterministic oracle
-#                over N_SESSIONS sessions, optionally concatenating the
-#                upstream ~50 gdown human trajectories. ~30 min CPU.
-#   3. train   - infra/app_sft_train.py --data-path <jsonl> --lora-rank 32
-#                --lora-target-modules <7 modules>. ~3-5 hr A100.
-#   4. eval    - smoke eval against configs/SFTOnly_webshop_mlpr32.json on
-#                [6500, 6600). Confirms the adapter loads cleanly into the
-#                rank-32 + MLP policy and has non-degenerate eval
-#                pct_success. ~30 min A100.
+# Produces a rank-32 + 7-MLP SFT adapter so the WebShop RL launchers' warm-start
+# matches their LoRA arch (the old sft_v3 was rank-16 attention-only).
+# Pipeline: install WebShop env -> generate oracle SFT trajs -> train SFT -> smoke eval.
 #
 # Usage:
 #   bash scripts/run_webshop_sft_v3_mlpr32.sh [--dry-run|--full|--skip-install|--skip-gen|--train-only|--eval-only]
 #
-# Override knobs via env vars (defaults shown):
-#   N_SESSIONS=2000                       # oracle generator sessions to attempt
-#   INCLUDE_HUMAN_TRAJS=true              # also concat upstream gdown human trajs
-#   EPOCHS=6
-#   LR=5e-5
-#   MAX_SEQ_LEN=2048
-#   GRAD_ACCUM=8
-#   MIN_REWARD=0.5
-#   EVAL_EPS=200
-#   EVAL_TASK_BASE=6500
-#   LORA_RANK=32
-#   LORA_TARGETS=q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
-#   RUN_TS=$(date +%Y%m%d_%H%M%S)
-#   RUN_NAME=sft_webshop_v3_mlpr32_${RUN_TS}
-#   DATA_PATH=/vol/data/webshop/oracle_trajs.jsonl
-#   LOG_DIR=/tmp
+# Modes: --dry-run | --full (default) | --skip-install | --skip-gen | --train-only | --eval-only
 #
-# Resume after partial failure:
-#   - Install crashed:    re-run --full (install is idempotent on the volume).
-#   - Gen crashed:        re-run --skip-install (gen overwrites the JSONL fresh).
-#   - Train crashed:      re-run --train-only (data file is preserved).
-#   - Eval crashed:       re-run --eval-only ADAPTER_PATH=/vol/checkpoints/<run_name>.
+# Override knobs via env vars: N_SESSIONS INCLUDE_HUMAN_TRAJS EPOCHS LR MAX_SEQ_LEN
+#   GRAD_ACCUM MIN_REWARD EVAL_EPS EVAL_TASK_BASE LORA_RANK LORA_TARGETS
+#   RUN_NAME DATA_PATH LOG_DIR.
 
 set -uo pipefail
 

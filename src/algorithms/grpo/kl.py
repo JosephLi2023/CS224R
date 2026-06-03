@@ -1,14 +1,7 @@
 """Adaptive KL controller (Schulman PPO style).
 
-Maintains a multiplier `coef` on the KL-to-reference penalty in the trainer's
-total loss. After every step, observes the realized KL and adjusts `coef`
-toward the configured `target_kl`:
-
-    if observed > 1.5 * target:  coef *= 1.5
-    if observed < 0.5 * target:  coef *= 0.5
-
-`target_kl` of 0.04 is the standard PPO-RLHF default (Ziegler et al. 2019).
-We expose `min_coef` / `max_coef` to keep the controller from running away.
+Multiplies the KL-to-reference penalty by `coef`, nudging it up/down toward
+`target_kl` after each step. `min_coef`/`max_coef` bound it.
 """
 from __future__ import annotations
 
@@ -49,7 +42,6 @@ class AdaptiveKLController:
             self.coef *= self.cfg.increase_factor
         elif observed_kl < low:
             self.coef *= self.cfg.decrease_factor
-        # Clip to bounds.
         self.coef = min(self.cfg.max_coef, max(self.cfg.min_coef, self.coef))
         self.steps += 1
         return self.coef

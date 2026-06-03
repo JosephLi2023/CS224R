@@ -1,28 +1,9 @@
 """Modal app: WebShop dataset acquisition into the shared Volume.
 
-Bake the WebShop product index into `/vol/data/webshop/`
-so subsequent training runs can mount the Volume and find the
-index without re-downloading.
-
-Strategy:
-  1. Shallow-clone princeton-nlp/WebShop into `/vol/code/webshop` (~50 MB
-     of Python source + scripts; cached so we only do it once).
-  2. Parse the upstream `setup.sh` to discover the canonical gdrive file IDs
-     (avoids us hard-coding IDs that could rot).
-  3. Use `gdown` to pull just the JSON data files we need into
-     `/vol/data/webshop/`. Skip files that already exist (idempotent).
-  4. `verify_webshop_data()` reports each file's size + record count, so we
-     can confirm the index landed without re-downloading.
-
-Cost-saving knobs:
-  - `small=True` (default): pulls `items_shuffle_1000.json` (~5 MB, 1000
-    products) for dev iteration. Use this for first-run verification.
-  - `small=False`: pulls the full `items_shuffle.json` (~1.4 GB, 1.18 M
-    products) needed for the full WebShop protocol runs.
-
-This app intentionally does NOT install pyserini/Java/spacy yet - those
-heavy deps are only needed when we actually instantiate `WebAgentTextEnv`.
-Keeping data acquisition cheap and fast.
+Shallow-clones princeton-nlp/WebShop, parses its `setup.sh` for the gdrive file
+IDs, and `gdown`-pulls the JSON data files into `/vol/data/webshop/`
+(idempotent). `small=True` pulls the 1k-product dev split; `small=False` the
+full 1.18M index.
 """
 
 from __future__ import annotations
@@ -35,31 +16,24 @@ from infra.image import image
 APP_NAME = "cs224r-hgpo-data"
 app = modal.App(APP_NAME)
 
-# Lighter-weight image variant - gdown is baked into the base image
-# (see infra/image.py) so we just reuse `image` directly here.
+# Reuse the base image (gdown is already baked in).
 data_image = image
 
 WEBSHOP_REPO = "https://github.com/princeton-nlp/WebShop.git"
 WEBSHOP_REPO_DIR = "/vol/code/webshop"
 WEBSHOP_DATA_DIR = "/vol/data/webshop"
 
-# Files we ever want from the upstream `setup.sh`.
-# `setup.sh -d small` writes items_shuffle_1000.json + items_ins_v2_1000.json +
-#                            items_human_ins.json
-# `setup.sh -d all`   writes items_shuffle.json      + items_ins_v2.json +
-#                            items_human_ins.json (1.18 M product index).
+# Files we want from upstream setup.sh: the small (1k) vs all (1.18M) splits.
 _COMMON_FILES = {"items_human_ins.json"}
 _SMALL_FILES = _COMMON_FILES | {"items_shuffle_1000.json", "items_ins_v2_1000.json"}
 _FULL_FILES = _COMMON_FILES | {"items_shuffle.json", "items_ins_v2.json"}
 
 
 def _parse_gdown_ids(setup_sh_text: str) -> dict[str, dict[str, str]]:
-    """Extract `{filename: {"gid": ..., "split": "small"|"all"|"common"}}` from setup.sh.
+    """Extract `{filename: {"gid": ..., "split": ...}}` from setup.sh.
 
-    The upstream WebShop setup.sh has no `-O` flag on its gdown lines; the
-    intended filename lives in the trailing `# comment`. Bash `if/elif/else`
-    determines whether a line belongs to the small or all split. We track
-    that branch by walking the file line-by-line.
+    The intended filename lives in each gdown line's trailing `# comment`; the
+    small/all split is tracked by walking the bash if/elif branches.
     """
     import re
 
@@ -86,8 +60,7 @@ def _parse_gdown_ids(setup_sh_text: str) -> dict[str, dict[str, str]]:
         if not m:
             continue
         gid, name_hint = m.group(1), m.group(2)
-        # The comment hint is the bare filename (no extension); upstream JSON
-        # files always end in .json.
+        # The comment hint is the bare filename; upstream JSON ends in .json.
         fname = name_hint.split()[0]
         if not fname.endswith(".json"):
             fname = fname + ".json"
@@ -120,12 +93,8 @@ def show_setup_sh() -> str:
 def download_webshop_data(small: bool = True) -> dict:
     """Idempotent WebShop data acquisition into the shared Volume.
 
-    Args:
-        small: If True (default), download only the 1000-product dev split
-               (~5 MB total). If False, download the full 1.18 M product
-               index (~1.4 GB).
-    Returns:
-        Manifest with which files were downloaded vs already cached.
+    `small=True` pulls the 1k-product dev split (~5 MB); `small=False` the full
+    1.18M index (~1.4 GB). Returns a manifest of downloaded vs cached files.
     """
     import os
     import shutil
@@ -204,10 +173,7 @@ def download_webshop_data(small: bool = True) -> dict:
     timeout=10 * 60,
 )
 def verify_webshop_data() -> dict:
-    """Inspect /vol/data/webshop/ - report each file's size + record count.
-
-    Use as: `modal run infra/app_data.py::verify_webshop_data`
-    """
+    """Inspect /vol/data/webshop/ - report each file's size + record count."""
     import json
     import os
 
@@ -238,7 +204,7 @@ def verify_webshop_data() -> dict:
 
 @app.local_entrypoint()
 def main(action: str = "verify", small: bool = True) -> None:
-    """`modal run infra/app_data.py --action <download|verify> --small <True|False>`"""
+    """Local entrypoint; dispatch on --action."""
     if action == "download":
         result = download_webshop_data.remote(small=small)
     elif action == "verify":
@@ -328,12 +294,7 @@ def show_human_ins_schema() -> dict:
 
 @app.function(image=data_image, volumes={VOLUME_MOUNT: volume}, timeout=20 * 60)
 def download_human_trajectories() -> dict:
-    """Download the released human-trajectory gdrive folder used by
-    setup.sh::get_human_trajs(). ~50 example trajectories the WebShop
-    paper authors made public for IL warm-start.
-
-    URL is hard-coded in WebShop's setup.sh (verified).
-    """
+    """Download the ~50 released human-trajectory gdrive folder (IL warm-start)."""
     import os
     import gdown  # type: ignore[import-not-found]
     dst = "/vol/data/webshop/human_trajs"
@@ -413,9 +374,7 @@ def show_one_trajectory_full() -> dict:
 
 @app.function(image=data_image, volumes={VOLUME_MOUNT: volume}, timeout=10 * 60)
 def summarize_sft_dataset_action(min_reward: float = 0.0) -> dict:
-    """Run src.datasets.sft_webshop loader on /vol/data/webshop/human_trajs
-    and report headline stats. Use min_reward=0.5 to filter for succeeded
-    trajectories before SFT."""
+    """Run the sft_webshop loader on human_trajs and report headline stats."""
     import sys
     sys.path.insert(0, "/workspace")
     from src.datasets.sft_webshop import (

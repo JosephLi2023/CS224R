@@ -1,32 +1,16 @@
 """Pure-Python AlfWorld goal-text extractor for the TurnRDv2 goal-conditioning ablation.
 
-AlfWorld's Turn 0 observation follows the TextWorld convention:
-
-    -= Welcome to TextWorld, ALFRED! =-
-
-    You are in the middle of a room. Looking quickly around you, you see ...
-
-    Your task is to: <goal text>.
-
-This module provides a single function `extract_goal_text(turn0_obs)` that returns
-the trimmed goal substring (e.g. "examine the cd with the desklamp.") or `None` when
-no match is found. It is intentionally torch-free + dep-free so the producer side
-(in `RolloutCollector._emit_turnrd_records`) can import it without any heavy stack.
-
-Format variants accepted:
-- Period vs no period at end of goal.
-- Optional trailing whitespace / blank lines.
-- Multi-line preamble before the task line (TextWorld decorations).
-- Casing of the literal "Your task is to:" - case-insensitive match.
+AlfWorld's Turn 0 observation follows the TextWorld convention, ending with a
+`Your task is to: <goal text>.` line. `extract_goal_text(turn0_obs)` returns the
+trimmed goal (or `None`). Torch-free + dep-free so the producer can import it.
 """
 from __future__ import annotations
 
 import re
 from typing import Optional
 
-# `Your task is to:` - anchored with non-greedy capture up to a newline (or
-# end-of-string). The `[ \t]*` after the colon tolerates extra whitespace
-# without consuming the goal text itself.
+# Capture after "Your task is to:" up to the first newline; `[ \t]*` skips
+# whitespace after the colon.
 _GOAL_RE = re.compile(
     r"your task is to:[ \t]*(.+?)\s*(?:\n|$)",
     re.IGNORECASE | re.DOTALL,

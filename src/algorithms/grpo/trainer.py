@@ -1,10 +1,8 @@
-"""HGPOTrainer: PPO-clipped policy update over K-trajectory groups, with the
-H-GRPO advantage construction and an adaptive KL controller
-to a frozen reference model.
+"""HGPOTrainer: PPO-clipped update over K-trajectory groups with the H-GRPO
+hierarchical advantage and an adaptive KL penalty to a frozen reference.
 
-torch / transformers imports are deferred to method bodies so the module
-loads cleanly on a Mac (where the heavy stack is not installed). All
-gradient math runs on Modal A100 inside `webshop_image` / `image`.
+torch/transformers imports are deferred to method bodies so the module loads
+on a Mac; gradient math runs on Modal A100.
 """
 from __future__ import annotations
 
@@ -56,17 +54,14 @@ class HGPOTrainerConfig:
     refresh_every_episodes: int = 0
     # Separate (higher) AdamW lr for the TurnRD params vs the LoRA policy.
     turnrd_lr: float = 1e-4
-    # V-baseline annealing across rounds. V_theta is random-init noise in
-    # Round 0, so ramp its weight in linearly:
-    # beta = clamp(round_idx / warmup_rounds, 0, 1). Round 0 -> beta=0
-    # (turn_adv only), warmup_rounds+ -> beta=1 (full V baseline).
+    # V-baseline annealing: V_theta is noise in Round 0, so ramp its weight
+    # beta = clamp(round_idx / warmup_rounds, 0, 1) (0 -> turn_adv only,
+    # >=warmup_rounds -> full V baseline).
     v_baseline_round_idx: int = 0
     v_baseline_warmup_rounds: int = 2
-    # Proposal-A: drop alpha and project V_t onto the sum-to-R constraint
-    # instead of the alpha*R formula:
-    #   per_turn_t = (V_t_clamped - (sum_t V_t_clamped - R) / T_active) * mask
-    # sum_t per_turn = R, but per_turn may be negative or exceed R (more
-    # expressive than the [0,R] softmax-alpha form). Default False = legacy.
+    # Proposal-A: project V_t onto the sum-to-R constraint instead of alpha*R
+    #   per_turn_t = (V_t_clamped - (sum_t V_t_clamped - R)/T_active) * mask
+    # (sums to R but may be negative or exceed R). Default False = legacy.
     use_v_projection_for_decomposition: bool = False
     v_projection_clamp: float = 2.0
 
@@ -92,10 +87,8 @@ class TrainStepStats:
     alpha_max: float = 0.0           # max alpha weight in the group
     alpha_entropy: float = 0.0       # mean H(alpha); uniform on T turns -> log(T); peaked -> small
     alpha_progress_corr: float = 0.0 # mean Pearson corr(alpha, env raw_env_reward) over trajectories
-    # Diagnostics for gradient-bearing signal magnitude.
-    # The legacy `mean_traj_adv` / `mean_turn_adv` columns are mathematically
-    # zero by construction (mean over centered values within a K-group).
-    # The columns below carry the actual gradient-bearing signal magnitude.
+    # Gradient-bearing signal magnitudes (mean_traj_adv/mean_turn_adv are 0
+    # by construction within a K-group).
     std_reward_group: float = 0.0    # std over the K final rewards; 0 -> degenerate K-group (all K rollouts gave same R)
     dead_K_group: int = 0            # 1 if std_reward_group < 1e-12 (no policy gradient on this group); else 0
     mean_abs_traj_adv: float = 0.0   # mean |A_traj| over K; non-zero whenever std_reward_group > 0
@@ -118,24 +111,15 @@ def progress_decomposer(group: TrajectoryGroup) -> list[list[float]]:
 
 class HGPOTrainer:
     """Group-relative policy optimization with hierarchical (trajectory + turn)
-    advantages, PPO-clip surrogate, and an adaptive KL penalty against the
-    frozen base.
-
-    One train_step minimizes:
+    advantages, a PPO-clip surrogate, and an adaptive KL penalty to a frozen
+    reference.
 
         L = L_PPO(theta) + beta_t * KL_k3(pi_theta || pi_ref)
                          + lambda * L_consistency(theta, phi)
 
-    - theta = LoRA-adapter weights (the only trainable LLM weights; base is
-      frozen).
-    - phi   = TurnRD decomposer params, trainable only for Method B
-      (decomposer.has_learnable_params). Empty for Methods A/C.
-    - pi_ref = LoRA-disabled base or an SFT-warmed LoRA snapshot; always
-      constant w.r.t. theta and phi.
-
-    L_PPO and KL flow into theta via new_logp (grad-on forward); L_PPO (via
-    A_H) and L_consistency flow into phi via alpha_t. The two param groups
-    use separate AdamW optimizers (different lrs) but share one backward.
+    theta = LoRA weights; phi = TurnRD decomposer params (Method B only);
+    pi_ref = frozen base or SFT-warmed LoRA snapshot. theta and phi use
+    separate AdamW optimizers but share one backward.
     """
 
     def __init__(
@@ -148,18 +132,11 @@ class HGPOTrainer:
     ) -> None:
         """Construct an H-GRPO trainer.
 
-        decomposer may be a plain callable (Methods A/C) or a TurnRDDecomposer
-        object (Method B); the learnable surface is detected via
-        getattr(decomposer, "has_learnable_params", False).
-
-        refresh_decomposer_fn (optional) is invoked at
-        cfg.refresh_every_episodes cadence inside train_step (skipping step 0)
-        to reload the TurnRD checkpoint. It MUST mutate the decomposer's params
-        in place (e.g. load_state_dict), not reassign decomposer.model: the
-        second AdamW is built once over decomposer.parameters(), so a model
-        swap would leave it updating stale tensors. With grad_accum_steps > 1,
-        pick refresh_every_episodes as a multiple of grad_accum_steps so a
-        refresh never lands mid-accumulation.
+        decomposer is a plain callable (Methods A/C) or a TurnRDDecomposer
+        (Method B, detected via has_learnable_params). refresh_decomposer_fn,
+        if given, reloads the TurnRD checkpoint at cfg.refresh_every_episodes
+        cadence and MUST mutate params in place (the second AdamW is built once
+        over decomposer.parameters()).
         """
         self.policy = policy
         self.decomposer = decomposer
@@ -167,10 +144,8 @@ class HGPOTrainer:
         self.kl_controller = AdaptiveKLController(self.cfg.kl_cfg)
         self._optimizer: Any = None  # lazy-init in train_step
         self._step: int = 0
-        # backward() calls since the last optimizer.step() flush. Keys the
-        # grad-accum boundary off the real number of accumulated grads
-        # (independent of self._step) so dead-K early returns (which skip
-        # backward) can't misalign the boundary parity.
+        # backward() calls since the last optimizer.step(); keys the grad-accum
+        # boundary off real accumulated grads so dead-K skips can't misalign it.
         self._pending_backwards: int = 0
         # Optional LoRA snapshot used as the KL reference: ref forwards swap
         # these in (no_grad) and restore live weights after. None -> the C2
@@ -182,17 +157,13 @@ class HGPOTrainer:
             getattr(self.decomposer, "has_learnable_params", False)
         )
         self._refresh_fn: Callable[[], None] | None = refresh_decomposer_fn
-        # Built lazily inside _ensure_optimizer (matches the policy
-        # optimizer's lazy init); kept None for non-learnable decomposers.
+        # Built lazily in _ensure_optimizer; None for non-learnable decomposers.
         self._decomposer_optimizer: Any = None
 
     def snapshot_current_lora_as_ref(self) -> int:
-        """Capture the current LoRA tensors as the frozen KL reference.
-
-        Returns the number of LoRA modules snapshotted. Call this AFTER
-        loading an SFT-warm adapter and BEFORE the first train_step so the
-        KL term penalises drift from the SFT-trained policy (not the raw
-        base Qwen - which would otherwise blow up the k3 estimator).
+        """Capture the current LoRA tensors as the frozen KL reference; returns
+        the count. Call after loading an SFT-warm adapter and before the first
+        train_step so KL penalises drift from the SFT policy, not the raw base.
         """
         import torch  # type: ignore[import-not-found]
         adapter_name = "default"
@@ -235,9 +206,8 @@ class HGPOTrainer:
         if self._optimizer is not None:
             return
         import torch  # type: ignore[import-not-found]
-        # Snapshot trainable params once so optimizer/grad-clip/AdamW state
-        # can't drift if trainable_parameters() later returns a different
-        # set/order (e.g. after merge_and_unload). Review M7.
+        # Snapshot trainable params once so optimizer/grad-clip state can't
+        # drift if trainable_parameters() later returns a different set. M7.
         self._trainable_params: list = list(self.policy.trainable_parameters())
         self._optimizer = torch.optim.AdamW(
             self._trainable_params,
@@ -261,12 +231,9 @@ class HGPOTrainer:
     def _new_logprobs_for_turn(
         self, prompt_token_ids: list[int], action_token_ids: list[int]
     ) -> "torch.Tensor":
-        """Recompute per-token logprobs under the current policy for one
-        (prompt, action) pair. Returns a 1-D tensor of len(action_token_ids).
-
-        Runs grad-on with the LoRA active, so the result carries autograd
-        history back to theta. fp32 before log_softmax keeps exp(new-old)
-        stable in the importance ratio.
+        """Per-token logprobs under the current policy for one (prompt, action)
+        pair. Runs grad-on with LoRA active so it carries autograd to theta;
+        fp32 before log_softmax keeps the importance ratio stable.
         """
         import torch  # type: ignore[import-not-found]
         from torch.nn import functional as F  # type: ignore[import-not-found]
@@ -293,11 +260,8 @@ class HGPOTrainer:
     def _ref_logprobs_for_turn(
         self, prompt_token_ids: list[int], action_token_ids: list[int]
     ) -> "torch.Tensor":
-        """Per-token logprobs under the frozen reference policy (LoRA disabled).
-
-        Used for the KL-to-reference penalty (review C2). Runs under no_grad
-        with disable_adapter() and returns detached tensors (constants in the
-        loss graph).
+        """Per-token logprobs under the frozen reference (LoRA disabled), for
+        the KL penalty. no_grad + disable_adapter(), returns detached tensors.
         """
         import torch  # type: ignore[import-not-found]
         from torch.nn import functional as F  # type: ignore[import-not-found]
@@ -325,16 +289,12 @@ class HGPOTrainer:
         *,
         use_ref: bool,
     ) -> list["torch.Tensor"]:
-        """Padded forward -> per-turn action logprobs (review M6).
+        """Padded forward -> per-turn action logprobs, micro-batched under
+        cfg.max_tokens_per_microbatch.
 
-        Splits the KxT (prompt, action) pairs into micro-batches under
-        cfg.max_tokens_per_microbatch, releasing activations between them.
-
-        use_ref=False: grad-on with LoRA active; returned tensors carry
-        autograd into theta and drive L_PPO and the KL term.
-        use_ref=True: no_grad with disable_adapter() (frozen base) or the SFT
-        LoRA snapshot swapped in; returned tensors are detached. Live LoRA is
-        restored in a finally block so an OOM mid-swap can't corrupt state.
+        use_ref=False: grad-on with LoRA, drives L_PPO + KL. use_ref=True:
+        no_grad with disable_adapter() or the SFT snapshot; detached, with live
+        LoRA restored in a finally block.
         """
         import torch  # type: ignore[import-not-found]
         from torch.nn import functional as F  # type: ignore[import-not-found]
@@ -385,15 +345,13 @@ class HGPOTrainer:
                 attention_mask[i, : len(s)] = 1
 
             if use_ref:
-                # If a SFT snapshot was registered as KL ref, swap its LoRA tensors
-                # in for this no_grad forward, then restore. Otherwise fall back to
-                # the C2 default of disabling LoRA entirely.
+                # SFT snapshot registered as ref: swap its LoRA in for this
+                # no_grad forward, else just disable LoRA.
                 if self._ref_lora_snapshot is not None:
                     with torch.no_grad():
                         saved: dict[str, dict[str, "torch.Tensor"]] = {}
-                        # try opened before the swap so a partial swap (shape
-                        # mismatch / OOM) still restores overwritten modules;
-                        # saved[mod_name] is set before each copy_. (Review A2.)
+                        # try before swap so a partial swap still restores
+                        # overwritten modules (saved set before each copy_). A2.
                         try:
                             for mod_name, snap in self._ref_lora_snapshot.items():
                                 try:
@@ -437,42 +395,29 @@ class HGPOTrainer:
         return out
 
     def compute_loss(self, group: TrajectoryGroup) -> tuple["torch.Tensor", TrainStepStats]:
-        """Compute the H-GRPO total loss for one group.
-
-        Reads prompt_token_ids / action_token_ids from each TurnRecord.
+        """H-GRPO total loss for one group, reading token ids from each TurnRecord.
 
         Per action token:
             rho   = exp(new_logp - old_logp)
             L_PPO = -mean(min(rho * A_H, clip(rho, 1+-eps) * A_H))
-            r     = exp(ref_logp - new_logp)
-            KL_k3 = mean((r - 1) - log r)
+            KL_k3 = mean((r - 1) - log r),  r = exp(ref_logp - new_logp)
             A_H   = alpha * A_traj + (1 - alpha) * A_turn
 
-        theta (LoRA) gets gradient from L_PPO and KL via new_logp. phi (TurnRD,
-        when learnable) gets it via alpha_t -> A_turn -> A_H -> L_PPO and via
-        consistency_loss_tensor. pi_ref is never updated.
-
-        KL warmup: during the first cfg.kl_warmup_episodes calls kl_term is a
-        fresh zero tensor (not 0.0 * kl, which would propagate NaN/Inf);
-        observed_kl is still logged.
-
-        Returns (total_loss_tensor, TrainStepStats); stats are detached.
+        Gradients reach theta via new_logp and phi (Method B) via alpha_t and
+        consistency_loss_tensor; pi_ref is constant. During the first
+        kl_warmup_episodes calls kl_term is a fresh zero. Returns
+        (loss, detached TrainStepStats).
         """
         import torch  # type: ignore[import-not-found]
 
         adv = self.build_advantages(group)
         combined: list[list[float]] = adv["combined"]
-        # Hoist traj_adv + flat_turn_adv so the V-head override block below
-        # can reference traj_adv without UnboundLocalError.
+        # Hoist traj_adv so the V-head override block below can reference it.
         traj_adv: list[float] = adv["traj_adv"]
         flat_turn_adv: list[float] = [v for row in adv["turn_adv"] for v in row]
 
-        # Signal diagnostics: mean_traj_adv/mean_turn_adv are zero by
-        # construction, so these capture actual gradient signal instead:
-        #   std_reward_group  = std of K final rewards (0 -> dead K-group)
-        #   dead_K_group      = 1 if all K rollouts agree on R
-        #   mean_abs_traj_adv = mean per-trajectory advantage magnitude
-        #   std_traj_adv      = should be ~=1 (sanity check on normalisation)
+        # Diagnostics that capture real gradient signal (mean_traj_adv etc. are
+        # 0 by construction): std_reward_group=0 -> dead K-group; std_traj_adv ~=1.
         _final_R = group.final_rewards()
         if _final_R:
             _R_mean = sum(_final_R) / len(_final_R)
@@ -493,9 +438,8 @@ class HGPOTrainer:
 
         device = next(self.policy.model.parameters()).device
 
-        # Skip optimizer work for groups with no reward variation. The
-        # decomposer has already run through `build_advantages`, so replay
-        # emission and diagnostics still see the same inputs as live groups.
+        # Skip optimizer work for groups with no reward variation; the decomposer
+        # already ran in build_advantages so replay/diagnostics are unaffected.
         if _dead_K_group:
             # Recover alpha statistics from the latest decomposer call when available.
             _alpha_mean = 0.0
@@ -521,9 +465,8 @@ class HGPOTrainer:
                         _alpha_var = float(
                             (((_last_alpha - _alpha_mean) ** 2 * _last_mask).sum() / _denom2).item()
                         )
-                        # Guard masked_fill+max against the all-padded case
-                        # (mask.sum()==0) where .max() would be -inf and leak
-                        # into stats; keep the 0.0 sentinel instead.
+                        # Guard masked max against the all-padded case
+                        # (mask.sum()==0 -> -inf); keep the 0.0 sentinel.
                         if float(_last_mask.sum().item()) > 0.0:
                             _masked2 = _last_alpha.masked_fill(_last_mask == 0, float("-inf"))
                             _alpha_max = float(_masked2.max().item())
@@ -602,9 +545,8 @@ class HGPOTrainer:
         all_new_lp: list[torch.Tensor] = []
         all_old_lp: list[torch.Tensor] = []
         all_ref_lp: list[torch.Tensor] = []
-        # Assemble advantages after decomposer updates so any per-turn value
-        # projection is reflected in the policy loss. The model forward
-        # passes are batched once per group for efficiency.
+        # Batch the forward passes once per group; advantages are assembled
+        # after the decomposer update so V-projection is reflected.
         pa_pairs: list[tuple[list[int], list[int]]] = []
         per_turn_meta: list[tuple[int, int]] = []  # (i_traj, t_turn)
         for i, traj in enumerate(group.trajectories):
@@ -644,9 +586,8 @@ class HGPOTrainer:
         ref_lp_t = torch.cat(all_ref_lp).to(torch.float32)
 
         cons = float(adv["consistency"])
-        # Consistency regularization has no gradient for pure-Python
-        # decomposers. For learnable TurnRD, construct a tensor-valued loss
-        # from grad-tracking attention weights so gradients can reach TurnRD.
+        # Consistency reg has no gradient for pure-Python decomposers; for
+        # learnable TurnRD build a tensor loss so gradients reach it.
         cons_loss_t: "torch.Tensor | None" = None
         # TurnRD diagnostics (populated alongside cons_loss_t when learnable).
         _alpha_mean: float = 0.0
@@ -673,24 +614,18 @@ class HGPOTrainer:
                 _masked = alpha_t.masked_fill(attn_t == 0, float("-inf"))
                 _alpha_max = float(_masked.max().detach().item()) if alpha_t.numel() > 0 else 0.0
                 # Per-row entropy of alpha over unmasked positions, averaged
-                # over K_real rows. Uniform on T_real -> log(T_real); smaller
-                # = credit concentrated on fewer turns. Inline to avoid
-                # importing from src.turnrd.
+                # over K_real (uniform -> log(T); smaller -> concentrated).
                 _log_alpha = torch.log(alpha_t.clamp_min(1e-12))
                 _row_H = -(alpha_t * _log_alpha * _mask_for_stats).sum(dim=-1)  # [K_real]
                 _alpha_entropy = float(_row_H.mean().detach().item())
-                # Per-turn rewards = alpha * R (legacy default); the
-                # v-projection mode below can replace this. Then
-                # group-normalize per turn position and per group, over the
-                # K_real subset (empty trajectories are dropped, matching the
-                # pure-Python path).
+                # Per-turn rewards = alpha * R (legacy); v-projection below may
+                # replace this. Then group-normalize per position and per group
+                # over the K_real subset (empty trajectories dropped).
                 R_for_decomp = final_R_t
 
-                # v-projection mode (use_v_projection_for_decomposition):
-                # replace alpha*R with a V_t projection onto sum-to-R:
-                #   per_turn_t = (V_t_clamped - (sum V_t_clamped - R)/T_active) * mask
-                # sum_t per_turn = R; per_turn may be negative or exceed R.
-                # alpha is still computed (drives diagnostics + R-pred loss).
+                # v-projection: replace alpha*R with a V_t projection onto
+                # sum-to-R (per_turn may be negative or exceed R; alpha still
+                # drives diagnostics + R-pred loss).
                 if (
                     self.cfg.use_v_projection_for_decomposition
                     and grad_out.get("value_per_turn") is not None
@@ -737,18 +672,14 @@ class HGPOTrainer:
                 cons_loss_t = consistency_loss_tensor(
                     self.cfg.lambda_consistency, traj_adv_t, turn_adv_t, attn_t
                 )
-                # v6: use the V-head as a per-turn PPO baseline. When the
-                # TurnRD model exposes value_per_turn, replace the normalized
-                # turn_adv with an actor-critic baseline:
+                # v6: use the V-head as a per-turn PPO baseline when exposed:
                 #   A_t = alpha_t * R[i] - V_theta(h_t^i)
-                # value is detached before going into `combined` (V is trained
-                # by the standalone trainer, not policy backprop). Only
-                # mask=1 entries are overridden.
+                # value is detached before going into combined (V trained
+                # separately); only mask=1 entries are overridden.
                 value_per_turn = grad_out.get("value_per_turn")
                 if value_per_turn is not None and value_per_turn.shape == per_turn_rewards.shape:
-                    # Per-position normalize the V-baseline before inserting
-                    # into combined: raw (alpha*R - V) is ~0.03 while traj_adv
-                    # is ~1.0, so unnormalized V would be effectively ignored.
+                    # Normalize the V-baseline before combining: raw (alpha*R - V)
+                    # ~0.03 vs traj_adv ~1.0 would otherwise be ignored.
                     v6_unnorm = (per_turn_rewards - value_per_turn) * mask_f
                     # Per-position group statistics, mask-aware (matches
                     # the existing turn_adv normalization path).
@@ -770,10 +701,8 @@ class HGPOTrainer:
                         1.0,
                         max(0.0, float(self.cfg.v_baseline_round_idx) / warmup),
                     )
-                    # Only override when beta_v > 0: at beta=0 keep combined's
-                    # original eval-mode values (falling through would swap in
-                    # the dropout-perturbed train-mode advantages from
-                    # decompose_with_grad). Review M1.
+                    # Only override when beta_v > 0; at beta=0 keep combined's
+                    # eval-mode values (avoid the train-mode advantages). M1.
                     if beta_v > 0.0:
                         if beta_v >= 1.0:
                             v6_blended = v6_turn_adv  # full V baseline
@@ -826,9 +755,8 @@ class HGPOTrainer:
                     _alpha_corr_sum / _alpha_corr_n if _alpha_corr_n > 0 else 0.0
                 )
 
-        # Populate alpha diagnostics from the eval-mode decomposition when
-        # the gradient-tracking path is skipped by lambda_consistency == 0.
-        # Only run when the gated block did not already populate them.
+        # Populate alpha diagnostics from the eval-mode decomposition when the
+        # grad path was skipped (lambda_consistency == 0) and not already set.
         if (
             self._decomposer_learnable
             and _alpha_mean == 0.0
@@ -941,8 +869,6 @@ class HGPOTrainer:
         else:
             total = policy_loss + kl_term
 
-        # `traj_adv` and `flat_turn_adv` were hoisted to the top of
-        # compute_loss. They are still used here for stats only.
         stats = TrainStepStats(
             policy_loss=float(policy_loss.detach().item()),
             kl_term=float(kl_term.detach().item()),
@@ -970,26 +896,18 @@ class HGPOTrainer:
         return total, stats
 
     def train_step(self, group: TrajectoryGroup) -> TrainStepStats:
-        """One AdamW step on a single TrajectoryGroup.
+        """One AdamW step on a TrajectoryGroup.
 
-        Honors cfg.grad_accum_steps (loss divided by it; optimizer.step() only
-        every Nth call). n_action_tokens == 0 short-circuits to a no-op.
-
-        Order per call: optional in-place TurnRD checkpoint refresh ->
-        _ensure_optimizer() -> compute_loss() builds
-        L = L_PPO + beta*KL + lambda*L_cons -> (loss/accum).backward() ->
-        at each grad-accum boundary, clip + step + zero_grad for the LoRA and
-        (if learnable) the TurnRD optimizer -> KL controller update (frozen
-        during warmup).
-
-        self._step increments every call. Updated LoRA tensors are synced to
-        vLLM by weight_sync.py and become pi_theta_old for the next rollout.
+        Honors cfg.grad_accum_steps (step() every Nth call); n_action_tokens==0
+        is a no-op. Per call: optional TurnRD refresh -> compute_loss ->
+        (loss/accum).backward() -> clip+step+zero_grad at each boundary -> KL
+        controller update (frozen during warmup). Updated LoRA is later synced
+        to vLLM.
         """
         import torch  # type: ignore[import-not-found]
 
-        # Refresh the TurnRD checkpoint at the configured cadence, before any
-        # optimizer is built (it may swap the decomposer's model). Skipped at
-        # step 0.
+        # Refresh the TurnRD checkpoint at cadence, before the optimizer is built
+        # (it may swap the decomposer's model). Skipped at step 0.
         if (
             self._refresh_fn is not None
             and self.cfg.refresh_every_episodes > 0
@@ -1003,11 +921,9 @@ class HGPOTrainer:
 
         loss, stats = self.compute_loss(group)
         if stats.dead_K_group:
-            # Zero policy gradient by construction; compute_loss already
-            # short-circuited, so skip backward + optimizer step. Don't feed
-            # the controller observed_kl=0 either (a run of dead groups would
-            # collapse kl_coef to min_coef); leave it untouched. _step still
-            # advances so refresh + warmup counts stay aligned.
+            # Zero policy gradient; skip backward + step. Don't feed the
+            # controller observed_kl=0 (a dead-group run would collapse
+            # kl_coef); _step still advances to keep cadence aligned.
             stats.kl_coef = self.kl_controller.coef
             self._step += 1
             return stats
@@ -1024,8 +940,7 @@ class HGPOTrainer:
         self._pending_backwards += 1
 
         # Step once we've accumulated `accum` backward contributions. Keying
-        # off _pending_backwards (not _step) keeps dead-K early returns from
-        # misaligning the boundary parity.
+        # off _pending_backwards (not _step) keeps dead-K skips from misaligning it.
         is_step_boundary = self._pending_backwards >= accum
         if is_step_boundary:
             grad_norm = torch.nn.utils.clip_grad_norm_(

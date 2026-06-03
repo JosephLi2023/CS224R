@@ -61,11 +61,10 @@ def system_prompt() -> str:
 
 
 def normalize_scores(raw_scores: list[float], final_reward: float) -> list[float]:
-    """Rescale `raw_scores` so they sum to `final_reward` (sum invariant).
+    """Rescale `raw_scores` to sum to `final_reward`.
 
-    Edge cases:
-    - All-zero raw scores: distribute final_reward uniformly.
-    - Sum is non-zero: scale by `final_reward / sum(raw_scores)`.
+    All-zero scores distribute `final_reward` uniformly; otherwise scores are
+    scaled by `final_reward / sum(raw_scores)`.
     """
     if not raw_scores:
         return []

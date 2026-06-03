@@ -1,43 +1,8 @@
 #!/usr/bin/env bash
 # AlfWorld goal-conditioned (FiLM-only) 5-round smoke test.
-#
-# Single-variable A/B vs v3 SOTA after the per-turn-supervision removal
-# (plan remove_per_turn_goal_supervision). Toggles three knobs on top of
-# the v3 recipe:
-#   - turnrd.emit_goal_text=true        (producer writes goal_text on every record)
-#   - turnrd.emit_goal_emb=true         (producer writes [input_dim] goal_emb)
-#   - turnrd.goal_conditioned_value_head=true
-#       (TurnRDv2 builds the FiLM gamma/beta projector layers; both alpha
-#        and v_t are FiLM-modulated by goal_emb)
-# Everything else (progress_prior_strength=1.0, lambda_progress=0.01,
-# recency_decay_half_life=4.0, rank=32 MLP+attn LoRA, seed=31, eps=80,
-# T=1.0) matches v3 SOTA. No per-turn supervision - goal_match_blend /
-# goal_shaping_coef / goal_match_signal are removed from the codebase.
-#
-# FiLM-only (not bundled with shaping): the previous goalcond seed31 run
-# bundled FiLM + shaping (coef=0.1); the cause of its regression was
-# shaping-induced reward inflation, not FiLM. See reports/ablations/README.md.
-#
-# Geometry (seed=31, rounds=5, eps=80):
-#   base_task_id_offset = 31 * 5 * 80 = 12400
-#   train task range    = [12400, 12800)   (disjoint from v3's [24800, 25600))
-#   per-round slice     = 80 task IDs starting at base + round * 80
-#   eval task range     = [6500, 6600)     (same pool as v3 - eval is comparable)
-#
-# ~3-4 hours wall-clock. Half of a v3 run (half the rounds).
-# Parallel-safe vs the in-flight v3 orchestrators - different RUN_PREFIX,
-# cache dir, and PIDFILE.
-#
-# Sanity checks (smoke-level):
-# 1. R0 train_turnrd manifest must contain a turnrd block (no
-#    goal_aware_supervision key). Train log should show the FiLM forward
-#    path activating (goal_conditioned_value_head=True; per-row
-#    goal_emb_mask present in batch).
-# 2. R0 eval pct_success >= 0.58.
-# 3. R0..R4 train mean_reward stays in the env-reward range (~0.5-0.7), NOT
-#    inflated to ~1.0 like the prior shaped run.
-# 4. By R4, eval pct_success should match or exceed v3's R4 (~0.70).
-#    R4 below 0.65 = FiLM didn't help on this slice.
+# A/B vs v3 SOTA with goal_conditioned_value_head + emit_goal_text/emit_goal_emb
+# enabled and no per-turn supervision. seed=31, eps=80, rounds=5.
+# Override via env vars: SFT_ADAPTER (required), CONFIG, RUN_PREFIX, ROUNDS, etc.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."

@@ -8,10 +8,8 @@ from typing import Any
 def _extract_expert_plan(info: Any) -> list[str]:
     """Pull the next-action list from the env info dict.
 
-    Checks `extra.expert_plan` then `expert_plan`, returning the first
-    non-empty list as list[str], or [] when no plan is available (off-plan
-    turn, terminal state, or fork that doesn't expose the expert). Kept in
-    sync with infra/app_alfworld_sft_gen.py::_extract_expert_plan.
+    Checks `extra.expert_plan` then `expert_plan`; returns the first
+    non-empty list as list[str], or [] when no plan is available.
     """
     if not isinstance(info, dict):
         return []
@@ -31,20 +29,16 @@ def _extract_facts_set(info: Any) -> set[str]:
     """Pull the per-step PDDL fact base from info["facts"] as a set of
     stringified propositions for diff-friendly comparison.
 
-    TextWorld exposes the ground-truth PDDL facts as a
-    list[textworld.Proposition]; diffing the per-step set gives a per-turn
-    fluent-flip signal for V-head supervision. We canonicalize via repr()
-    rather than hash() since Proposition is not hashable in some textworld
-    releases. Tolerates the per-batch list-of-lists wrapping. Returns the
-    empty set when facts are missing, non-list, or empty.
+    Canonicalizes via repr() since Proposition isn't always hashable, and
+    tolerates the per-batch list wrapping. Returns the empty set when facts
+    are missing or empty.
     """
     if not isinstance(info, dict):
         return set()
     facts = info.get("facts")
     if not isinstance(facts, (list, tuple)) or not facts:
         return set()
-    # Per-batch wrap: outer list whose only element is the inner list of
-    # propositions. Peel it.
+    # Peel the per-batch wrap (outer list holding the inner facts list).
     first = facts[0]
     if isinstance(first, (list, tuple)):
         facts = first
@@ -63,24 +57,11 @@ class ALFWorldState:
 
 
 class ALFWorldAdapter:
-    """ALFWorld environment adapter with normalized state/action wiring.
+    """ALFWorld adapter normalizing common ALFWorld API shapes.
 
-    Accepts several common ALFWorld API shapes and normalizes outputs.
-
-    Construction:
-        - observation_mode: forwarded to the upstream env constructor when
-          accepted. Default "text" matches the ReAct-style prompt format.
-        - task_split: AlfredTWEnv takes the split at construction time, not
-          at reset() time. Injected into env_kwargs under the upstream's
-          canonical `train_eval` key when the caller hasn't set one; an
-          explicit env_kwargs.train_eval wins.
-
-    Reset semantics:
-        - reset(task_id=N): maps N deterministically to game-file index
-          N % len(game_files) and points the env at it before env.reset(),
-          preserving H-GRPO's K-trajectories-per-task invariant.
-        - task_id None or no game-files list: falls back to bare
-          env.reset() (random game from the upstream's pointer).
+    task_split is injected into env_kwargs as the upstream `train_eval` key
+    at construction. reset(task_id=N) maps N to game-file index
+    N % len(game_files) for deterministic selection, else bare env.reset().
     """
 
     def __init__(
@@ -95,19 +76,15 @@ class ALFWorldAdapter:
         self.max_steps = max_steps
         self.observation_mode = observation_mode
         self.task_split = task_split
-        # Inject task_split as the upstream `train_eval` kwarg when the
-        # caller hasn't already set one. Construct a fresh dict so we
-        # don't mutate the caller's input.
+        # Inject task_split as train_eval without mutating the caller's dict.
         merged_kwargs: dict[str, Any] = dict(env_kwargs or {})
         merged_kwargs.setdefault("train_eval", task_split)
         self.env_kwargs = merged_kwargs
 
-        # Prefer TextWorld's native info["intermediate_reward"] (per-step
-        # PDDL-fluent flips) over the synthesized expert-plan-length delta
-        # as the V-head signal. Default False preserves prior behavior.
+        # Prefer TextWorld's native intermediate_reward over the
+        # expert-plan-length delta. Default False preserves prior behavior.
         self._use_tw_intermediate_reward: bool = bool(use_textworld_intermediate_reward)
-        # Set True in _wrap_batch_env only when EnvInfos registration
-        # succeeds; otherwise stays False -> step() uses the fallback.
+        # True only when EnvInfos registration succeeds (set in _wrap_batch_env).
         self._tw_registration_succeeded: bool = False
         # Fail fast at construction if opt-in is on but textworld is missing.
         if self._use_tw_intermediate_reward and self._build_request_infos() is None:
@@ -118,34 +95,25 @@ class ALFWorldAdapter:
 
         self._steps = 0
         self._last_state: ALFWorldState | None = None
-        # Records the most recent task_id-derived game index so callers
-        # (and tests) can verify deterministic selection.
+        # Most recent task_id-derived game index, for determinism checks.
         self._last_task_idx: int | None = None
-        # Per-turn expert-plan length carried across step() calls to
-        # compute the dense progress signal delta = max(0, prev - curr),
-        # stashed on info["intermediate_reward"]. None -> no plan -> delta 0.
+        # Prev expert-plan length for the dense delta = max(0, prev - curr).
         self._prev_plan_len: int | None = None
-        # PDDL-facts-diff opt-in. When True, step() computes the per-turn
-        # fact-set diff and prefers it over the plan-length delta;
-        # TextWorld upstream still wins when both are on. Default False.
+        # PDDL-facts-diff opt-in: prefer the fact-set diff over the
+        # plan-length delta (TextWorld still wins). Default False.
         self._use_facts_diff_ir: bool = bool(use_facts_diff_intermediate_reward)
-        # Previous step's PDDL fact set (stringified propositions). Reset
-        # each reset(). None when opt-in is off or no facts exposed.
+        # Prev step's PDDL fact set. None when opt-in off or no facts.
         self._prev_facts_set: set[str] | None = None
-        # Whether _env is TextWorld's batched gym wrapper (set in
-        # _wrap_batch_env). Test fakes skip the wrap, keeping this False.
+        # Whether _env is TextWorld's batched wrapper (set in _wrap_batch_env).
         self._is_batched: bool = False
         self._env = self._build_alfworld_env()
 
     def _build_alfworld_env(self):
         import_error: Exception | None = None
 
-        # AlfredTWEnv is the meta-env and does not expose .reset()/.step()
-        # directly; .init_env(batch_size=1) returns a gym-style BatchEnv.
-
-        # Canonical ALFWorld text env path. Forward observation_mode when
-        # the constructor accepts it; fall back to kwargs-only for forks
-        # that don't take it.
+        # AlfredTWEnv is the meta-env; .init_env(batch_size=1) gives a
+        # gym-style BatchEnv. Forward observation_mode when accepted; fall
+        # back to kwargs-only.
         try:
             from importlib import import_module
 
@@ -189,14 +157,11 @@ class ALFWorldAdapter:
         )
 
     def _build_request_infos(self) -> Any | None:
-        """Build a TextWorld EnvInfos registration object, or None if unavailable.
+        """Build a TextWorld EnvInfos opting into native intermediate_reward,
+        or None if textworld isn't importable.
 
-        Opts in to TextWorld's native per-step info["intermediate_reward"]
-        at meta-env init time (AlfWorld won't populate it by default).
-        extras=["expert_plan"] whitelists the fallback key so it survives
-        registration; won/admissible_commands preserve other
-        downstream-relied-on keys. Returns None when textworld isn't
-        importable so callers can raise loudly or no-op.
+        extras=["expert_plan"] and won/admissible_commands preserve keys that
+        registration would otherwise strip.
         """
         try:
             from textworld import EnvInfos  # type: ignore[import-not-found]
@@ -210,21 +175,13 @@ class ALFWorldAdapter:
         )
 
     def _wrap_batch_env(self, meta: Any) -> Any:
-        """Convert AlfWorld's AlfredTWEnv meta-env into a gym-style env.
+        """Convert AlfWorld's AlfredTWEnv meta-env into a gym-style env via
+        .init_env(batch_size=1), stashing the meta as _alfred_meta and
+        setting self._is_batched. Returns a gym-shaped env directly if
+        .reset exists.
 
-        The meta-env's .init_env(batch_size=1) returns a gym-style BatchEnv.
-        Some forks return a gym-shaped env directly, so we only call
-        init_env(...) when .reset is missing. Stashes the meta-env as
-        _alfred_meta (for _select_task's game_files) and sets
-        self._is_batched = True so _normalize_* helpers unwrap the
-        per-batch shape.
-
-        EnvInfos registration (when _use_tw_intermediate_reward) uses a
-        3-tier fallback since forks differ on the request_infos kwarg:
-          - Tier 1: init_env(batch_size=1, request_infos=env_infos).
-          - Tier 2: set meta.request_infos, then bare init_env(batch_size=1).
-          - Tier 3: bare init_env + warn; _tw_registration_succeeded stays
-            False so step() uses the fallback.
+        EnvInfos registration (when opted in) tries init_env(request_infos=...),
+        then meta.request_infos + init_env, then bare init_env with a warning.
         """
         # Already a gym-style env? Skip the wrap (some test fakes do this).
         if hasattr(meta, "reset") and hasattr(meta, "step"):
@@ -244,9 +201,7 @@ class ALFWorldAdapter:
                 wrapped = meta.init_env(batch_size=1, request_infos=env_infos)
                 self._tw_registration_succeeded = True
             except TypeError:
-                # Fallback: set request_infos as an attribute, then call init_env.
-                # AttributeError means this fallback is unsupported; init-time
-                # failures are handled by the final fallback below.
+                # Tier 2: set request_infos as an attribute, then init_env.
                 tier2_ok = False
                 try:
                     setattr(meta, "request_infos", env_infos)
@@ -258,12 +213,10 @@ class ALFWorldAdapter:
                         self._tw_registration_succeeded = True
                         tier2_ok = True
                     except Exception:
-                        # init_env failed even after setattr succeeded;
-                        # fall through to Tier 3 rather than propagating.
+                        # init_env failed after setattr; fall through to Tier 3.
                         pass
                 if not tier2_ok:
-                    # Tier 3: silent-fallback. Warn loudly so smoke logs
-                    # surface the regression.
+                    # Tier 3: bare init; warn so smoke logs surface it.
                     warnings.warn(
                         "ALFWorld meta-env accepts neither `init_env(request_infos=...)` "
                         "nor `meta.request_infos = ...`; falling back to bare init. "
@@ -280,8 +233,7 @@ class ALFWorldAdapter:
             wrapped = meta.init_env(batch_size=1)
             self._tw_registration_succeeded = False
         self._is_batched = True
-        # Surface the meta-env's `game_files` for `_select_task`'s
-        # determinism check (the BatchEnv wrapper hides them).
+        # Expose game_files for _select_task (the wrapper hides them).
         if not hasattr(wrapped, "game_files") and hasattr(meta, "game_files"):
             try:
                 setattr(wrapped, "game_files", meta.game_files)
@@ -325,9 +277,7 @@ class ALFWorldAdapter:
     def _normalize_reset(self, reset_out: Any) -> tuple[Any, dict[str, Any]]:
         """Normalize reset output across legacy and batched API shapes.
 
-        TextWorld's batch env returns (obs_list, info_dict_with_list_values);
-        we unwrap for batch_size=1 so downstream sees scalar obs + flat info.
-        Only fires when self._is_batched; raw shape passes through otherwise.
+        Unwraps the batch_size=1 list shape when self._is_batched.
         """
         if isinstance(reset_out, tuple):
             if len(reset_out) == 2 and isinstance(reset_out[1], dict):
@@ -345,13 +295,10 @@ class ALFWorldAdapter:
         return reset_out, {}
 
     def _normalize_step(self, step_out: Any) -> tuple[Any, float, bool, dict[str, Any]]:
-        """Normalize the step output across legacy/gymnasium/batched API shapes.
+        """Normalize step output across legacy/gymnasium/batched API shapes.
 
-        TextWorld's batch env emits per-field lists of length batch_size; we
-        unwrap for batch_size=1 so downstream sees scalar reward/done and a
-        flat info dict. Only fires when self._is_batched.
+        Unwraps the batch_size=1 per-field lists when self._is_batched.
         """
-        # Handle legacy and gymnasium-like variants.
         if isinstance(step_out, tuple):
             if len(step_out) == 4:
                 obs, reward, done, info = step_out
@@ -379,12 +326,9 @@ class ALFWorldAdapter:
     ) -> tuple[Any, Any, Any, Any]:
         """Unwrap batch-size-1 returns from TextWorld's batched API.
 
-        - obs = [str] -> str
-        - reward = [float] -> float
-        - done = [bool] -> bool
-        - info = {k: [v]} -> {k: v}, but only when the value is a length-1
-          list/tuple whose element is itself a list/tuple/dict (the
-          TextWorld batch shape). Plain scalar info values pass through.
+        obs/reward/done are unwrapped from length-1 lists. info values are
+        unwrapped only when a length-1 list/tuple wraps a list/tuple/dict;
+        plain scalars pass through.
         """
         if isinstance(obs, (list, tuple)) and obs:
             obs = obs[0]
@@ -440,11 +384,9 @@ class ALFWorldAdapter:
         return valid_actions[action]
 
     def _game_files(self) -> list[Any]:
-        """Return the underlying env's game-files list, if exposed.
+        """Return the env's game-files list (game_files/task_files), or [].
 
-        ALFWorld's `AlfredTWEnv` typically holds the loaded TextWorld game
-        file paths under `game_files` (or `task_files` in some forks). This
-        is the source of truth for deterministic task selection.
+        Source of truth for deterministic task selection.
         """
         for attr in ("game_files", "task_files", "_game_files"):
             candidates = getattr(self._env, attr, None)
@@ -453,12 +395,8 @@ class ALFWorldAdapter:
         return []
 
     def _select_task(self, task_id: int) -> int:
-        """Map task_id -> deterministic game index, then point env at it.
-
-        Returns task_id % len(game_files) when the list is discoverable,
-        else task_id verbatim. Forks expose the game pointer under
-        different attr names; we try the common ones.
-        """
+        """Map task_id -> game index (task_id % len(game_files), else task_id)
+        and point the env at it via the first matching pointer attr."""
         game_files = self._game_files()
         idx = int(task_id) % len(game_files) if game_files else int(task_id)
         for attr in (
@@ -485,14 +423,11 @@ class ALFWorldAdapter:
         except TypeError:
             raw_obs, raw_info = self._normalize_reset(self._env.reset())
 
-        # Prime the expert-plan-length tracker for the dense signal in
-        # step(). No expert_plan -> tracker None -> step() yields delta 0.
+        # Prime the expert-plan-length tracker; None -> step() yields delta 0.
         initial_plan = _extract_expert_plan(raw_info)
         self._prev_plan_len = len(initial_plan) if initial_plan else None
 
-        # Prime the per-step PDDL fact set. None when opt-in is off or no
-        # facts exposed, so step() yields delta 0 instead of rewarding
-        # "everything new" on the first step.
+        # Prime the PDDL fact set; None -> step() yields delta 0 on step 1.
         if self._use_facts_diff_ir:
             initial_facts = _extract_facts_set(raw_info)
             self._prev_facts_set = initial_facts if initial_facts else None
@@ -505,10 +440,8 @@ class ALFWorldAdapter:
 
     def step(self, action: str | int) -> tuple[ALFWorldState, float, bool, dict[str, Any]]:
         action_cmd = self._resolve_action(action)
-        # TextWorld's batch env (the AlfredTWEnv.init_env(batch_size=1)
-        # wrapper) expects a LIST of commands of length=batch_size. With
-        # batch_size=1 we send a single-element list; `_normalize_step`
-        # unwraps the per-field batch lists on the way back.
+        # The batch env expects a length-1 command list; _normalize_step
+        # unwraps the per-field batch lists on return.
         if hasattr(self._env, "_alfred_meta"):
             step_arg: Any = [action_cmd]
         else:
@@ -516,8 +449,7 @@ class ALFWorldAdapter:
         try:
             raw_step_out = self._env.step(step_arg)
         except (AssertionError, TypeError):
-            # Defensive: if the env actually wants a scalar (e.g. test
-            # fakes), retry without the wrap.
+            # Defensive: retry with a scalar if the env wants one.
             raw_step_out = self._env.step(action_cmd)
         raw_obs, reward, done, info = self._normalize_step(raw_step_out)
 
@@ -528,28 +460,17 @@ class ALFWorldAdapter:
         info["timeout"] = timeout
         info["resolved_action"] = action_cmd
 
-        # Dense progress shaping signal, reconciled from two sources:
-        #   1. (preferred) TextWorld's native info["intermediate_reward"]:
-        #      newly-satisfied PDDL fluents minus reverted ones per step.
-        #   2. (fallback) per-turn reduction in the handcoded expert's
-        #      remaining-plan length.
-        # Written to info["intermediate_reward"] (never overwrites
-        # raw_env_reward); the chosen source is recorded under
-        # info["intermediate_reward_source"]. Always recompute and update
-        # _prev_plan_len so the fallback stays warm.
-        #
-        # Edge cases (fallback path):
-        #   - Plan missing/empty mid-trajectory -> curr_plan_len 0, emit 0;
-        #     the max(0, .) clamp also prevents negative shaping on re-plan.
-        #   - _prev_plan_len never primed -> fall back to curr_plan_len so
-        #     delta 0 instead of rewarding the first step.
-        # Capture upstream BEFORE we overwrite the key with the fallback.
+        # Dense progress signal -> info["intermediate_reward"] (source in
+        # info["intermediate_reward_source"]):
+        #   1. (preferred) TextWorld's native intermediate_reward.
+        #   2. (fallback) per-turn drop in the expert's remaining-plan length.
+        # Always update _prev_plan_len so the fallback stays warm. Missing
+        # plan or unprimed prev -> delta 0; max(0, .) avoids negative shaping.
+        # Capture upstream BEFORE overwriting the key with the fallback.
         upstream_ir: Any = info.get("intermediate_reward") if (
             self._use_tw_intermediate_reward and self._tw_registration_succeeded
         ) else None
-        # In the batched path, scalar info values arrive wrapped as
-        # length-1 lists (e.g. [3]); _unbatch_info leaves these unchanged,
-        # so peel the per-batch wrapping here for the type-check below.
+        # Peel the length-1 batch wrapping (e.g. [3]) for the type-check below.
         if isinstance(upstream_ir, (list, tuple)) and len(upstream_ir) == 1:
             upstream_ir = upstream_ir[0]
         curr_plan = _extract_expert_plan(info)
@@ -559,10 +480,8 @@ class ALFWorldAdapter:
         )
         fallback_delta = float(max(0, prev_plan_len - curr_plan_len))
 
-        # PDDL-facts diff: net delta = max(0, len(new) - len(removed)) so
-        # satisfying one fluent while reverting another scores 0. Only
-        # fires when opt-in is on, prev set was primed, and curr set is
-        # non-empty; otherwise stays None.
+        # PDDL-facts diff: max(0, len(new) - len(removed)). Only fires when
+        # opt-in is on, prev set primed, and curr set non-empty.
         facts_delta: float | None = None
         curr_facts_set: set[str] | None = None
         if self._use_facts_diff_ir:
@@ -571,15 +490,12 @@ class ALFWorldAdapter:
                 new_facts = curr_facts_set - self._prev_facts_set
                 removed_facts = self._prev_facts_set - curr_facts_set
                 facts_delta = float(max(0, len(new_facts) - len(removed_facts)))
-            # Always update tracker so it stays warm even if this step
-            # didn't emit (e.g. first step after reset). Use the curr
-            # set even when empty so a subsequent populated step
-            # doesn't spuriously diff against a stale fact base.
+            # Always update the tracker (use curr when non-empty) so it stays
+            # warm without diffing against a stale base.
             self._prev_facts_set = curr_facts_set if curr_facts_set else self._prev_facts_set
 
         if upstream_ir is not None and isinstance(upstream_ir, (int, float)) and not isinstance(upstream_ir, bool):
-            # max(0, .) clamp keeps shaping non-negative; TextWorld's
-            # intermediate_reward can be negative when fluents are reverted.
+            # Clamp to non-negative; TextWorld's IR can go negative on reverts.
             info["intermediate_reward"] = max(0.0, float(upstream_ir))
             info["intermediate_reward_source"] = "textworld"
         elif facts_delta is not None:

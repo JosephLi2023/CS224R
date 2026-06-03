@@ -44,9 +44,8 @@ class TurnScore:
 class JudgeBackend(Protocol):
     """Common interface for all judge implementations.
 
-    Implementations are responsible only for producing raw per-turn scores;
-    normalization to `sum_t r_t = R` is handled in `src.judge.prompts.normalize_scores`
-    by callers, so backends remain stateless and easy to swap.
+    Backends produce raw per-turn scores; normalization to the sum invariant
+    is handled by callers, so backends stay stateless and swappable.
     """
 
     model_tag: str  # short identifier baked into cache keys, e.g. "gpt-4o-mini" or "qwen2.5-7b-instruct"
@@ -54,9 +53,8 @@ class JudgeBackend(Protocol):
     def score_turns(self, request: JudgeRequest) -> list[TurnScore]:
         """Return a list[TurnScore] aligned with `request.turns`.
 
-        Must produce exactly `len(request.turns)` entries with `turn_idx`
-        matching the input ordering. Implementations should raise on parse
-        failure rather than silently returning zeros.
+        Must produce exactly `len(request.turns)` entries; raise on parse
+        failure rather than returning zeros.
         """
         ...
 
@@ -66,18 +64,7 @@ class JudgeBackend(Protocol):
 
 
 def build_judge(cfg: dict[str, Any]) -> JudgeBackend:
-    """Factory: instantiate the backend named in `cfg["judge"]["backend"]`.
-
-    Expected config shape:
-      {
-        "judge": {
-          "backend": "openai" | "vllm",
-          "openai": { "model": "gpt-4o-mini", "max_retries": 3, ... },
-          "vllm":   { "endpoint": "https://...modal.run/score_turns", "model": "qwen2.5-7b-instruct", ... },
-          "cache":  { "path": "/vol/cache/judge.sqlite" }
-        }
-      }
-    """
+    """Instantiate the backend named in `cfg["judge"]["backend"]` ("openai" or "vllm")."""
     backend = str(cfg["judge"]["backend"]).lower()
     if backend == "openai":
         from src.judge.openai_backend import OpenAIJudge

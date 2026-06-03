@@ -17,14 +17,8 @@ if TYPE_CHECKING:
 
 
 class LoRAMergeNonFiniteError(RuntimeError):
-    """Raised by `iter_merged_weights` when a merged LoRA weight contains
-    non-finite entries (inf/NaN).
-
-    This subclass lets callers distinguish invalid merged weights from
-    transient per-episode environment failures. A partial vLLM
-    `load_weights` can leave the runtime policy inconsistent across
-    layers, so callers should fail the round rather than continue with a
-    partially updated model.
+    """Raised by `iter_merged_weights` when a merged LoRA weight is non-finite
+    (inf/NaN), so callers can fail the round instead of syncing a bad model.
     """
 
 
@@ -38,23 +32,18 @@ class LoRAPolicyConfig:
     lora_target_modules: list[str] = field(
         default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj"]
     )
-    # device_map="auto" pushes everything onto a single GPU when only one is visible;
-    # explicit "cuda:0" works too if you want to be explicit.
+    # Single visible GPU; "cuda:0" or "auto" both work.
     device_map: str = "cuda:0"
-    # Where HF caches downloaded weights. Setting this to a Modal Volume path
-    # avoids re-downloading on every container start.
+    # HF weight cache; a Modal Volume path avoids re-downloads.
     cache_dir: str | None = None
 
 
 class LoRAPolicy:
     """Wraps `transformers.AutoModelForCausalLM` + PEFT LoRA.
 
-    Public surface:
-      - `tokenizer` - HF tokenizer (PreTrainedTokenizer)
-      - `model`    - peft.PeftModel (the trainable wrapper)
-      - `parameters()` - yields trainable LoRA parameters (for AdamW)
-      - `merged_state_dict()` - non-destructive merge -> state-dict ready for vLLM
-      - `save_adapter(path)` / `load_adapter(path)` - PEFT-style adapter persistence
+    Exposes `tokenizer`, `model`, trainable-parameter accessors, merged-weight
+    export for vLLM (`merged_state_dict`/`iter_merged_weights`), and
+    `save_adapter`/`load_adapter`.
     """
 
     def __init__(self, cfg: LoRAPolicyConfig) -> None:
@@ -98,11 +87,9 @@ class LoRAPolicy:
         )
         self.model: PeftModel = get_peft_model(base, lora_cfg)
 
-        # Enable HF gradient checkpointing to free activations between
-        # forward and backward (trades ~30% compute for memory).
-        # use_reentrant=False is required for PEFT; the reentrant variant
-        # breaks LoRA gradient flow. enable_input_require_grads() ensures
-        # the recomputation chain reaches the LoRA params.
+        # Gradient checkpointing to save memory (~30% extra compute).
+        # use_reentrant=False is required for PEFT; enable_input_require_grads
+        # keeps the recomputation chain reaching the LoRA params.
         try:
             self.model.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False}
@@ -125,59 +112,44 @@ class LoRAPolicy:
         return sum(p.numel() for p in self.model.parameters())
 
     def merged_state_dict(self) -> dict[str, "torch.Tensor"]:
-        """Materialize all merged-LoRA weights as a single dict.
+        """Materialize all merged-LoRA weights as a dict.
 
-        Backward-compat wrapper around `iter_merged_weights()`. Prefer the
-        iterator form for vLLM weight sync - it streams one tensor at a
-        time and avoids holding the full base+LoRA state-dict in memory
-        simultaneously.
+        Prefer iter_merged_weights() for vLLM sync; it streams one tensor at
+        a time instead of holding the full state-dict in memory.
         """
         return dict(self.iter_merged_weights())
 
     def iter_merged_weights(self):
-        """Lazy generator yielding `(canonical_name, merged_tensor)` pairs.
+        """Lazily yield `(canonical_name, merged_tensor)` pairs.
 
-        For each PEFT-LoRA-wrapped Linear, computes the merged weight on
-        the fly as `base + (lora_B @ lora_A) * scaling` WITHOUT modifying
-        the live model and WITHOUT a full deepcopy. Each merged tensor
-        exists only briefly during `yield`; vLLM's `model.load_weights`
-        copies the data into its own buffer, then the tensor is freed
-        before the next iteration.
-
-        Per-layer transient peaks are bounded by ONE layer (not the sum),
-        since each layer's merge transients are released before the next.
+        For each LoRA-wrapped Linear, computes base + (lora_B @ lora_A) *
+        scaling on the fly without mutating the model or deepcopying. Peak
+        memory is bounded by one layer since transients free before the next.
         """
         import torch  # type: ignore[import-not-found]
 
         from src.policy.weight_sync import canonicalize_lora_target_name
 
-        # Map module-name -> PEFT LoRA layer (if any). PEFT wraps a Linear
-        # with a LoraLayer that holds .base_layer (the original weight) and
-        # .lora_A.<adapter>, .lora_B.<adapter>, plus .scaling[adapter].
+        # PEFT wraps each Linear in a LoraLayer holding .base_layer,
+        # .lora_A/.lora_B[adapter], and .scaling[adapter].
         adapter_name = "default"
 
-        # First pass: build a set of module names that ARE LoRA-wrapped, so
-        # we can skip their .base_layer.weight in the second pass and yield
-        # the merged version instead.
+        # First pass: collect LoRA-wrapped module names so we skip their
+        # .base_layer.weight below and yield the merged version instead.
         lora_module_names: set[str] = set()
         for name, module in self.model.named_modules():
             if hasattr(module, "lora_A") and hasattr(module, "lora_B") and hasattr(module, "base_layer"):
                 lora_module_names.add(name)
 
-        # Second pass: walk every parameter and decide what to yield.
-        # PEFT puts everything under "base_model.model." prefix; we strip
-        # that via canonicalize_lora_target_name.
+        # Second pass: yield each param, stripping the PEFT prefix.
         with torch.no_grad():
             for raw_name, param in self.model.named_parameters():
-                # Skip pure-LoRA params (lora_A/lora_B); they are merged
-                # into the base layer in the LoRA pass below.
+                # Skip pure-LoRA params; merged in the LoRA pass below.
                 if ".lora_A." in raw_name or ".lora_B." in raw_name:
                     continue
 
-                # Skip ANY .base_layer.weight whose parent module is LoRA-wrapped;
-                # we yield the merged version below instead.
-                # raw_name like 'base_model.model.<...>.q_proj.base_layer.weight'
-                # -> its parent module name is everything up to '.base_layer.<...>'
+                # Skip a LoRA-wrapped module's .base_layer.weight; the merged
+                # version is yielded in the LoRA pass below.
                 if ".base_layer." in raw_name:
                     parent = raw_name.split(".base_layer.")[0]
                     parent_short = parent[len("base_model.model.") :] if parent.startswith("base_model.model.") else parent
@@ -185,13 +157,10 @@ class LoRAPolicy:
                     if parent_full in {"base_model.model." + n for n in lora_module_names} or parent in lora_module_names:
                         continue
 
-                # Untouched param (norms, embed, lm_head, mlp not in target_modules):
-                # canonicalize the name and yield the param data directly (no copy).
+                # Untouched param: yield directly (no copy).
                 yield canonicalize_lora_target_name(raw_name), param.data
 
-            # LoRA pass: for each wrapped module, compute the merged weight
-            # and yield it. This is the only place where a transient tensor
-            # is materialized.
+            # LoRA pass: materialize and yield each merged weight.
             for mod_name in lora_module_names:
                 module = self.model.get_submodule(mod_name)
                 base_layer = module.base_layer
@@ -199,18 +168,13 @@ class LoRAPolicy:
                 lora_A = module.lora_A[adapter_name].weight  # [r, in]
                 lora_B = module.lora_B[adapter_name].weight  # [out, r]
                 scaling = float(module.scaling[adapter_name])
-                # Promote the matmul + add to fp32 before casting back to
-                # the base dtype (mirrors PEFT's get_delta_weight). Without
-                # this, rank-32 LoRA produces inf/NaN after ~10-20 RL steps
-                # because bf16 can't represent (B @ A) * scaling for large
-                # LoRA-B entries, which vLLM then silently copies.
+                # fp32-promote the matmul + add before downcasting (mirrors
+                # PEFT's get_delta_weight); bf16 otherwise overflows to
+                # inf/NaN for large LoRA-B entries after ~10-20 RL steps.
                 delta = (lora_B.to(torch.float32) @ lora_A.to(torch.float32)) * scaling
                 merged = (base_weight.to(torch.float32) + delta).to(base_weight.dtype)
-                # Finite-check at the true bug site (the LoRA layer), not
-                # at vLLM's async forward. Cheap (~1us on-GPU); will not
-                # fire post-fp32 promotion for well-behaved weights. If it
-                # DOES fire, the module name + abs-max value tells us
-                # exactly which layer blew up.
+                # Finite-check here (the true bug site); on failure the
+                # module name + abs-max pinpoints the blown-up layer.
                 if not torch.isfinite(merged).all():
                     raise LoRAMergeNonFiniteError(
                         f"iter_merged_weights: non-finite merged weight at "
@@ -218,23 +182,16 @@ class LoRAPolicy:
                         f"likely LoRA-B gradient explosion — tighten "
                         f"max_grad_norm or add per-tensor LoRA-B clip."
                     )
-                # `mod_name` from named_modules() already carries the full
-                # `base_model.model.<...>` PEFT prefix (since `self.model` IS
-                # the wrapped PeftModel). Don't double-prefix here.
+                # mod_name already carries the PEFT prefix; don't double-prefix.
                 full_name = f"{mod_name}.weight"
                 yield canonicalize_lora_target_name(full_name), merged
-                # `merged` and `delta` go out of scope here -> freed before
-                # next iteration.
 
     def save_adapter(self, path: str) -> None:
         """Save the LoRA adapter to `path`.
 
-        Save the LoRA adapter with a CUDA-safe fallback path. The standard
-        PEFT save path is attempted first. If CUDA reports an error during
-        that path, trainable LoRA tensors are copied to CPU one by one and
-        written directly with safetensors. If the CUDA context is already
-        invalid, the original error is re-raised rather than writing a
-        partial adapter directory.
+        Tries PEFT's save_pretrained first; on a CUDA error, copies trainable
+        tensors to CPU and writes them with safetensors. Re-raises if the CUDA
+        context is already invalid rather than writing a partial directory.
         """
         import torch  # local import: torch is heavy and only present in the runtime image
 
@@ -262,10 +219,8 @@ class LoRAPolicy:
         from safetensors.torch import save_file as _st_save_file
         os.makedirs(path, exist_ok=True)
 
-        # Collect LoRA + trainable params with explicit per-tensor moves.
-        # `.detach().clone().contiguous().cpu()` order matters: detach first
-        # (no grad fn), clone (independent storage so partial fault doesn't
-        # corrupt others), contiguous (safetensors requires it), .cpu() last.
+        # Per-tensor CPU copy; detach->clone->contiguous->cpu order matters
+        # (independent, contiguous storage that safetensors can write).
         cpu_state: dict[str, "torch.Tensor"] = {}
         for name, param in self.model.named_parameters():
             if param.requires_grad:  # LoRA-A, LoRA-B, modules_to_save
@@ -284,9 +239,7 @@ class LoRAPolicy:
         adapter_file = os.path.join(path, "adapter_model.safetensors")
         _st_save_file(cpu_state, adapter_file)
 
-        # Write adapter_config.json so peft.load_adapter() recognizes the
-        # directory as a local LoRA adapter. PEFT normally writes this via
-        # PeftConfig.save_pretrained; this path avoids additional CUDA use.
+        # Write adapter_config.json so load_adapter sees a local adapter.
         try:
             self.model.peft_config["default"].save_pretrained(path)
         except Exception as e:

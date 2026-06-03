@@ -1,11 +1,4 @@
-"""Modal app: install WebShop env + build BM25 search index into the Volume.
-
-Entrypoints:
-  modal run infra/app_webshop_install.py --action pip_install
-  modal run infra/app_webshop_install.py --action download_spacy
-  modal run infra/app_webshop_install.py --action build_index_1k
-  modal run infra/app_webshop_install.py --action reset_smoke
-"""
+"""Modal app: install WebShop env + build the BM25 search index into the Volume."""
 from __future__ import annotations
 
 import modal  # type: ignore[import-not-found]
@@ -24,10 +17,8 @@ WEBSHOP_RESOURCES_DIR = "/vol/data/webshop/resources_1k"
 
 @app.function(image=webshop_image, volumes={VOLUME_MOUNT: volume}, timeout=20 * 60)
 def pip_install_webshop() -> dict:
-    """Install the cloned WebShop repo as editable into a Volume-resident
-    user site so subsequent containers can `import web_agent_site` without
-    re-installing. `--no-deps` keeps WebShop's legacy pins out of the
-    modern stack."""
+    """Editable-install the WebShop repo into a Volume-resident user site
+    (`--no-deps` keeps its legacy pins out of the modern stack)."""
     import os, subprocess, sys
     os.makedirs(WEBSHOP_PYUSER, exist_ok=True)
     env = dict(os.environ)
@@ -55,11 +46,8 @@ def download_spacy_model() -> dict:
 
 @app.function(image=webshop_image, volumes={VOLUME_MOUNT: volume}, timeout=30 * 60)
 def build_index_1k() -> dict:
-    """Build the BM25 lucene index for the 1000-product dev split.
-
-    Uses items_shuffle_1000.json as DEFAULT_FILE_PATH by symlinking it as
-    items_shuffle.json in the data dir (WebShop's load_products() reads from
-    the canonical name). Output index lands at /vol/data/webshop/indexes_1k.
+    """Build the BM25 lucene index for the 1000-product dev split (symlinks the
+    1k file as the canonical name; output at /vol/data/webshop/indexes_1k).
     """
     import os, subprocess, sys, shutil
     env = dict(os.environ)
@@ -81,9 +69,7 @@ def build_index_1k() -> dict:
     repo_human = os.path.join(repo_data, "items_human_ins.json")
     if not os.path.lexists(repo_human):
         os.symlink(os.path.join(WEBSHOP_DATA_DIR, "items_human_ins.json"), repo_human)
-    # WebShop's DEFAULT_FILE_PATH directly references items_shuffle_1000.json
-    # under the small-data convention; mirror every JSON we have so that
-    # whichever default path the upstream picks at import time, it resolves.
+    # Mirror every JSON so whichever default path upstream picks resolves.
     for fname in os.listdir(WEBSHOP_DATA_DIR):
         if not fname.endswith(".json"):
             continue
@@ -181,12 +167,8 @@ def main(action: str = "pip_install") -> None:
 
 @app.function(image=webshop_image, volumes={VOLUME_MOUNT: volume}, timeout=120 * 60)
 def build_index_full() -> dict:
-    """Build the BM25 lucene index for the full 1.18M product split.
-
-    Symlinks `items_shuffle.json` (1.18M) + `items_ins_v2.json` as canonical
-    filenames in repo/data, runs convert_product_file_format.py + pyserini
-    indexing for `resources/` -> `indexes/`. Persists to
-    /vol/data/webshop/indexes_full.
+    """Build the BM25 lucene index for the full 1.18M product split
+    (persists to /vol/data/webshop/indexes_full).
     """
     import os, subprocess, sys, shutil
     env = dict(os.environ)
@@ -201,9 +183,7 @@ def build_index_full() -> dict:
     full_attrs = os.path.join(WEBSHOP_DATA_DIR, "items_ins_v2.json")
     repo_canonical = os.path.join(repo_data, "items_shuffle.json")
     repo_attrs = os.path.join(repo_data, "items_ins_v2.json")
-    # WebShop's DEFAULT_FILE_PATH hard-codes `items_shuffle_1000.json`, so we
-    # MUST also repoint that name (and the matching attrs name) to the full
-    # file when we want to index the full split.
+    # DEFAULT_FILE_PATH hard-codes the _1000 name, so repoint it to the full file.
     repo_canonical_1k = os.path.join(repo_data, "items_shuffle_1000.json")
     repo_attrs_1k = os.path.join(repo_data, "items_ins_v2_1000.json")
     for link, target in [

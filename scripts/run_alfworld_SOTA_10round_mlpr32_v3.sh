@@ -1,35 +1,7 @@
 #!/usr/bin/env bash
-# AlfWorld SOTA 10-round MLP-r32 - v3: clean buffer, seed=31, eps=80, T=0.7,
-# soft per-batch recency decay (half-life=4 rounds).
-#
-# Builds on the v2 experiment with two changes:
-#   1. rounds=10 (instead of 8) - more carry-policy iterations.
-#   2. turnrd.recency_decay_half_life=4.0 - soft per-batch loss weighting
-#      via 0.5^((max_round - round_idx) / 4). Stale rows are kept in the
-#      buffer but contribute less to the TurnRD value-head fit. See
-#      src/turnrd/train.py::train_turnrd.
-#
-# Decay schedule (half_life=4):
-#   round age | weight
-#   ----------+-------
-#       0     | 1.000
-#       2     | 0.707
-#       4     | 0.500
-#       8     | 0.250
-#      10     | 0.177
-#
-# Geometry (seed=31, rounds=10, eps=80):
-#   base_task_id_offset = 31 * 10 * 80 = 24800
-#   train task range    = [24800, 25600)
-#   per-round slice     = 80 task IDs starting at base + round * 80
-#   eval task range     = [6500, 6600)  (disjoint from training)
-#   disjoint from v1 (seed=11 -> [5280, 5760))
-#   disjoint from v2 (seed=23 -> [14720, 15360))
-#
-# ~6-8 hours wall-clock. Heavier than v2 (+2 rounds at 80 eps each).
-# Can run in parallel with v1/v2 - different prefix and cache dir.
-#
-# v3's decay is built in at the loss-scaling layer; no manual trim needed.
+# AlfWorld SOTA 10-round MLP-r32 - v3: seed=31, eps=80, soft per-batch recency
+# decay (half-life=4). Builds on v2; rounds=10 with carry-policy across rounds.
+# Override via env vars: SFT_ADAPTER (required), CONFIG, RUN_PREFIX, ROUNDS, etc.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

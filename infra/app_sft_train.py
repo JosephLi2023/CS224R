@@ -1,14 +1,8 @@
 """Modal A100 app: SFT warm-start of Qwen2.5-1.5B + LoRA on WebShop human trajectories.
 
-  modal run --detach infra/app_sft_train.py --epochs 3 --min-reward 0.5
-
-Tokenizes (prompt, action) SFT examples loaded via src.datasets.sft_webshop,
-runs masked cross-entropy (only action tokens contribute to the loss),
-saves the LoRA adapter to /vol/checkpoints/<run_name>_<ts>/. The adapter
-can then be loaded by infra/app_train_loop.py via
-LoRAPolicy.load_adapter(...) to seed GRPO with a non-trivial init.
-
-Cost: ~$0.50 for 3 epochs over ~745 examples on A100.
+Tokenizes (prompt, action) examples and runs masked cross-entropy (action
+tokens only), saving the LoRA adapter to /vol/checkpoints/<run_name>_<ts>/ for
+`app_train_loop.py` to load.
 """
 from __future__ import annotations
 
@@ -20,11 +14,8 @@ from infra.image import image
 app = modal.App("cs224r-hgpo-sft-train")
 
 
-# Legacy default data path. Directory of upstream WebShop gdown human
-# trajectories - consumed by `load_sft_examples_from_directory`. The
-# new oracle-gen single-JSONL path is
-# `/vol/data/webshop/oracle_trajs.jsonl`; dispatch happens on suffix
-# in the loader site below.
+# Legacy default: dir of upstream gdown human trajs. The loader below
+# dispatches on suffix (.jsonl -> oracle-gen single-file format).
 DEFAULT_SFT_DATA_PATH = "/vol/data/webshop/human_trajs"
 
 
@@ -64,12 +55,8 @@ def sft_train(
     ckpt_dir = f"/vol/checkpoints/{run_name}_{timestamp}"
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    # Dispatch loader on the data path's suffix. A single `.jsonl` file
-    # is the AlfWorld-style pre-rendered format produced by the new
-    # `infra/app_webshop_sft_gen.py` oracle generator; a directory is
-    # the legacy upstream-gdown human-trajs layout consumed by
-    # `load_sft_examples_from_directory`. Default keeps legacy behavior
-    # byte-identical when `--data-path` is not passed.
+    # Dispatch loader on suffix: `.jsonl` = oracle-gen single file, directory
+    # = legacy gdown human-trajs layout.
     print(">>> Loading SFT dataset (min_reward=", min_reward,
           ", data_path=", data_path, ")")
     if data_path.endswith(".jsonl"):
@@ -89,12 +76,8 @@ def sft_train(
             "successful trajectories. Try lowering --min-reward."
         )
 
-    # LoRA arch knobs propagated from CLI. Defaults preserve v1
-    # behavior (rank 16, attention-only). The 2:1 alpha:rank convention
-    # is kept in lockstep with `infra/app_sft_train_alfworld.py` so the
-    # two trainers stay binary-compatible against the same
-    # `LoRAPolicyConfig` dataclass defaults (16/32) and the
-    # `infra/app_train_loop.py` plumb-through.
+    # LoRA arch knobs from CLI (defaults: rank 16, attention-only).
+    # 2:1 alpha:rank matches the alfworld trainer + train_loop plumb-through.
     _targets = [t.strip() for t in lora_target_modules.split(",") if t.strip()]
     print(f">>> LoRA arch: rank={lora_rank} target_modules={_targets}")
     policy = LoRAPolicy(LoRAPolicyConfig(
@@ -110,9 +93,8 @@ def sft_train(
     n_truncated_prompts = 0
     for ex in examples:
         prompt_ids = tokenizer(ex.prompt, add_special_tokens=False).input_ids
-        # Target is the full ReAct emission ` <thought>\nAction: <body>` so
-        # the SFT model learns to produce Thought + Action together - the
-        # exact format the runtime ReAct loop expects.
+        # Target = full ReAct emission (Thought + Action), the format the
+        # runtime ReAct loop expects.
         target_str = synthesize_sft_target(ex.action) + tokenizer.eos_token
         action_ids = tokenizer(target_str, add_special_tokens=False).input_ids
         if len(prompt_ids) + len(action_ids) > max_seq_len:

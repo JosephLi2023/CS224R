@@ -1,16 +1,8 @@
 """Env-agnostic cloud-side orchestrator for the H-GRPO round-loop + SFT pipeline.
 
-Hosts three `@app.function` entrypoints that drive multi-stage pipelines from
-inside a Modal container (24h timeout) instead of a laptop-resident loop:
-  - orchestrate_rl_with_turnrd: per-round = train_loop_{env} + train_turnrd_run
-  - orchestrate_rl_no_turnrd:   per-round = train_loop_{env} only
-  - orchestrate_sft_pipeline:   install -> gen -> train -> eval
-
-Each dispatches heavy work to other deployed Modal apps via
-`modal.Function.from_name(...)` and writes per-stage/per-round "done" sentinels
-to the shared Volume so completed stages auto-resume on a preemption-restart.
-`env_name` ("alfworld" | "webshop") selects which `train_loop_{env_name}`
-function to look up at runtime, so the orchestrator is env-agnostic.
+Hosts three `@app.function` entrypoints (orchestrate_rl_with_turnrd,
+orchestrate_rl_no_turnrd, orchestrate_sft_pipeline) that dispatch work to other
+deployed Modal apps and write per-round/per-stage sentinels for auto-resume.
 """
 from __future__ import annotations
 
@@ -56,61 +48,9 @@ def orchestrate_rl_with_turnrd(
 ) -> dict:
     """Run a multi-round H-GRPO + TurnRDv2 loop cloud-side.
 
-    Per-round shape: (a) `train_loop_{env_name}` collects rollouts, runs
-    GRPO updates, writes the replay JSONL via the producer hook, then
-    saves the carry-policy adapter; (b) `train_turnrd_run` standalone-fits
-    the V-head on the replay buffer and saves the ckpt for the next
-    round's reference forward.
-
-    Carry-policy is hard-coded ON (the only mode SOTA recipes use); fork
-    if you ever need the reset-each-round mode.
-
-    `replay_path` and `ckpt_path` are NOT orchestrator args - they are
-    read from `cfg.turnrd.replay_buffer_path` and `cfg.turnrd.ckpt_path`
-    inside the JSON config. The reason: the producer hook inside
-    `train_loop_{env_name}` writes the replay JSONL using
-    `cfg.turnrd.replay_buffer_path` (NOT a kwarg). If the orchestrator
-    accepted these as independent args, a mismatch between args and
-    config would mean train_loop writes to one path while train_turnrd
-    looks at another - exactly the FileNotFoundError that bit the
-    first cloud-orchestrator run. Sourcing from the JSON config is the
-    single-source-of-truth fix.
-
-    Args:
-      config: path to the JSON config inside the container (typically
-        `/workspace/configs/<your_config>.json`).
-      sft_adapter: path to the SFT warm-start adapter on the volume.
-        Loaded at R0; rounds N>=1 carry the prior round's adapter.
-      env_name: "alfworld" | "webshop". Selects which
-        `train_loop_<env_name>` function to look up.
-      rounds: total round count (default 10).
-      start_round: round index to resume from. 0 = fresh run.
-      episodes_per_round: H-GRPO episodes per round (default 80).
-      eval_episodes: held-out eval pass per round (default 100).
-      eval_task_id_base: eval task-id starting offset (default 6500
-        - disjoint from training task ranges per the per-seed offset
-        math).
-      seed: protocol seed; drives the per-seed training task-id slice
-        `seed * rounds * episodes_per_round`.
-      turnrd_epochs: standalone TurnRD epochs per round (default 5).
-      turnrd_mode: 1 = R-prediction (the AlfWorld SOTA path).
-      turnrd_batch_size: standalone TurnRD batch size (default 16).
-      rollout_temperature: vLLM sampling T for K-trajectory rollouts.
-      run_name_prefix: per-round run name prefix; gets `_round{N:02d}`
-        and `_seed{S}` appended.
-      adapter_dir: directory under which carry-policy adapters are
-        written and read (default /vol/checkpoints).
-      gpu_mem_util: vLLM GPU memory fraction (default 0.4).
-      sync_every: vLLM weight-sync cadence (default 8).
-      skip_warmup_fit: when True, skip the standalone TurnRD fit at
-        the end of round 0. Used for resume-from-mid-run scenarios.
-      auto_resume: when True (default), at startup AND between rounds
-        scan the volume for per-round "done" sentinels. Any round whose
-        sentinel exists is SKIPPED. This makes the orchestrator
-        idempotent under Modal preemption-restarts.
-
-    Returns:
-      A summary dict with per-round eval.pct_success and total elapsed.
+    Each round runs `train_loop_{env_name}` (rollouts + GRPO + replay) then
+    `train_turnrd_run` (standalone V-head fit). `replay_path`/`ckpt_path` come
+    from the JSON config (not args) to keep producer and trainer paths in sync.
     """
     import json
     import os
@@ -119,8 +59,7 @@ def orchestrate_rl_with_turnrd(
 
     sys.path.insert(0, "/workspace")
 
-    # Modal volume eventual consistency: ensure we see the latest
-    # adapters + ckpts written by prior orchestrator turns.
+    # Reload so we see adapters/ckpts written by prior orchestrator turns.
     volume.reload()
 
     # Validate + resolve env routing
@@ -130,10 +69,8 @@ def orchestrate_rl_with_turnrd(
         )
     train_loop_fn_name = f"train_loop_{env_name}"
 
-    # Look up the deployed train_loop + train_turnrd functions
-    # `from_name` requires `modal deploy` to have been run on each of
-    # those app files; the launcher does that before submitting this
-    # orchestrator.
+    # Look up the deployed train_loop + train_turnrd functions (require a
+    # prior `modal deploy`, which the launcher does).
     train_loop_fn = modal.Function.from_name(
         "cs224r-hgpo-train-loop", train_loop_fn_name
     )
@@ -141,8 +78,7 @@ def orchestrate_rl_with_turnrd(
         "cs224r-hgpo-train-turnrd", "train_turnrd_run"
     )
 
-    # Load the JSON config so we can compute per-round task-ids
-    #     and (for train_turnrd) extract the arch + aux-loss knobs.
+    # Load the JSON config for per-round task-ids + train_turnrd knobs.
     with open(config) as fh:
         cfg_json = json.load(fh)
 
@@ -161,14 +97,8 @@ def orchestrate_rl_with_turnrd(
         (cfg_json.get("train", {}) or {}).get("K_trajectories_per_task", 4)
     )
 
-    # WebShop env needs a non-zero `num_products` for BM25 index sizing.
-    # `_train_loop_impl` falls back to the kwarg ONLY when
-    # cfg.env.env_kwargs is empty (which IS the case for all the shipped
-    # WebShop SOTA configs). We therefore must NOT pass num_products=0
-    # for webshop - that would size the env to 0 products and break the
-    # search engine. Resolve from cfg.env.env_kwargs.num_products if
-    # present; otherwise pick the env-appropriate default that matches
-    # `train_loop_{env_name}`'s own default (webshop=1000, alfworld=0).
+    # WebShop needs a non-zero `num_products`; resolve from
+    # cfg.env.env_kwargs.num_products, else default (webshop=1000, alfworld=0).
     _cfg_env_kwargs_with_turnrd = (
         (cfg_json.get("env", {}) or {}).get("env_kwargs", {}) or {}
     )
@@ -177,8 +107,7 @@ def orchestrate_rl_with_turnrd(
         1000 if env_name == "webshop" else 0,
     ))
 
-    # Per-seed deterministic task-id slice. Mirrors
-    # `OrchestrationConfig.base_task_id_offset` in the local driver.
+    # Per-seed deterministic task-id slice.
     base_task_id_offset = int(seed) * int(rounds) * int(episodes_per_round)
 
     effective_run_name_prefix = f"{run_name_prefix}_seed{int(seed)}"
@@ -349,13 +278,8 @@ def orchestrate_rl_with_turnrd(
                 progress_prior_strength=float(
                     _trd_kwarg("progress_prior_strength", 1.0)
                 ),
-                # Plan `turnrd_goal_conditioned_v_head`: thread the
-                # FiLM goal-conditioned V-head flag through to the
-                # standalone trainer so the rebuilt model in round N+1
-                # carries the right shape for the ckpt written by the
-                # parent train_loop's train_turnrd. Default False
-                # preserves byte-for-byte behaviour for non-AlfWorld
-                # configs.
+                # Thread the FiLM goal-conditioned V-head flag through so the
+                # round N+1 model matches the ckpt shape. Default False = legacy.
                 goal_conditioned_value_head=bool(
                     _trd_kwarg("goal_conditioned_value_head", False)
                 ),
@@ -440,14 +364,9 @@ def orchestrate_rl_with_turnrd(
     return summary
 
 
-# Backward-compat alias for in-flight ephemeral runs that hold a
-# `Function.from_name` handle by the old name. Module-level aliasing is
-# safe because the underlying registered function is the same one;
-# Python imports also resolve `orchestrate_alfworld_rl` to the new impl.
-# Note: `modal run infra/app_orchestrator.py::orchestrate_alfworld_rl` is
-# NOT supported via this alias - Modal looks the function up by its
-# decorator-registered name (`orchestrate_rl_with_turnrd`). Update the
-# in-flight launcher to use the new name + `--env-name alfworld`.
+# Backward-compat alias by the old name (same registered function). Note:
+# `modal run ...::orchestrate_alfworld_rl` is NOT supported - Modal resolves
+# by the decorator name `orchestrate_rl_with_turnrd`.
 orchestrate_alfworld_rl = orchestrate_rl_with_turnrd
 
 
@@ -479,38 +398,9 @@ def orchestrate_rl_no_turnrd(
 ) -> dict:
     """Run a multi-round H-GRPO loop cloud-side WITHOUT the TurnRD step.
 
-    Per-round shape: train_loop_{env_name} only (no standalone V-head fit).
-    Used by Method C / FlatGRPO / LLMJudge / Progress recipes - any
-    decomposer that doesn't need a TurnRD model trained between rounds.
-
-    Carry-policy adapter chaining matches the with-TurnRD variant:
-    R0 loads sft_adapter; R_N>0 loads R_{N-1}'s saved adapter. Per-round
-    sentinels enable auto-resume on preemption-restart.
-
-    `gpu_mem_util` and `sync_every` are honored if the JSON config does
-    NOT specify train.gpu_mem_util / train.sync_every; otherwise the
-    JSON values win (matching `_train_loop_impl`'s precedence).
-
-    Args:
-      config: path to the JSON config inside the container.
-      sft_adapter: warm-start adapter on the volume (loaded at R0).
-      env_name: "alfworld" | "webshop".
-      rounds: total round count.
-      start_round: round to resume from (0 = fresh).
-      episodes_per_round: H-GRPO episodes per round.
-      eval_episodes: held-out eval pass per round.
-      eval_task_id_base: eval task-id starting offset.
-      seed: protocol seed; drives the per-seed training task-id slice.
-      rollout_temperature: vLLM sampling T.
-      run_name_prefix: per-round run name prefix; gets `_round{N:02d}`
-        and `_seed{S}` appended.
-      adapter_dir: directory for carry-policy adapters.
-      gpu_mem_util: vLLM GPU memory fraction.
-      sync_every: vLLM weight-sync cadence.
-      auto_resume: scan + skip rounds whose "done" sentinel exists.
-
-    Returns:
-      A summary dict with per-round eval.pct_success and total elapsed.
+    Per-round = `train_loop_{env_name}` only (Method C / FlatGRPO / LLMJudge /
+    Progress). Carry-policy chaining and per-round auto-resume sentinels match
+    the with-TurnRD variant.
     """
     import json
     import os
@@ -537,8 +427,7 @@ def orchestrate_rl_no_turnrd(
         (cfg_json.get("train", {}) or {}).get("K_trajectories_per_task", 4)
     )
 
-    # WebShop env needs a non-zero `num_products` for BM25 index sizing
-    # (see orchestrate_rl_with_turnrd for the full rationale).
+    # WebShop needs a non-zero `num_products` (see orchestrate_rl_with_turnrd).
     _cfg_env_kwargs_no_turnrd = (
         (cfg_json.get("env", {}) or {}).get("env_kwargs", {}) or {}
     )
@@ -694,9 +583,7 @@ def orchestrate_rl_no_turnrd(
         summary["rounds_completed"] = round_idx - start_round + 1
         print(f"    Round {round_idx} total elapsed: {round_elapsed}s")
 
-        # Sentinel - same shape as the with-TurnRD path, sans
-        # final_loss / n_steps fields. Status-table scripts that read
-        # these JSONs handle the absent keys gracefully.
+        # Sentinel - same shape as the with-TurnRD path, minus final_loss/n_steps.
         import datetime as _dt
         sentinel_payload = {
             "round_idx": round_idx,
@@ -742,13 +629,10 @@ def orchestrate_rl_no_turnrd(
 
 # Pattern A: WebShop SFT pipeline (4-stage: install -> gen -> train -> eval)
 
-# Stage ordering for the SFT pipeline. The orchestrator iterates through
-# this list in order and skips any stage whose sentinel exists. The MODE
-# flag gates which stages are eligible to run.
+# Stage ordering; iterated in order, skipping any stage whose sentinel exists.
 _SFT_STAGES: tuple[str, ...] = ("1a", "1b", "1c", "2", "3", "4")
 
-# Stages that each MODE is allowed to execute. Mirrors the bash launcher
-# `scripts/run_webshop_sft_v3_mlpr32.sh`'s MODE gating.
+# Stages each MODE may execute (mirrors the bash launcher's MODE gating).
 _SFT_MODE_STAGES: dict[str, set[str]] = {
     "full": {"1a", "1b", "1c", "2", "3", "4"},
     "skip-install": {"2", "3", "4"},
@@ -792,51 +676,12 @@ def orchestrate_sft_pipeline(
     eval_gpu_mem_util: float = 0.30,
     auto_resume: bool = True,
 ) -> dict:
-    """Run the 4-stage WebShop SFT pipeline cloud-side.
+    """Run the 4-stage WebShop SFT pipeline cloud-side: install (1a-1c) ->
+    generate (2) -> sft_train (3) -> eval (4), each gated on a sentinel file.
 
-    Stages (each gated on a sentinel file):
-      1a: pip_install_webshop (cs224r-hgpo-webshop-install)
-      1b: download_spacy_model (cs224r-hgpo-webshop-install)
-      1c: build_index_1k (cs224r-hgpo-webshop-install)
-      2:  generate_sft_trajectories (cs224r-hgpo-webshop-sft-gen)
-      3:  sft_train (cs224r-hgpo-sft-train)
-      4:  train_loop_webshop in eval-only mode (cs224r-hgpo-train-loop)
-
-    There is no dedicated `eval_sft` Modal function; Stage 4 reuses
-    `train_loop_webshop` with `n_episodes=0` exactly as the bash launcher
-    `scripts/run_webshop_sft_v3_mlpr32.sh` does.
-
-    The `sft_train` function writes its adapter to a timestamped dir
-    `/vol/checkpoints/<run_name>_<ts>` - we resolve the actual dir AFTER
-    Stage 3 by scanning `/vol/checkpoints/` for `<run_name>_*` and
-    picking the newest. Override via `adapter_path` if you want to
-    force-eval a specific adapter (handy for `mode=eval-only`).
-
-    Args:
-      run_name: SFT run name (`sft_train`'s `run_name` arg; also used as
-        prefix for stage sentinels). Should match the bash launcher's
-        RUN_NAME knob.
-      mode: "full" | "skip-install" | "skip-gen" | "train-only" | "eval-only".
-        Selects which stages are eligible to run. Already-completed stages
-        (per sentinel scan) are always skipped when `auto_resume=True`.
-      n_sessions, include_human_trajs, human_trajs_min_reward,
-        max_result_pages, max_steps_per_episode, reward_threshold:
-        forwarded to `generate_sft_trajectories`.
-      epochs, learning_rate, max_seq_len, grad_accum, min_reward,
-        lora_rank, lora_target_modules: forwarded to `sft_train`.
-      eval_episodes, eval_task_id_base: forwarded to Stage 4 train_loop.
-      data_path: where gen writes / train reads the SFT JSONL.
-      adapter_path: optional override for Stage 4's `sft_adapter` arg.
-        When empty (default), Stage 4 resolves it by globbing
-        `/vol/checkpoints/<run_name>_*` and picking newest.
-      sentinel_dir: where per-stage "done" sentinels are written.
-      eval_config: container path to the SFTOnly_webshop_mlpr32.json
-        config used by Stage 4.
-      eval_gpu_mem_util: vLLM mem util for Stage 4 (default 0.30).
-      auto_resume: scan + skip stages whose "done" sentinel exists.
-
-    Returns:
-      A summary dict with per-stage status and total elapsed.
+    Stage 4 reuses `train_loop_webshop` with `n_episodes=0`; the trained adapter
+    is resolved from `adapter_path`, the Stage 3 return, or newest
+    `/vol/checkpoints/<run_name>_*`.
     """
     import datetime as _dt
     import json
@@ -968,9 +813,7 @@ def orchestrate_sft_pipeline(
         human_trajs_min_reward=human_trajs_min_reward,
     ))
 
-    # Stage 3: SFT train. `sft_train` writes adapter to
-    # `/vol/checkpoints/<run_name>_<ts>`; we capture the returned dict's
-    # ckpt_dir so Stage 4 can find it without globbing.
+    # Stage 3: SFT train; capture the returned ckpt_dir so Stage 4 finds it.
     sft_result = _maybe_run("3", "sft_train", lambda: fn_sft.remote(
         epochs=epochs,
         learning_rate=learning_rate,
@@ -983,11 +826,8 @@ def orchestrate_sft_pipeline(
         lora_target_modules=lora_target_modules,
     ))
 
-    # Resolve adapter path for Stage 4:
-    # 1. Explicit `adapter_path` arg wins (handy for eval-only mode).
-    # 2. Else use ckpt_dir from sft_train's return (or its skipped
-    #    sentinel's result_preview).
-    # 3. Else glob `/vol/checkpoints/<run_name>_*` and pick newest dir.
+    # Resolve Stage 4 adapter: explicit adapter_path, else sft_train's ckpt_dir,
+    # else newest glob of /vol/checkpoints/<run_name>_*.
     resolved_adapter = adapter_path.strip()
     if not resolved_adapter:
         if isinstance(sft_result, dict):
@@ -1071,15 +911,7 @@ def main(
     skip_warmup_fit: bool = False,
     auto_resume: bool = True,
 ) -> None:
-    """Local entrypoint for the with-TurnRD orchestrator. Mirrors the
-    legacy `orchestrate_alfworld_rl` CLI exactly, with the addition of
-    `--env-name {alfworld,webshop}` (default `alfworld` preserves
-    pre-rename behavior). For `--detach` use:
-
-      modal run --detach infra/app_orchestrator.py::orchestrate_rl_with_turnrd \\
-        --config /workspace/configs/foo.json --sft-adapter /vol/checkpoints/... \\
-        --env-name alfworld --rounds 10 ...
-    """
+    """Local entrypoint for the with-TurnRD orchestrator (adds --env-name; default alfworld)."""
     import json as _json
 
     result = orchestrate_rl_with_turnrd.remote(
@@ -1124,14 +956,7 @@ def main_no_turnrd(
     sync_every: int = 8,
     auto_resume: bool = True,
 ) -> None:
-    """Local entrypoint for the no-TurnRD orchestrator. Submit via:
-
-      modal run --detach infra/app_orchestrator.py::orchestrate_rl_no_turnrd \\
-        --config /workspace/configs/foo.json --sft-adapter /vol/... \\
-        --env-name webshop --rounds 10 ...
-
-    (Or use this local_entrypoint via `infra/app_orchestrator.py::main_no_turnrd`.)
-    """
+    """Local entrypoint for the no-TurnRD orchestrator."""
     import json as _json
 
     result = orchestrate_rl_no_turnrd.remote(
@@ -1180,11 +1005,7 @@ def main_sft_pipeline(
     eval_gpu_mem_util: float = 0.30,
     auto_resume: bool = True,
 ) -> None:
-    """Local entrypoint for the SFT pipeline orchestrator. Submit via:
-
-      modal run --detach infra/app_orchestrator.py::orchestrate_sft_pipeline \\
-        --run-name sft_webshop_v3_mlpr32_<ts> --mode full --n-sessions 2000 ...
-    """
+    """Local entrypoint for the SFT pipeline orchestrator."""
     import json as _json
 
     result = orchestrate_sft_pipeline.remote(

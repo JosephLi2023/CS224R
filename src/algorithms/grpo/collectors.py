@@ -1,16 +1,10 @@
 """K-trajectory rollout collector for H-GRPO.
 
 Drives a vLLM-style runner through K parallel env instances for one task,
-returning a `TrajectoryGroup` populated with action token ids and
-rollout-time logprobs ready for the GRPO trainer.
+returning a `TrajectoryGroup` with action token ids and rollout-time logprobs.
 
-Optional opt-in **TurnRD replay-buffer producer**. When the
-collector is constructed with `turnrd_emit_path` + `turnrd_embedder`
-(and, for Mode 2, `judge_decomposer`), each `collect_group` call
-appends one JSONL row per non-empty trajectory using
-`src.turnrd.dataset.TurnRDRecord` for schema validation. All producer
-params default to `None`, so the existing flag-driven
-`infra/app_train_loop.py` path is byte-for-byte unchanged.
+Optionally acts as a TurnRD replay-buffer producer when constructed with
+`turnrd_emit_path` + `turnrd_embedder` (all producer params default to None).
 """
 from __future__ import annotations
 
@@ -38,13 +32,11 @@ class _RunnerLike(Protocol):
 PromptRenderer = Callable[[Any, list[TurnRecord]], str]
 ActionParser = Callable[[str], str]
 EnvFactory = Callable[[], Any]
-# `TurnEmbedder` is `Callable[[Trajectory], torch.Tensor]` per
-# `src/algorithms/hgpo/decomposers/turnrd.py::TurnEmbedder`. We don't import
-# the type alias here because it requires torch at module-load time.
+# TurnEmbedder = Callable[[Trajectory], torch.Tensor]; not imported here to
+# stay torch-free at module load.
 TurnEmbedder = Callable[[Trajectory], Any]
-# `JudgeDecomposer`-shaped object: anything with a `.decompose(group) ->
-# list[K] of list[T_i]` method. Matches the structural Protocol at
-# `src/algorithms/hgpo/decomposers/base.py::TurnRewardDecomposer`.
+# JudgeDecomposer-shaped: any object with `.decompose(group) -> list[K] of
+# list[T_i]` (see decomposers/base.py::TurnRewardDecomposer).
 TurnRewardDecomposerLike = Any
 
 
@@ -147,11 +139,8 @@ class RolloutCollector:
         )
         self._turnrd_emit_goal_text: bool = bool(turnrd_emit_goal_text)
         self._turnrd_emit_goal_emb: bool = bool(turnrd_emit_goal_emb)
-        # Per-round cache: goal_text -> goal_emb (list[float]). Reset at
-        # the start of every `collect_group` call so we don't grow
-        # unbounded across the (~80) episodes in a round. The same goal
-        # text repeats across the K rollouts of one task, so caching
-        # saves K-1 redundant embedder calls per group.
+        # Per-round cache goal_text -> goal_emb, reset each collect_group call.
+        # The K rollouts of a task share a goal, so this saves K-1 embeds.
         self._goal_emb_cache: dict[str, list[float]] = {}
 
     def _acquire_envs(self, K: int) -> list[Any]:
@@ -269,8 +258,7 @@ class RolloutCollector:
             task_id=str(task_id), env_name=env_name, trajectories=trajectories
         )
 
-        # Emit TurnRD replay-buffer rows (if the producer was
-        # configured at construction time). Skipped entirely otherwise.
+        # Emit TurnRD replay rows when the producer is configured.
         if self._turnrd_emit_path is not None:
             self._emit_turnrd_records(group)
 
@@ -289,9 +277,7 @@ class RolloutCollector:
         # Local import keeps the collector module torch-free at import time.
         from src.turnrd.dataset import TurnRDRecord  # type: ignore[import-not-found]
 
-        # The goal extractor is pure-Python (no torch / no heavy deps); import
-        # once up front when goal-text emission is enabled, rather than
-        # re-importing for every trajectory in every group.
+        # Goal extractor is pure-Python; import once when goal-text emission is on.
         extract_goal_text = None
         if self._turnrd_emit_goal_text:
             from src.turnrd.goal_extractor import (  # type: ignore[import-not-found]
@@ -344,13 +330,8 @@ class RolloutCollector:
                 # Per-turn env signal: step rewards are already deltas, so
                 # forward as-is (v2 trainer's per-turn value-head target).
                 progress: list[float] = [float(t.raw_env_reward) for t in traj.turns]
-                # Optional dense progress signal sourced from the env
-                # adapter (e.g. ALFWorld expert-plan-length deltas). All-
-                # or-nothing per-trajectory emission so the dataset
-                # collator's per-batch all-or-nothing gate stays
-                # well-defined: a trajectory either has a complete
-                # signal or none at all (no partial coverage that would
-                # masquerade as zeros at masked-out positions).
+                # Optional dense progress signal (e.g. ALFWorld expert-plan
+                # deltas), emitted all-or-nothing per trajectory.
                 progress_signal: list[float] | None
                 # Emit if ANY turn has a non-None intermediate_reward,
                 # zero-filling missing turns (a zero is a valid "no progress"
@@ -435,8 +416,7 @@ class RolloutCollector:
                                     exc,
                                 )
                                 goal_emb_v = None
-                # Round-trip through TurnRDRecord so producer-side schema
-                # bugs surface here, not at the next trainer launch.
+                # Round-trip through TurnRDRecord so schema bugs surface here.
                 rec = TurnRDRecord(
                     task_id=str(traj.task_id),
                     turn_embeds=turn_embeds,

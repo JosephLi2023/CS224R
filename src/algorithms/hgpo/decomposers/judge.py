@@ -1,17 +1,10 @@
 """LLM-as-judge per-turn reward decomposer (Method A).
 
-For each `Trajectory tau_i` in a `TrajectoryGroup`, builds a `JudgeRequest`
-with one `JudgeTurn` per `TurnRecord`, hits the SQLite read-through cache
-to skip already-scored turns, and asks the `JudgeBackend` to score any
-missing turns. The returned per-turn rewards satisfy the invariant
-`sum_t r_hat_t = R` (within ~1e-9) by construction (`to_turn_scores` does the
-rescaling - see `src/judge/prompts.py:81`).
-
-Cost guardrail: if the per-run hard cap on judge calls
-(`judge.limits.max_judge_calls_per_run` from the run config) would be
-exceeded by an upcoming call, `decompose` falls back to a uniform split
-(`R / T_i` per turn) and logs a warning rather than silently spending more
-$$ than the run budget allows.
+Scores each `Trajectory` in a `TrajectoryGroup` via a `JudgeBackend`, using a
+SQLite read-through cache to skip already-scored turns; per-turn rewards satisfy
+`sum_t r_hat_t = R` (within ~1e-9). If the per-run cap
+`judge.limits.max_judge_calls_per_run` would be exceeded, `decompose` falls back
+to a uniform `R / T_i` split and logs a warning.
 """
 
 from __future__ import annotations
@@ -30,11 +23,10 @@ _logger = logging.getLogger(__name__)
 def _build_request(group_task_id: str, env_name: str, traj: Trajectory, k_index: int) -> JudgeRequest:
     """Build a JudgeRequest for one trajectory.
 
-    `task_id` is qualified as `{group_task_id}#k{k_index}` so per-K cache
-    entries stay disjoint: the cache stores `normalized` scores pre-rescaled
-    against this trajectory's `final_reward`, so sharing entries across
-    K-samples with different `R`s would yield per-turn rewards that don't
-    sum to `R`, violating the cache invariant.
+    `task_id` is qualified as `{group_task_id}#k{k_index}` so per-K cache entries
+    stay disjoint: stored `normalized` scores are pre-rescaled against this
+    trajectory's `final_reward`, and sharing them across K-samples with different
+    `R`s would break the cache's sum-to-`R` invariant.
     """
     qualified_task_id = f"{group_task_id}#k{k_index}"
     turns = [

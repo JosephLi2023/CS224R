@@ -17,23 +17,12 @@ from src.judge.backend import JudgeRequest, JudgeTurn, TurnScore
 
 
 def prefix_hash(env_name: str, turns: list[JudgeTurn], up_to_turn: int) -> str:
-    """Deterministic hash over the trajectory prefix up to (and including) turn `up_to_turn`.
+    """Deterministic hash over the trajectory prefix up to turn `up_to_turn`.
 
-    Designed so that two trajectories sharing a common prefix could reuse
-    cached scores for shared turns when the per-turn judge prompt is purely
-    prefix-conditioned.
-
-    NOTE (as of 2026-05-04): this prefix-sharing is NOT realized end-to-end
-    today. The current `JudgeDecomposer` qualifies `task_id` with the
-    K-sample index (`{task_id}#k{i}`) for a correctness reason: cached
-    `normalized` values are pre-scaled against a specific `final_reward`,
-    so cross-trajectory reuse with different `R`s would silently violate
-    the section 3.2 `sum_t r_t = R` invariant. As a result, cache entries from
-    different K-samples are never shared even when their prefixes match.
-    To genuinely re-enable cross-K prefix sharing, cache `raw_score` only
-    and re-normalize at read time using `request.final_reward`, then drop
-    the `#k{i}` qualifier in
-    `src/algorithms/hgpo/decomposers/judge.py::_build_request`.
+    Intended to let trajectories sharing a prefix reuse cached scores. Not
+    realized today: the decomposer qualifies `task_id` with the K-sample index
+    because cached `normalized` values are pre-scaled to a specific
+    `final_reward`, so cross-trajectory reuse would break the sum invariant.
     """
     payload = {
         "env": env_name,
@@ -113,11 +102,10 @@ class JudgeCache:
             self._conn.commit()
 
     def get_or_miss(self, request: JudgeRequest, model_tag: str) -> tuple[list[TurnScore | None], list[str]]:
-        """Return (per-turn-cached-or-None, per-turn-prefix-hashes).
+        """Return (per-turn cached-or-None, per-turn prefix-hashes).
 
-        Caller fills the None entries by querying the backend, then writes them
-        back with `put(...)`. This keeps the cache fully precomputable and
-        hides hash construction from the trainer.
+        Caller fills the None entries via the backend and writes them back
+        with `put(...)`.
         """
         hashes = [prefix_hash(request.env_name, request.turns, t.turn_idx) for t in request.turns]
         cached: list[TurnScore | None] = []

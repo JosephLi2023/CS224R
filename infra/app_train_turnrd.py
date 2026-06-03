@@ -1,26 +1,8 @@
 """Modal A100 app: standalone TurnRD trainer (Method B).
 
-Wraps `src.turnrd.train.train_turnrd` so the standalone Method-B
-fitting pass can run on a single A100 against a replay JSONL written
-by the in-loop producer (see `src/algorithms/grpo/collectors.py`'s
-emit hook).
-
-Usage:
-
-  modal run infra/app_train_turnrd.py \\
-    --replay /vol/cache/turnrd_replay.jsonl \\
-    --mode 1 \\
-    --n-epochs 5 \\
-    --batch-size 16 \\
-    --lr 1e-4 \\
-    --ckpt-out /vol/manifests/turnrd_ckpt.pt
-
-After the checkpoint is written, the parent H-GRPO trainer's refresh
-hook (built by `src.trainers.train_hgpo.build_trainer_from_config`
-when `cfg["turnrd"]["ckpt_path"]` is set) reloads it on the configured
-cadence.
-
-Cost: ~$0.50 for 5 epochs over a 200-trajectory replay (A100 ~5 min).
+Wraps `src.turnrd.train.train_turnrd` to fit on a single A100 against a replay
+JSONL written by the in-loop producer; the parent H-GRPO trainer reloads the
+saved ckpt on its configured cadence.
 """
 from __future__ import annotations
 
@@ -41,11 +23,9 @@ def train_turnrd_run(
     lr: float = 5e-4,
     ckpt_out: str = "",
     max_records: int = 0,
-    # Architecture selector. "v1" = legacy TurnRD; "v2" = TurnRDv2
-    # (bidirectional + identifiable R-loss + progress-prior init).
+    # Architecture: "v1" legacy TurnRD, "v2" TurnRDv2.
     version: str = "v1",
-    # TurnRD model knobs (defaults match TurnRDConfig + the existing
-    # configs/method_hgpo_turnrd.json post-improvement values).
+    # TurnRD model knobs (defaults match TurnRDConfig).
     layers: int = 6,
     hidden_size: int = 384,
     n_heads: int = 4,
@@ -55,14 +35,9 @@ def train_turnrd_run(
     value_head: bool = True,
     # v2-only model knob (ignored when version="v1").
     progress_prior_strength: float = 1.0,
-    # Plan `turnrd_goal_conditioned_v_head`: opt-in FiLM
-    # goal-conditioned V-head. When True (and version="v2"), the model
-    # is built with the FiLM gamma/beta projection layers and the trainer
-    # threads `goal_emb` from the replay rows into model.forward.
-    # Default False preserves legacy byte-for-byte behaviour.
+    # Opt-in FiLM goal-conditioned V-head (v2 only); default False = legacy.
     goal_conditioned_value_head: bool = False,
-    # Aux-loss knobs (Mode 1 only). lambda_value/gamma drive the
-    # per-turn V-head loss; lambda_entropy is the negative-entropy reg.
+    # Aux-loss knobs (Mode 1 only): per-turn V-head loss + entropy reg.
     lambda_value: float = 0.5,
     gamma: float = 0.95,
     lambda_entropy: float = 0.01,
@@ -73,31 +48,21 @@ def train_turnrd_run(
     lambda_rank: float = 0.1,
     lambda_progress: float = 0.01,
     rank_margin: float = 0.1,
-    # Optional replay-buffer recency decay (per-batch loss scaling). When
-    # > 0, each batch's loss is multiplied by the mean over its records
-    # of `0.5 ** ((max_round_idx - round_idx) / recency_decay_half_life)`.
-    # 0.0 (default) disables the path and preserves legacy behavior.
-    # See `src.turnrd.train.train_turnrd` for the algorithm + edge cases.
+    # Optional replay recency decay (per-batch loss scaling); 0.0 disables.
     recency_decay_half_life: float = 0.0,
     legacy_decay_weight: float = 0.5,
     min_batch_weight: float = 1e-3,
-    # Cumulative warm-start (plan: turnrd_v2_continual_larger). When
-    # non-empty AND the file exists, load model state_dict with
-    # `strict=False` BEFORE training begins. Used by the orchestrator to
-    # pass the prior round's ckpt for warm-start across rounds. Default
-    # empty preserves byte-for-byte cold-start behaviour.
+    # Cumulative warm-start: when set + file exists, load the prior round's
+    # ckpt with strict=False before training. Default "" = cold start.
     ckpt_in: str = "",
-    # LR schedule (plan: turnrd_v2_continual_larger). Threads through
-    # to `train_turnrd`. Default "constant" is a no-op.
+    # LR schedule; default "constant" is a no-op.
     warmup_steps: int = 0,
     lr_schedule: str = "constant",
-    # Fresh-emphasis pass (plan: turnrd_v2_continual_larger). Default
-    # 0/0 = disabled, byte-for-byte legacy behaviour.
+    # Fresh-emphasis pass; 0/0 = disabled.
     fresh_emphasis_window_rounds: int = 0,
     fresh_emphasis_n_epochs: int = 0,
-    # The producer pre-embeds turns; the standalone trainer doesn't need
-    # the LoRA policy. We DO need the embedding width D, which the
-    # producer wrote into the replay (we read it off the first record).
+    # The producer pre-embeds turns; we read the embedding width off the
+    # first replay record (no LoRA policy needed here).
 ) -> dict:
     import json
     import sys
@@ -107,10 +72,7 @@ def train_turnrd_run(
 
     import torch  # type: ignore[import-not-found]
 
-    # Modal Volumes are eventually-consistent across containers. Reload
-    # at startup so we see the latest replay JSONL written by the parent
-    # train_loop in the previous orchestration round (which called
-    # volume.commit() before exiting).
+    # Reload so we see the replay the previous round committed.
     volume.reload()
 
     from src.turnrd.model import TurnRD, TurnRDConfig, TurnRDv2, TurnRDv2Config
@@ -122,9 +84,7 @@ def train_turnrd_run(
     if version_norm not in ("v1", "v2"):
         raise ValueError(f"--version must be 'v1' or 'v2'; got {version!r}")
 
-    # Read the embedding width from the first record in the replay so
-    # the model's input_proj is sized correctly without forcing the
-    # caller to pass it on the CLI.
+    # Read embedding width from the first replay record to size input_proj.
     with open(replay) as fh:
         first = json.loads(fh.readline())
     if not first.get("turn_embeds"):
@@ -166,11 +126,8 @@ def train_turnrd_run(
     if torch.cuda.is_available():
         model.to("cuda:0")
 
-    # Cumulative warm-start (plan: turnrd_v2_continual_larger).
-    # When `--ckpt-in` is non-empty AND the file exists, load the prior
-    # round's TurnRD ckpt into THIS round's freshly-constructed model
-    # before training. `strict=False` so a legacy no-FiLM ckpt can warm-
-    # start a FiLM-enabled model (the FiLM-specific keys stay at zero-init).
+    # Warm-start: load the prior round's ckpt (strict=False so a legacy
+    # no-FiLM ckpt can seed a FiLM model).
     import os as _os
     if ckpt_in and _os.path.exists(ckpt_in):
         ckpt_in_state = torch.load(ckpt_in, map_location="cpu", weights_only=True)

@@ -1,9 +1,7 @@
 """Decomposer Protocol + factory.
 
-A decomposer maps a `TrajectoryGroup` to per-turn rewards `r_hat_t^i` (one float
-per turn per trajectory). This is the contract the trainer's `compute_loss`
-consumes - see `src/algorithms/grpo/trainer.py::PerTurnDecomposer` (line 74)
-which is structurally identical.
+A decomposer maps a `TrajectoryGroup` to per-turn rewards `r_hat_t^i`, matching
+the trainer's `PerTurnDecomposer` contract in `src/algorithms/grpo/trainer.py`.
 """
 
 from __future__ import annotations
@@ -32,11 +30,9 @@ if TYPE_CHECKING:
 class TurnRewardDecomposer(Protocol):
     """Common shape for any per-turn reward decomposer.
 
-    `decompose(group)` must return a list shape `[K][T_i]` of floats with
-    the section 3.2 invariant `sum_t out[i][t] == group.trajectories[i].final_reward`
-    (within ~1e-9) for the judge/turnrd methods. Method C (progress) does
-    NOT enforce that invariant since raw env-progress signals don't sum to
-    the final reward by construction.
+    `decompose(group)` returns floats shaped `[K][T_i]`. The judge/turnrd
+    methods satisfy `sum_t out[i][t] == final_reward` (within ~1e-9); Method C
+    (progress) does not, since raw progress signals don't sum to the reward.
     """
 
     def decompose(self, group: TrajectoryGroup) -> list[list[float]]:
@@ -59,25 +55,10 @@ def build_decomposer(
 ) -> PerTurnDecomposer:
     """Dispatch to the decomposer named in `cfg["hgpo"]["decomposer"]`.
 
-    - "progress":      returns the existing `progress_decomposer` callable
-      (re-exported from `src.algorithms.grpo.trainer`).
-    - "judge":         requires `backend` + `cache`; returns a callable wrapping
-      `JudgeDecomposer.decompose`.
-    - "turnrd":        requires `model` (a `TurnRD` nn.Module) + `embedder` (a
-      `Callable[[Trajectory], torch.Tensor]` returning per-turn embeddings of
-      shape `[T_i, D]`); returns a callable wrapping
-      `TurnRDDecomposer.decompose`.
-    - "counterfactual": requires `runner`, `env_factory`, `prompt_renderer`,
-      `action_parser`, and `sampling_factory`. Returns a
-      `CounterFactualDecomposer` instance whose `__call__` matches the
-      `PerTurnDecomposer` contract - re-samples N alternative actions per
-      turn from the policy, completes a short greedy rollout, and emits
-      `r_hat_t = R - R_baseline_t`. See
-      `src/algorithms/hgpo/decomposers/counterfactual.py` for the full
-      design + cost rationale.
-
-    Returns a callable matching the `PerTurnDecomposer` signature so the
-    trainer can plug it in directly.
+    Branches and required kwargs: "progress" (none), "judge" (`backend` +
+    `cache`), "turnrd" (`model` + `embedder`), "counterfactual" (`runner`,
+    `env_factory`, `prompt_renderer`, `action_parser`, `sampling_factory`).
+    Returns a callable matching the `PerTurnDecomposer` signature.
     """
     name = str(cfg.get("hgpo", {}).get("decomposer", "progress")).lower()
     if name == "progress":
@@ -90,7 +71,6 @@ def build_decomposer(
             )
         from src.algorithms.hgpo.decomposers.judge import JudgeDecomposer
 
-        # Read the optional per-run hard cap from the judge config block.
         judge_cfg = cfg.get("judge", {})
         limits = judge_cfg.get("limits", {}) if isinstance(judge_cfg, dict) else {}
         max_calls = int(limits.get("max_judge_calls_per_run", 0)) if isinstance(limits, dict) else 0

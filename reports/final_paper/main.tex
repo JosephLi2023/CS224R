@@ -1,0 +1,780 @@
+% =============================================================================
+% CS224R Final Report
+% Hybrid Advantage Shaping with Goal-Aware Attention for Per-Turn Credit
+% Assignment in LLM-Agent Reinforcement Learning
+% Build: latexmk -pdf main.tex   (pdflatex + bibtex)
+% =============================================================================
+\documentclass{article}
+
+\usepackage[preprint]{cs224r_2026}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\setlength{\fboxsep}{2pt}
+\usepackage{graphicx}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{float}
+
+\newtheorem{proposition}{Proposition}
+
+% Avoid stretched vertical gaps around section headings (send slack to page bottom)
+\raggedbottom
+
+\title{Hybrid Advantage Shaping with Goal-Aware Attention for Per-Turn Credit Assignment in LLM-Agent Reinforcement Learning}
+
+\author{%
+  Joseph Li \\
+  Stanford University \\
+  \texttt{shoupei@stanford.edu} \\
+  \And
+  Max Rodriguez \\
+  Stanford University \\
+  \texttt{maxrod@stanford.edu} \\
+  \And
+  Samantha Leventis \\
+  Stanford University \\
+  \texttt{samanthaleventis@stanford.edu} \\
+}
+
+\newcommand{\Atraj}{A_{\text{traj}}}
+\newcommand{\Aturn}{A_{\text{turn}}}
+\newcommand{\AH}{A_{\text{H}}}
+\newcommand{\flatgrpo}{flatGRPO}
+
+\begin{document}
+
+% ============================================================================
+% PART 1: ONE-PAGE EXTENDED ABSTRACT
+% ============================================================================
+\begin{titlepage}
+\begin{center}
+\Large\textbf{Extended Abstract}\\[2pt]
+\normalsize Hybrid Advantage Shaping with Goal-Aware Attention for Per-Turn Credit Assignment in LLM-Agent RL\\
+\small Joseph Li, Max Rodriguez, Samantha Leventis
+\end{center}
+\vspace{6pt}
+
+\paragraph{Motivation.}
+LLM agents acting over many turns in sparse-reward environments such as AlfWorld and WebShop
+receive only a single \emph{terminal} reward, yet success depends on credit being assigned to
+the individual turns that actually mattered. Although flatGRPO is stable, it is credit-blind
+because it assigns the same group-normalized trajectory advantage to every turn. Recent
+step-structured variants such as GiGPO and HoGPO recognize this limitation, but still assign
+credit through fixed grouping rules or heuristic step structure rather than a learned,
+task-conditioned
+decomposition. Classical return decomposition addresses delayed reward, but not the
+language-agent setting where the same local action can be useful or harmful depending on the
+goal. The missing mechanism is a GRPO-compatible way to retain the reliable trajectory
+baseline while injecting learned, goal-aware per-turn credit.
+
+\paragraph{Method.}
+We close this gap with \textbf{Hybrid Advantage Shaping (HAS)}, a one-knob framework whose
+per-turn advantage is a convex blend $\AH^{t} = \alpha\,\Atraj + (1-\alpha)\,\Aturn^{t}$ of
+the group-normalized trajectory advantage and a per-turn signal produced by a \emph{pluggable}
+decomposer. At $\alpha{=}1$ HAS recovers flatGRPO exactly, so the framework contains the
+standard baseline as a special case; $\alpha{=}0.5$ is empirically optimal in our sweeps.
+Our strongest decomposer is \textbf{TurnRD with goal-aware FiLM attention}: a compact
+bidirectional transformer over per-turn encoder hiddens whose attention and value heads are
+modulated by Feature-wise Linear Modulation (FiLM) parameters predicted from a
+per-trajectory goal embedding.
+
+\paragraph{Implementation.}
+The policy is Qwen2.5-1.5B-Instruct with a rank-32 LoRA adapter (attention + MLP targets),
+trained on Modal A100-80GB GPUs. Training alternates between two decoupled stages. In the
+policy stage, the current LoRA policy collects $K$ rollouts for each task; trajectory
+advantages are computed from group-normalized terminal rewards, while a frozen TurnRD
+checkpoint predicts per-turn credits used in the HAS blend for the PPO/GRPO update. In the
+credit-model stage, after a round of policy rollouts has been written to replay, the TurnRD
+checkpoint is updated in a separate training job using the cumulative replay buffer with
+recency decay, then loaded by the next policy-training round. This separation keeps rollout
+and policy optimization lightweight while letting the credit model improve from accumulated
+experience without being updated online inside every policy-gradient step.
+
+\paragraph{Results.}
+On \textbf{WebShop}, HAS with TurnRD reaches \textbf{91.3\%} success versus 80.5\% for
+flatGRPO ($+10.8$pp), and beats the Progressive ($+5.3$pp) and LLM-Judge ($+9.3$pp)
+decomposers.
+On \textbf{AlfWorld}, TurnRD+FiLM reaches \textbf{80\%} versus ${\sim}70\%$ for flatGRPO
+($+10$pp), with goal-aware FiLM contributing $+5$pp over a no-FiLM variant (75\%).
+
+\paragraph{Discussion.}
+The results validate HAS as a general credit-assignment framework: the same $\alpha$-blend
+improves over flatGRPO on both AlfWorld and WebShop, while TurnRD is the strongest decomposer
+among the learned and heuristic alternatives we tested. The central pattern is that
+trajectory-level GRPO provides stable group-relative ranking, but needs a learned
+intra-trajectory signal to separate decisive turns from incidental ones. TurnRD supplies that
+signal with attention over turns, allocating credit selectively within each completed
+trajectory, and goal conditioning lets the decomposer interpret actions relative to the task
+instruction rather than position alone. This learned, task-conditioned credit outperforms
+heuristic progress rewards and LLM-judge labels.
+
+\paragraph{Conclusion.}
+Hybrid Advantage Shaping with TurnRD offers a practical recipe for sparse-reward LLM-agent RL:
+retain GRPO's stable trajectory-level objective, and add learned per-turn credit where
+flatGRPO is blind. The approach is validated across two distinct agentic benchmarks, achieving
+strong gains on both AlfWorld and WebShop while preserving flatGRPO as the $\alpha{=}1$
+fallback. More broadly, the results support attention-based, goal-aware turn-level credit
+assignment as a useful missing component for GRPO-style optimization of multi-turn LLM agents.
+
+\end{titlepage}
+
+% ============================================================================
+% PART 2: MAIN PAPER
+% ============================================================================
+\maketitle
+
+\begin{abstract}
+Sparse terminal rewards make reinforcement learning for multi-turn LLM agents fundamentally a
+credit-assignment problem. Success is observed only at the trajectory level, while learning
+requires knowing which turns caused the outcome. GRPO-style training uses group-relative
+comparisons among rollouts of the same task, but flatGRPO assigns the same
+trajectory advantage to every turn and is therefore blind to intra-trajectory structure.
+Recent step-structured variants add finer-grained credit heuristics, but do not learn
+task-conditioned turn-level credit for language-agent trajectories. We propose \emph{Hybrid
+Advantage Shaping} (HAS), a GRPO-compatible framework that preserves the stable
+trajectory-level baseline while adding learned per-turn credit through a pluggable decomposer.
+A single coefficient $\alpha$ interpolates between the trajectory advantage and the decomposed
+turn-level signal, recovering flatGRPO exactly at $\alpha{=}1$. We instantiate the decomposer
+with \emph{TurnRD}, a goal-conditioned attention model that analyzes completed trajectories
+and assigns task-dependent credit to individual turns. On WebShop, HAS with TurnRD reaches
+91.3\% success, improving over flatGRPO by $+10.8$pp and over Progressive and LLM-Judge
+decomposers by $+5.3$pp and $+9.3$pp. On AlfWorld, TurnRD+FiLM reaches 80\% success, $+10$pp
+over flatGRPO and $+5$pp over a goal-blind TurnRD variant. These results suggest that learned,
+goal-aware turn-level credit is a missing ingredient for stable and sample-efficient
+GRPO-style optimization of sparse-reward LLM agents.
+\end{abstract}
+
+\section{Introduction}
+Large language models are increasingly deployed as \emph{agents} that act over long horizons:
+issuing tool calls, navigating web pages, and manipulating embodied environments through
+sequences of natural-language actions~\citep{yao2023react}. Reinforcement learning (RL) is
+attractive for these agents because it optimizes task success directly rather than a proxy such
+as next-token likelihood. Yet realistic agentic environments are often sparse: the environment
+returns a single scalar reward only at the end of an episode, even though the episode contains
+many turns. The learner must therefore solve a credit-assignment problem and determine which
+turns caused success or failure, and which were incidental.
+
+The prevailing recipe for LLM-agent RL is Group Relative Policy Optimization
+(GRPO)~\citep{shao2024deepseekmath,guo2025deepseekr1}, which avoids a learned value critic by
+$z$-scoring terminal rewards across a group of $K$ rollouts of the same task. This makes GRPO
+simple and stable, but its standard flat form assigns the same trajectory-level advantage to
+every turn of the trajectory. As a result, every turn in a successful rollout receives positive
+credit, including redundant detours or actions that merely happened to precede success.
+
+Recent work has begun to address this failure mode by adding step-level or hierarchical
+structure to policy optimization, or by training process reward models that provide denser
+supervision. These directions confirm that flat trajectory credit is insufficient, but they leave
+two gaps for sparse-reward LLM agents: many rely on fixed grouping or externally supplied
+process labels, and they do not provide a simple way to combine learned turn-level credit with
+GRPO's stable trajectory-level baseline. In language-agent tasks, this distinction matters
+because the same local action can be decisive or irrelevant depending on the task instruction.
+
+We therefore argue that the missing piece is not merely denser feedback, but a safe and
+task-conditioned mechanism for inserting learned per-turn credit into GRPO without discarding
+the reliable group-relative trajectory signal. We make two contributions.
+
+\textbf{(1) Hybrid Advantage Shaping (HAS)}, a framework whose per-turn advantage is a convex
+blend of the trajectory advantage and a pluggable per-turn decomposer, controlled by a single
+coefficient $\alpha \in [0,1]$. At $\alpha{=}1$ HAS is \emph{exactly} flatGRPO, so it
+retains the baseline objective as an available fallback; intermediate $\alpha$ injects dense
+per-turn credit, with $\alpha{=}0.5$ empirically optimal across both environments.
+
+\textbf{(2) TurnRD with goal-aware FiLM attention}, the strongest realization of the
+decomposer slot: a compact bidirectional transformer over per-turn encoder hiddens that
+predicts per-turn credit weights and values, modulated by FiLM~\citep{perez2018film}
+parameters derived from a per-trajectory goal embedding. TurnRD is trained as a side
+network on a recency-decayed replay buffer with an identifiable reward-prediction objective;
+in the main runs, per-turn credits are obtained by projecting value predictions onto the
+constraint that their sum equals the observed terminal return.
+
+A single shared framework delivers \textbf{91.3\%} success on WebShop ($+10.8$pp over
+flatGRPO) and \textbf{80\%} on AlfWorld ($+10$pp), with goal-aware FiLM contributing $+5$pp
+on AlfWorld; learned attention-based credit beats heuristic decomposers by $+5.3$ to
+$+9.3$pp on WebShop. Beyond raw numbers, we contribute mechanism evidence that FiLM is genuinely
+goal-aware. The remainder of the paper covers related work (\S\ref{sec:related}), the method
+and Algorithm~\ref{alg:has} (\S\ref{sec:method}), setup (\S\ref{sec:setup}), results
+(\S\ref{sec:results}), discussion (\S\ref{sec:discussion}), and conclusions
+(\S\ref{sec:conclusion}).
+
+\section{Related Work}
+\label{sec:related}
+\textbf{GRPO and critic-free LLM policy optimization.} RLHF popularized PPO~\citep{schulman2017ppo}
+for aligning language models~\citep{rlhf}. GRPO~\citep{shao2024deepseekmath,guo2025deepseekr1}
+removes the learned value critic by normalizing rewards within a group of sampled completions,
+making it attractive for LLM fine-tuning where value estimation is costly and unstable. Recent
+systems such as DAPO~\citep{yu2025dapo} and VAPO~\citep{yue2025vapo} improve GRPO-style
+optimization through better sampling, clipping, and stability mechanisms. These developments
+make group-relative RL practical at scale, but primarily address optimization stability: in the
+flat form, a single trajectory-level advantage is still assigned to all turns. HAS is
+complementary because it keeps the group-relative trajectory baseline but changes how credit is
+distributed within a trajectory.
+
+\textbf{Credit assignment in long-horizon LLM agents.} Long-horizon agent training makes
+temporal credit assignment unavoidable. ArCHer~\citep{zhou2024archer} introduces hierarchical
+value estimates over agent turns, while RAGEN~\citep{wang2025ragen} analyzes how GRPO behaves
+as multi-turn rollouts grow longer. Recent step-structured variants such as
+GiGPO~\citep{feng2025gigpo} and HoGPO~\citep{he2026hogpo} add step- or hierarchy-level
+normalization to GRPO, and StepPO-style methods~\citep{wang2026steppo} align updates to
+per-step signals. These methods confirm that flat trajectory credit is insufficient, but most
+rely on fixed grouping, position-level structure, or externally supplied step rewards. By
+contrast, HAS exposes the granularity of credit through a single mixing coefficient and allows
+the per-turn signal to be learned, heuristic, or judge-based while preserving flatGRPO as the
+$\alpha{=}1$ special case.
+
+\textbf{Return decomposition and process reward models.} Classical return decomposition such
+as RUDDER~\citep{arjona2019rudder} redistributes delayed rewards across timesteps, and
+hindsight credit assignment~\citep{harutyunyan2019hca,andrychowicz2017her} reweights
+experience by outcome. Process reward models provide denser supervision for reasoning and
+agentic tasks~\citep{wu2023verify,khalifa2025prm,chen2025rmr1}, and recent
+AgentPRM/HiPER-style approaches learn step-wise progress or explicit credit models for LLM
+agents~\citep{xi2025agentprm,peng2026hiper}. These methods are closely related in spirit to
+TurnRD, but they often require explicit process labels, external reward-model training, or a
+separate supervision pipeline. TurnRD instead learns a reusable decomposer from the agent's own
+replay and terminal outcomes, then plugs into a GRPO-style policy update as a post-hoc
+per-turn credit signal.
+
+\textbf{Goal-conditioned credit for language agents.} In language-agent environments such as
+AlfWorld~\citep{shridhar2021alfworld} and WebShop~\citep{yao2022webshop}, the same local
+action can be useful or harmful depending on the task instruction. ReAct~\citep{yao2023react}
+established prompting patterns for reasoning-and-acting agents, and trajectory optimization
+approaches such as ETO~\citep{song2024eto} fine-tune agents from collected experience. We
+focus on how to assign credit within those trajectories. FiLM~\citep{perez2018film} provides a
+lightweight mechanism for conditioning intermediate representations by feature-wise affine
+modulation. TurnRD uses FiLM to condition per-turn credit on the trajectory goal, making the
+decomposer task-aware rather than position-only or goal-blind. All policy updates use
+parameter-efficient LoRA~\citep{hu2022lora}.
+
+\section{Method}
+\label{sec:method}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\linewidth]{figures/architecture.png}
+\caption{\textbf{Overview of our two contributions.} \textbf{(a)} The Hybrid Advantage
+  Shaping (HAS) framework: a pluggable per-turn decomposer produces $\Aturn^{t}$, blended with
+  the group-normalized trajectory advantage $\Atraj$ through a single mixing coefficient
+  $\alpha$. At $\alpha{=}1$ we recover flatGRPO; $\alpha{=}0.5$ is empirically optimal.
+  \textbf{(b)} TurnRD with FiLM goal-conditioning, our strongest decomposer. A
+  bidirectional transformer reads per-turn encoder hiddens; a per-trajectory goal embedding
+  produces FiLM parameters $\gamma,\beta$ that modulate the hiddens before an $\alpha$-head
+  (attention weights) and a $V$-head (per-turn values). The auxiliary reconstruction
+  $\sum_t \alpha_t V_t \approx R$ makes the attention/value factorization identifiable, while
+  the policy update uses a sum-preserving projection of $V_t$ for per-turn credits.}
+  \label{fig:arch}
+\end{figure}
+
+\subsection{Background: Group-relative policy optimization}
+For a task, the current policy $\pi_\theta$ generates a group of $K$ trajectories; each
+trajectory $\tau_i$ yields a terminal reward $R_i$. GRPO forms a group-normalized trajectory
+advantage by $z$-scoring,
+\begin{equation}
+\Atraj(\tau_i) = \frac{R_i - \mathrm{mean}_j R_j}{\mathrm{std}_j R_j + \epsilon},
+\end{equation}
+and updates $\pi_\theta$ with a PPO clipped surrogate plus a KL penalty to a reference policy.
+In \emph{flat} GRPO this scalar is assigned to every turn (and token) of $\tau_i$; no
+intra-trajectory credit is expressed.
+
+\subsection{Hybrid Advantage Shaping}
+HAS replaces the flat assignment with a per-turn advantage that blends the trajectory baseline
+with a per-turn signal $\Aturn^{t}$ from a decomposer:
+\begin{equation}
+\AH^{t} = \alpha\,\Atraj + (1-\alpha)\,\Aturn^{t},
+\qquad \alpha \in [0,1].
+\label{eq:has}
+\end{equation}
+The blended quantity is computed \emph{per turn} and then broadcast over that turn's tokens
+for the surrogate loss. Three properties make Eq.~\eqref{eq:has} attractive. First, it is a
+\emph{one-knob} interpolation: $\alpha$ trades trajectory-level variance reduction against
+per-turn credit density. Second, it is \emph{backward-compatible}: at $\alpha{=}1$ the
+per-turn term vanishes and HAS
+reduces exactly to flatGRPO, so deployments can recover the baseline objective without
+changing the rest of the training stack. Third, the decomposer is \emph{pluggable}: we support
+a parameter-free Progressive decomposer (env shaping signal), an LLM-Judge decomposer, and the
+learned TurnRD decomposer below.
+
+\paragraph{Why blend, and why $\alpha{=}0.5$.}
+The blend is best read as a bias--variance interpolation over \emph{where} credit is placed.
+The trajectory advantage $\Atraj$ is low-variance because it ranks whole trajectories within
+the group and averages over much of the per-turn stochasticity. However, it is high-bias at
+the turn level, assigning identical credit to every turn of a trajectory, including turns that
+were irrelevant or harmful. A pure per-turn signal $\Aturn^{t}$ has the opposite profile: it
+can localize credit to the turns that mattered, but it is produced by a learned decomposer and
+is therefore higher-variance, especially early in training before that decomposer has
+converged. Equation~\eqref{eq:has} interpolates between these regimes with a single scalar;
+our $\alpha$-sweep (\S\ref{sec:discussion}) finds the midpoint $\alpha{=}0.5$ optimal on both
+environments. This suggests that neither extreme suffices alone: the trajectory-only signal is
+credit-blind, while an unanchored per-turn estimate is too noisy.
+
+\begin{proposition}[flatGRPO containment]
+\label{prop:safe}
+At $\alpha{=}1$ the per-turn term in Eq.~\eqref{eq:has} is multiplied by zero, so
+$\AH^{t}=\Atraj$ for every turn and the per-token PPO surrogate gradient is \emph{identical}
+to that of flatGRPO. HAS therefore contains flatGRPO as the $\alpha{=}1$ special case and
+recovers it exactly when the per-turn signal is disabled.
+\end{proposition}
+\noindent Proposition~\ref{prop:safe} is a containment statement, not a guarantee that every
+intermediate $\alpha$ dominates the baseline. Its practical value is operational: if a
+mis-specified or under-trained decomposer destabilizes learning, one can anneal
+$\alpha{\to}1$ and recover the exact flatGRPO objective without modifying the trainer. We
+further keep the mixture \emph{convex} ($\alpha\in[0,1]$ with weights summing to one) rather
+than permitting free reweighting. Convexity preserves the scale and sign of the advantage, so
+the PPO clipping range and KL trust region behave comparably to the baseline, and it keeps the
+blended per-turn advantages centered consistently with the group baseline.
+
+\subsection{TurnRD: a goal-aware attention decomposer}
+TurnRD (Figure~\ref{fig:arch}b) reads the policy's per-turn last-hidden states $h_{1:T}$
+($D{=}1536$), projects them to a hidden width $H{=}128$, and encodes them with a bidirectional
+transformer (2 layers, 4 heads). Two heads sit on top: an $\alpha$-head that applies a softmax
+over turns to produce normalized attention weights $\alpha_t$, and a $V$-head that predicts
+per-turn scalar values $V_t$. The auxiliary prediction $\hat{R}=\sum_t \alpha_t V_t$ anchors
+attention to return prediction rather than arbitrary saliency. For the policy update, however,
+our main implementation uses a value-projection credit signal: it shifts the active-turn
+values by a constant so their sum equals the terminal reward,
+\begin{equation}
+\hat{r}_t = \mathrm{clip}(V_t) - \frac{\sum_{s=1}^{T}\mathrm{clip}(V_s)-R}{T}.
+\label{eq:vproj}
+\end{equation}
+The projected credits $\hat{r}_t$ define $\Aturn^{t}$ after group normalization across the $K$
+rollouts at the same turn. This projection preserves the observed return exactly while
+allowing negative blame and allowing one decisive turn to receive more credit than the final
+reward when compensated by negative turns.
+
+\paragraph{Why bidirectional, non-causal attention.}
+The encoder is deliberately \emph{non-causal}: each turn attends to both earlier and later
+turns. This is essential because the credit due to an early turn typically depends on whether
+\emph{later} turns exploit it. For example, picking up an object is valuable only if a
+subsequent turn uses it to satisfy the goal. A causal model, restricted to the past, cannot see the downstream
+turns that realize (or waste) an early action's payoff, and would systematically under-credit
+setup actions. Non-causality is legitimate here because TurnRD is an \emph{offline} post-hoc
+analyzer of completed trajectories used only to shape advantages, not the acting policy; it
+never leaks future information into action selection.
+
+\paragraph{Why a softmax attention head (selectivity).}
+The $\alpha$-head normalizes attention with a softmax over turns, so $\sum_t \alpha_t = 1$.
+The model therefore allocates a fixed unit budget across the trajectory. This simplex
+constraint forces selectivity because raising one turn's weight must lower another's, rather
+than letting the model trivially flag every turn as important. In TurnRD, this attention is
+used to make reward prediction identifiable and interpretable. The final per-turn shaping
+signal for the main experiments comes from the value projection in Eq.~\eqref{eq:vproj}.
+
+\paragraph{Identifiability and conservation.}
+The reconstruction term $\sum_t \alpha_t V_t \approx R$ anchors an otherwise under-determined
+attention/value factorization to the single observable quantity, the terminal reward, so the
+attention head cannot drift into a purely cosmetic saliency map. The value-projection step
+enforces exact conservation of return for the actual shaping credits: empirically the projected
+per-turn credits have maximum sum-to-$R$ drift of only ${\sim}2\times10^{-6}$ across probed
+trajectories, so the credit visualizations in \ref{app:extra} decompose reward rather than
+merely highlighting turns.
+
+\textbf{Goal-aware FiLM conditioning.} A per-trajectory goal embedding is projected into FiLM
+parameters $\gamma,\beta \in \mathbb{R}^{H}$, which modulate each encoder hidden state before
+the attention and value heads:
+\begin{equation}
+\mathrm{FiLM}(h_t) = \gamma \odot h_t + \beta.
+\end{equation}
+The FiLM projector is zero-initialized, so the conditioned model starts as the unconditioned
+decomposer at round 0. As training proceeds, the model learns to use goal information to
+reshape per-turn credit.
+
+\paragraph{Why credit must be goal-aware.}
+In goal-conditioned agent environments, the same local action can have different credit
+depending on the task instruction. For example, opening the fridge may be useful when the goal
+is to cool an object, but irrelevant when the goal is to place a book on a desk.
+learn an average credit pattern over superficially similar trajectories, which can blur the
+turns that matter for a specific instruction. Conditioning on the goal lets TurnRD assign
+credit relative to the task being solved, rather than only relative to position or generic
+progress.
+
+FiLM provides a lightweight way to inject this goal information. A single per-trajectory affine
+modulation conditions every turn representation with small parameter overhead and no dependence
+on trajectory length. Because the FiLM projector is zero-initialized, the model starts as the
+unconditioned decomposer and learns goal dependence only when the data supports it.
+Section~\ref{sec:discussion} reports mechanism probes, and \ref{app:extra} contrasts
+goal-aware and goal-blind credit on matched AlfWorld trajectories.
+
+\textbf{Auxiliary TurnRD objective.} TurnRD is trained to predict terminal return from
+per-turn representations while exposing a per-turn credit signal. Its primary objective is the
+reward-reconstruction loss
+\begin{equation}
+\mathcal{L}_{\text{pred}}
+=
+\mathcal{L}_{\text{MSE}}\!\Big(\textstyle\sum_t \alpha_t V_t,\,R\Big),
+\label{eq:loss}
+\end{equation}
+which makes the attention/value factorization identifiable from the observed return. In the
+main runs we add lightweight auxiliary terms for relative ranking, progress-prior regularization,
+and per-turn value supervision when environment progress signals are available. The ranking
+term is a within-batch hinge loss that encourages trajectories with larger returns to receive
+larger predicted returns; it complements the absolute reconstruction loss but is not the core
+definition of TurnRD.
+
+\subsection{Putting it together}
+Algorithm~\ref{alg:has} summarizes the round-level training protocol. In each round, the
+current LoRA policy collects $K$ trajectories per task and writes replay records containing
+per-turn hidden states, goal embeddings, terminal rewards, and any available progress signals.
+A separate credit-model update consumes the cumulative replay buffer with recency weighting, so
+newer policy data has larger influence while earlier rounds remain available. The resulting
+TurnRD checkpoint is then used as a frozen decomposer during the next policy-update stage,
+where trajectory advantages are blended with TurnRD per-turn credits according to
+Eq.~\eqref{eq:has}. At $\alpha{=}1$, the per-turn term vanishes and the policy objective
+reduces exactly to flatGRPO, independent of the decomposer.
+
+\begin{algorithm}[t]
+\caption{Hybrid Advantage Shaping (HAS) with a replay-trained TurnRD credit model}
+\label{alg:has}
+\begin{algorithmic}[1]
+\Require policy $\pi_\theta$ (LoRA); rounds $N$, episodes/round $M$, rollouts/task $K$;
+         mix $\alpha$; recency half-life $H$
+\State Replay buffer $\mathcal{B} \gets \varnothing$; initialize TurnRD checkpoint $\phi$
+\For{round $r = 0,\dots,N-1$}
+  \State Sample $M$ tasks and roll out $K$ trajectories each with $\pi_\theta$
+  \State Append replay records to $\mathcal{B}$ \Comment{$R$, hiddens $h_{1:T}$, \texttt{goal\_emb}, round index}
+  \State Update TurnRD checkpoint $\phi$ from $\mathcal{B}$ using recency-weighted minibatches
+  \For{each rollout group of size $K$}
+    \State $\Atraj \gets$ group-normalized $z$-score of $R$ over the $K$ rollouts
+    \State $\Aturn^{t} \gets$ per-turn credit from frozen $\mathrm{TurnRD}_\phi$
+    \State $\AH^{t} \gets \alpha\,\Atraj + (1-\alpha)\,\Aturn^{t}$ \Comment{broadcast over turn $t$'s tokens}
+  \EndFor
+  \State $\theta \gets$ PPO/GRPO clipped-surrogate update using $\AH$ with KL penalty
+\EndFor
+\State \Return $\pi_\theta$
+\end{algorithmic}
+\end{algorithm}
+
+\section{Experimental Setup}
+\label{sec:setup}
+\textbf{Policy and optimization.} All methods fine-tune Qwen2.5-1.5B-Instruct with a rank-32
+LoRA adapter on attention and MLP projections~\citep{hu2022lora}. We warm-start from a
+supervised checkpoint trained on oracle trajectories, so the RL phase improves an already
+competent instruction-following policy rather than learning the action format from scratch.
+Policy updates use $K{=}8$ rollouts per task, PPO-style clipping, a KL penalty to the reference
+policy, and greedy held-out evaluation ($K{=}1$) on $n{=}100$ episodes. Runs use a single
+A100-80GB on Modal, ${\sim}5$--$12$h each.
+
+\textbf{Environments.} \emph{AlfWorld}~\citep{shridhar2021alfworld} is a text embodied
+household benchmark spanning navigation, object manipulation, receptacle placement, and
+object-state goals; for compute control, we train on a 1{,}000-game subset of its training
+split. \emph{WebShop}~\citep{yao2022webshop} is a
+web-navigation shopping benchmark built from 1{,}000 products, where the agent searches,
+filters, compares product attributes, and purchases an item matching a natural-language goal.
+Both environments expose sparse terminal success rewards as the evaluation metric. When
+available, we use environment-specific progress signals only to instantiate or supervise
+per-turn decomposers, not as the final metric optimized for reporting.
+
+\textbf{Methods compared.} We compare supervised fine-tuning (SFT); flatGRPO ($\alpha{=}1$);
+and HAS ($\alpha{=}0.5$) with Progressive, LLM-Judge, and TurnRD decomposers. Progressive uses
+environment-derived progress signals, LLM-Judge uses cached turn labels, and TurnRD is our
+learned goal-aware decomposer. We additionally compare TurnRD with and without FiLM
+goal-conditioning to isolate the contribution of goal-aware credit. Additional experiment and
+implementation details are provided in \ref{app:expdetails}.
+
+\section{Results}
+\label{sec:results}
+
+\subsection{Quantitative evaluation}
+The quantitative results support two claims. First, HAS improves over trajectory-only GRPO on
+both benchmarks. Second, the learned TurnRD decomposer is stronger than heuristic or judge-based
+per-turn signals. We report terminal success rate throughout, using the same greedy held-out
+evaluation protocol for all methods.
+
+\textbf{WebShop.} Table~\ref{tab:webshop} and Figure~\ref{fig:webshop} compare five methods on
+WebShop. SFT alone reaches 40.0\%, while flatGRPO raises success to 80.5\%, showing that
+terminal-reward RL is already a strong improvement over imitation. HAS with Progressive and
+LLM-Judge reaches 86.0\% and 82.0\%, respectively, both above flatGRPO but below TurnRD. The
+learned TurnRD decomposer performs best at 91.3\%, improving over flatGRPO by $+10.8$pp and
+over Progressive and LLM-Judge by $+5.3$pp and $+9.3$pp. This ordering indicates that the
+benefit is not merely the presence of a dense per-turn signal. A replay-trained decomposer
+adapted to the policy's own trajectories provides a stronger shaping signal than generic
+progress heuristics or cached judge labels.
+
+\begin{table}[H]
+  \caption{WebShop terminal success rate (\%). HAS uses $\alpha{=}0.5$; flatGRPO is
+  recovered at $\alpha{=}1$. TurnRD gives the strongest per-turn decomposition.}
+  \label{tab:webshop}
+  \centering
+  \begin{tabular}{lc}
+    \toprule
+    Method & Success rate (\%) \\
+    \midrule
+    SFT (no RL)                 & 40.0 \\
+    flatGRPO ($\alpha{=}1$)    & 80.5 \\
+    HAS + LLM-Judge             & 82.0 \\
+    HAS + Progressive           & 86.0 \\
+    \textbf{HAS + TurnRD (ours)} & \textbf{91.3} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.72\linewidth]{figures/F2_webshop_5method_bar.pdf}
+  \caption{WebShop success by method. HAS with TurnRD improves by $+10.8$pp over flatGRPO and
+  outperforms heuristic and judge-based decomposers.}
+  \label{fig:webshop}
+\end{figure}
+
+\textbf{AlfWorld.} Table~\ref{tab:alfworld} and Figure~\ref{fig:alfworld} show the same pattern
+on a longer-horizon embodied benchmark. The oracle-SFT warm start reaches 47\% success, and
+flatGRPO improves this to roughly 70\%, indicating that trajectory-level RL is effective but
+plateaus in the high-60s. Adding TurnRD raises held-out success to 75\%, and adding FiLM
+conditioning reaches 80\%. Thus, learned per-turn credit contributes about $+5$pp beyond
+flatGRPO, and goal-aware conditioning adds another $+5$pp over the goal-blind TurnRD variant.
+The early-round curves overlap within uncertainty, but the TurnRD+FiLM advantage emerges later
+as the credit model accumulates useful replay.
+
+The absolute success rates should not be compared directly across benchmarks. WebShop has a
+shorter interaction horizon (max 15 steps) and a more structured search/filter/purchase action
+space, whereas AlfWorld allows up to 40 steps and requires longer compositional action chains.
+We therefore emphasize within-environment improvements over flatGRPO rather than raw
+cross-benchmark success levels.
+
+\begin{table}[H]
+  \caption{AlfWorld held-out terminal success (\%). SFT is the oracle-trajectory warm start;
+  flatGRPO uses trajectory-level credit only. TurnRD and FiLM each add measurable lift.}
+  \label{tab:alfworld}
+  \centering
+  \begin{tabular}{lc}
+    \toprule
+    Method & Success rate (\%) \\
+    \midrule
+    SFT (no RL)                    & 47 \\
+    flatGRPO ($\alpha{=}1$)        & ${\sim}70$ \\
+    HAS + TurnRD (no FiLM)         & 75 \\
+    \textbf{HAS + TurnRD + FiLM (ours)} & \textbf{80} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.82\linewidth]{figures/F4_alfworld_trajectory.pdf}
+  \caption{AlfWorld round-by-round held-out success ($n{=}100$, Wilson 95\% CI bands).
+  TurnRD+FiLM reaches 80\%, while flatGRPO plateaus in the high-60s.}
+  \label{fig:alfworld}
+\end{figure}
+
+\subsection{Qualitative analysis}
+The credit visualizations in \ref{app:extra} provide a mechanism-level view of the quantitative
+improvements. On a 50-task qualitative probe slice, the goal-aware TurnRD+FiLM policy solved
+44 tasks versus 39 for the goal-blind TurnRD variant; it solved every task solved by the
+goal-blind policy plus five additional tasks, with no reversals. This slice is smaller than the
+$n{=}100$ held-out evaluation behind the headline numbers, so we use it as qualitative evidence
+rather than a second benchmark.
+
+Across the matched examples, TurnRD concentrates positive credit on pivotal turns, such as
+locating the target object, moving it to the right receptacle, or issuing the final
+goal-satisfying action, while assigning small or negative credit to detours. In the case where
+the goal-aware policy succeeds and the goal-blind policy fails, TurnRD+FiLM assigns high
+positive credit to instruction-relevant turns, while the goal-blind variant assigns credit to
+locally plausible but ultimately wrong actions. In shared-success cases, both decomposers
+identify terminal goal actions, but the goal-aware model places less credit on detours. In
+shared failures, negative credit concentrates on turns that misdirect the trajectory. These
+examples show how learned goal-aware credit differs from flatGRPO's uniform trajectory credit
+and from heuristic progress signals, which can reward local changes that do not help the
+instruction.
+
+\section{Discussion}
+\label{sec:discussion}
+\textbf{Why does the hybrid blend help?} The $\alpha$-sweep supports the bias--variance
+interpretation of HAS. At $\alpha{=}1$, the update preserves stable group-level ranking but
+remains credit-blind within each trajectory. At very small $\alpha$, the update relies too
+heavily on decomposed turn-level estimates, which are noisy early in training. The strongest
+setting is the hybrid regime, $\alpha{=}0.5$, where trajectory-level ranking anchors the
+update while TurnRD reshapes credit within the trajectory. This explains why HAS improves most
+clearly after replay has accumulated and the decomposer becomes better calibrated.
+
+A pilot AlfWorld sweep under a smaller LoRA-rank-16 setup supports this interpretation
+(Table~\ref{tab:alpha-sweep}). Although the absolute success rates are not directly comparable
+to the final rank-32 runs, the relative ordering is informative: $\alpha{=}0.5$ performs best,
+while both the trajectory-only setting and more extreme mixtures underperform. We therefore use
+$\alpha{=}0.5$ in the main experiments.
+
+\begin{table}[H]
+  \caption{Pilot AlfWorld $\alpha$ sweep under a smaller LoRA-rank-16 setup. Absolute numbers
+  are not directly comparable to the final rank-32 runs, but the sweep supports the hybrid
+  setting used in the main experiments.}
+  \label{tab:alpha-sweep}
+  \centering
+  \begin{tabular}{lc}
+    \toprule
+    Setting & Success rate (\%) \\
+    \midrule
+    flatGRPO ($\alpha{=}1.0$) & 46 \\
+    HAS + TurnRD ($\alpha{=}0.25$) & 56 \\
+    HAS + TurnRD ($\alpha{=}0.50$) & 62 \\
+    HAS + TurnRD ($\alpha{=}0.75$) & 58 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\textbf{What does TurnRD add beyond dense heuristics?} The decomposer comparison isolates the
+source of the gain. Progressive and LLM-Judge both provide denser turn-level signals, but
+neither matches TurnRD. This indicates that the important ingredient is not density alone, but
+a credit model adapted to the policy's own replay distribution. Static heuristics encode
+generic notions of progress, whereas TurnRD can track which turns are predictive under the
+current policy and task distribution.
+
+\textbf{What does goal conditioning add?} The AlfWorld ablation separates learned credit from
+goal-conditioned learned credit. TurnRD without FiLM already improves over flatGRPO, showing
+that learned per-turn decomposition is useful. Adding FiLM gives a further $+5$pp, which is
+consistent with AlfWorld goals making the same local action useful or irrelevant depending on
+the instruction. Figure~\ref{fig:film} reports three mechanism probes. Zeroing $\gamma/\beta$
+changes the per-turn $V$-head credit by $39.7\%$, shuffling goal embeddings worsens $V$-head
+MSE by $3.16\%$ (57.6\% of samples worse), and the FiLM modulation strength grows over rounds
+($\gamma$ norm $0.34 \to 0.83$). These probes show that FiLM is used by the trained model, but
+the modest shuffle effect also suggests that the current goal-conditioning signal is useful
+rather than a complete semantic goal reasoner.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\linewidth]{figures/F7_film_mechanism.pdf}
+  \caption{Offline FiLM mechanism probes: (a) perturbation magnitude, (b) goal-shuffle MSE,
+  and (c) $\gamma/\beta$ norm growth across rounds.}
+  \label{fig:film}
+\end{figure}
+
+\textbf{Failure modes and threats to validity.} The main training risk is distribution lag
+between the policy and the credit model. During policy optimization, TurnRD is frozen; after
+each round, its checkpoint is updated from the cumulative replay buffer with recency weighting
+and then loaded for the next round. This decoupling avoids online credit-model drift within a
+policy update, but the decomposer can still be imperfectly calibrated when the policy
+distribution shifts across rounds. Recency weighting mitigates stale replay, but does not
+eliminate this lag. Second, the goal-shuffle probe shows goal dependence, but the effect is
+modest. One plausible reason is that goal-conditioned variation in raw TurnRD values is
+attenuated by the downstream credit pipeline: projected per-turn credits are group-normalized,
+then blended with the trajectory advantage before entering the PPO objective. Thus, FiLM may be
+useful even when the measured goal-shuffle effect is small; stronger goal-discrimination losses
+or adaptive normalization could make this signal more visible. Third, all reported policy
+updates are LoRA-only on a 1.5B model, leaving open whether larger or fully fine-tuned policies
+would require different $\alpha$ schedules. Finally, the AlfWorld curve is noisy in early
+rounds. The strongest claim supported by the data is a later-stage advantage once TurnRD has
+enough replay to learn useful credit, not monotonic dominance from round 0.
+
+\section{Conclusion}
+\label{sec:conclusion}
+This work studies credit assignment as a central bottleneck in sparse-reward RL for multi-turn
+LLM agents. We introduced Hybrid Advantage Shaping, a GRPO-compatible framework that preserves
+the stable group-relative trajectory objective while adding learned per-turn credit through a
+pluggable decomposer. Instantiated with TurnRD, a goal-aware attention-based decomposer, the
+framework improves success on both WebShop and AlfWorld, outperforming flatGRPO as well as
+heuristic and judge-based turn-level signals.
+
+The main takeaway is that dense credit is most useful when it remains anchored to reliable
+trajectory-level comparisons. flatGRPO supplies stable group-relative ranking but cannot
+distinguish decisive turns from incidental ones; TurnRD supplies that missing intra-trajectory
+structure by learning from replay and conditioning credit on the task goal. The consistent gains
+across two qualitatively different environments suggest that learned, goal-aware turn-level
+credit is a practical missing component for GRPO-style optimization of LLM agents.
+
+More broadly, HAS provides a modular interface for studying credit granularity in agentic RL:
+$\alpha{=}1$ recovers flatGRPO, while intermediate values expose how much learned per-turn
+structure should influence the policy update. This makes the framework useful not only as a
+strong empirical recipe, but also as a tool for analyzing when decomposed credit helps or fails
+in sparse-reward language-agent training.
+
+\section{Team Contributions}
+\begin{itemize}
+  \item \textbf{Joseph Li:} Researched credit assignment for LLM agents; proposed the HAS and
+  TurnRD directions; designed the main experiments; implemented training infrastructure,
+  RL algorithms, replay-buffer plumbing, and goal-conditioning with FiLM; and conducted more
+  than 30 experiments across AlfWorld and WebShop.
+  \item \textbf{Max Rodriguez:} Fine-tuned the supervised warm-start policy, explored
+  alternative modeling and optimization approaches, and helped debug and improve WebShop model
+  performance.
+  \item \textbf{Samantha Leventis:} Ran training and evaluation scripts and trained WebShop
+  models from SFT through RL variants, including TurnRD, LLM-Judge, Progressive, and flatGRPO.
+\end{itemize}
+
+\paragraph{Changes from Proposal.}
+The original proposal framed the project as H-GRPO with several turn-level reward
+decomposition strategies. During experimentation, we consolidated the method around the HAS
+formulation and TurnRD as the strongest learned decomposer, and we added goal-aware FiLM
+conditioning to TurnRD after observing that goal-blind credit assignment was insufficient for
+instruction-conditioned AlfWorld tasks. We also completed the flatGRPO baseline and expanded
+the evaluation to include Progressive and LLM-Judge decomposer comparisons, making the final
+report focus on which source of per-turn credit actually improves sparse-reward LLM-agent RL.
+
+\bibliographystyle{plainnat}
+\bibliography{reference}
+
+% ============================================================================
+% APPENDIX
+% ============================================================================
+\appendix
+\renewcommand{\thesection}{Appendix~\Alph{section}}
+
+\section{Goal-aware vs.\ goal-blind credit assignment}
+\label{app:extra}
+To make the effect of FiLM goal-conditioning concrete, we probe the trained TurnRD decomposer
+on held-out AlfWorld trajectories and visualize its per-turn credit. Each turn shows the
+observation and the agent's action; the action cell is shaded by the per-turn credit (green =
+positive credit, red = blame), normalized per trajectory, with the most decisive turn marked
+$\bigstar$. By construction the per-turn credits sum to the trajectory's terminal reward via
+the v-projection. We contrast the \emph{goal-aware} decomposer (TurnRD\,+\,FiLM) against the
+\emph{goal-blind} variant (TurnRD without FiLM) on three matched cases. The headline case,
+shown first, is a task where the goal-aware policy succeeds while the goal-blind one fails;
+the other two cases show a shared success and a shared failure. The brief result is that
+TurnRD+FiLM solves five additional tasks on this probe slice with no losses relative to the
+goal-blind variant, while the examples below illustrate the mechanism: FiLM changes where
+credit and blame concentrate for the same goal-conditioned task.
+
+\input{figures/credit_sidebyside.tex}
+
+\section{Experiment Details}
+\label{app:expdetails}
+\textbf{Data and evaluation.} AlfWorld experiments use a 1{,}000-game subset of the training
+split for compute control and evaluate on a held-out pool with greedy decoding. WebShop
+experiments use the 1{,}000-product setup described in the main text. We report terminal
+success rate for both environments; dense progress signals are used only for decomposer
+construction or supervision.
+
+\textbf{SFT warm start and policy updates.} The initial policy is Qwen2.5-1.5B-Instruct with a
+rank-32 LoRA adapter trained from oracle trajectories. RL updates continue from this SFT
+checkpoint and keep the base model frozen, updating only LoRA parameters on attention and MLP
+projection modules. Policy updates use $K{=}8$ rollouts per task, PPO-style clipping, and a KL
+penalty to a reference policy.
+
+\textbf{Replay and TurnRD updates.} Replay records store per-turn encoder hidden states,
+per-trajectory goal embeddings, terminal rewards, round indices, and any available progress
+signals. The replay buffer is cumulative and recency-weighted rather than physically trimmed,
+so older rounds remain available but newer policy data has larger influence. TurnRD checkpoint
+updates run separately from policy optimization, and the resulting checkpoint is used as a
+frozen credit model during the policy stage.
+
+\textbf{Compute and logging.} Runs execute on Modal A100-80GB workers. Per-round rollout,
+TurnRD checkpoint, policy-update, and evaluation statistics are logged to manifests, including
+evaluation \texttt{pct\_success}. Table~\ref{tab:hparams} summarizes the shared
+hyperparameters.
+
+\begin{table}[H]
+  \caption{Shared hyperparameters.}
+  \label{tab:hparams}
+  \centering
+  \begin{tabular}{ll}
+    \toprule
+    Setting & Value \\
+    \midrule
+    Base model            & Qwen2.5-1.5B-Instruct \\
+    LoRA rank / targets   & 32 / attention + MLP \\
+    Rounds                & 10 \\
+    Episodes per round    & 80 \\
+    Rollouts per task $K$ & 8 \\
+    Mixing coefficient $\alpha$ & 0.5 (HAS), 1.0 (flatGRPO) \\
+    TurnRD encoder        & 2 layers, 4 heads, hidden $H{=}128$ \\
+    Recency half-life $H$ & 4 rounds \\
+    Eval                  & greedy, $n{=}100$ held-out / round \\
+    Hardware              & A100-80GB (Modal) \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\end{document}
