@@ -7,15 +7,15 @@ Drives `ALFWorldAdapter` over the (trimmed) train games using the
 upstream handcoded PDDL expert. The expert exposes its full optimal
 plan via `info["extra.expert_plan"]` after every reset/step. We pop one
 action at a time (`expert_plan[0]`) so we always re-read the plan
-after each `env.step()` — robust to upstream re-planning if a step
+after each `env.step()` - robust to upstream re-planning if a step
 nondeterministically fails.
 
 For every step we emit one JSONL row with:
-  - prompt  — pre-rendered by `render_alfworld_turn_prompt` (the SAME
+  - prompt  - pre-rendered by `render_alfworld_turn_prompt` (the SAME
               renderer the runtime ReAct collector uses; this is the
               critical anti-template-drift guarantee).
-  - action  — the expert plan action string just executed.
-  - step_idx, trajectory_id, instruction, final_reward — bookkeeping.
+  - action  - the expert plan action string just executed.
+  - step_idx, trajectory_id, instruction, final_reward - bookkeeping.
 
 We KEEP only trajectories where the env reports `won=True` (or
 equivalent: episode terminated with reward > 0). If the expert plan
@@ -132,7 +132,7 @@ def _extract_expert_plan(info: dict) -> list[str]:
     for key in ("extra.expert_plan", "expert_plan"):
         plan = info.get(key)
         if isinstance(plan, (list, tuple)) and plan:
-            # Some adapters wrap once more in a per-batch list — peel it.
+            # Some adapters wrap once more in a per-batch list - peel it.
             first = plan[0]
             if isinstance(first, (list, tuple)) and first and isinstance(first[0], str):
                 return [str(x) for x in first]
@@ -175,7 +175,7 @@ def generate_sft_trajectories(
                  maps to game-index `i % len(game_files)`. Cap at the
                  trimmed-train-set cardinality (default 200).
         output_path: where to write the JSONL on the shared Volume.
-                     Truncated on entry — re-running this app produces a
+                     Truncated on entry - re-running this app produces a
                      fresh dataset.
         max_history_turns: forwarded to the runtime renderer to bound
                            prompt context. MUST match what the runtime
@@ -263,7 +263,7 @@ def generate_sft_trajectories(
 
         for step_idx in range(max_steps_per_episode):
             if not plan:
-                # Expert exhausted before winning → drop trajectory.
+                # Expert exhausted before winning -> drop trajectory.
                 truncated = True
                 break
 
@@ -290,7 +290,7 @@ def generate_sft_trajectories(
 
             # Append a TurnRecord-shaped object to history so the next
             # render sees the prior (obs, action). Use a dataclass-lite
-            # SimpleNamespace — `_format_history` uses getattr so any
+            # SimpleNamespace - `_format_history` uses getattr so any
             # object exposing observation_text + action_text works.
             from types import SimpleNamespace
             history.append(SimpleNamespace(
@@ -314,7 +314,7 @@ def generate_sft_trajectories(
 
             new_plan = _extract_expert_plan(info)
             if not new_plan:
-                # Plan unexpectedly empty mid-trajectory → upstream
+                # Plan unexpectedly empty mid-trajectory -> upstream
                 # re-planning failed. Drop.
                 truncated = True
                 break
@@ -367,7 +367,6 @@ def inspect_sft_dataset(path: str = SFT_OUTPUT_PATH) -> dict:
     Useful smoke test after `generate_sft_trajectories` to confirm the
     file is non-trivial before kicking off the SFT trainer.
     """
-    import json
     import os
     import sys
 
@@ -409,8 +408,8 @@ def main(
     """Local entrypoint dispatching on `--action`.
 
     Actions:
-      generate (default) — run `generate_sft_trajectories(...)`
-      inspect            — pretty-print the dataset summary + first row
+      generate (default) - run `generate_sft_trajectories(...)`
+      inspect            - pretty-print the dataset summary + first row
     """
     import json as _json
     if action == "generate":

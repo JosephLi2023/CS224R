@@ -1,27 +1,23 @@
 """H-GRPO advantage math.
 
-All functions are pure-Python (operate on `list[float]` / `list[list[float]]`)
-so they're trivially unit-testable without torch and so the same code paths
-run in numerical-correctness tests AND in the trainer (which adapts via
-`torch.tensor(_).tolist()` at the boundary). When perf becomes the
-bottleneck we'll add a torch-native path; until then clarity wins.
+Pure-Python (list[float] / list[list[float]]) so it's unit-testable without
+torch and shared between the correctness tests and the trainer.
 
 Notation:
-- K = number of trajectories per task (default: K=4).
-- For trajectory i ∈ {0..K-1}, R_i is the final scalar reward.
-- For turn t in trajectory i, r̂_t^i is the per-turn reward produced by a
+- K = number of trajectories per task (default K=4).
+- For trajectory i, R_i is the final scalar reward.
+- For turn t in trajectory i, r_hat_t^i is the per-turn reward from a
   decomposer (Method A judge / Method B TurnRD / Method C progress).
-- σ_floor (=1e-8) is added inside std() to keep gradients finite when a
+- sigma_floor (=1e-8) is added inside std() to keep gradients finite when a
   group is degenerate (all rewards equal).
 
 Formulas:
+    A_traj(tau_i)        = (R_i - R_bar) / sigma_R
+    A_turn(t, tau_i)     = (r_hat_t^i - r_bar_t) / sigma_{r_hat_t}   per position t
+    A_H(t, tau_i)        = alpha * A_traj + (1 - alpha) * A_turn
+    L_consistency(tau_i) = lambda * norm(sum_t A_turn(t, tau_i) - A_traj(tau_i))^2
 
-    Â_traj(τ_i)        = (R_i − R̄) / σ_R
-    Â_turn(t, τ_i)     = (r̂_t^i − r̄_t) / σ_{r̂_t}        per position t
-    Â_H(t, τ_i)        = α · Â_traj(τ_i) + (1 − α) · Â_turn(t, τ_i)
-    L_consistency(τ_i) = λ · ‖ Σ_t Â_turn(t, τ_i) − Â_traj(τ_i) ‖²
-
-Setting α=1 and λ=0 reduces H-GRPO exactly to flat GRPO; this is unit-tested.
+alpha=1, lambda=0 reduces H-GRPO to flat GRPO; unit-tested.
 """
 
 from __future__ import annotations
@@ -29,9 +25,6 @@ from __future__ import annotations
 import math
 
 SIGMA_FLOOR = 1e-8
-
-
-# ---------- low-level helpers ----------
 
 
 def _mean(xs: list[float]) -> float:
@@ -51,18 +44,8 @@ def _std(xs: list[float], mean: float | None = None) -> float:
     return math.sqrt(var + SIGMA_FLOOR**2)
 
 
-# ---------- trajectory-level advantage ----------
-
-
 def compute_traj_advantages(final_rewards: list[float]) -> list[float]:
-    """Standard GRPO trajectory-level group-normalized advantage.
-
-    Args:
-        final_rewards: length-K list of scalar trajectory rewards R_i.
-
-    Returns:
-        Length-K list of `Â_traj(τ_i) = (R_i − R̄) / σ_R`.
-    """
+    """Group-normalized trajectory advantage: (R_i - R_bar) / sigma_R."""
     if not final_rewards:
         return []
     mean = _mean(final_rewards)
@@ -70,24 +53,12 @@ def compute_traj_advantages(final_rewards: list[float]) -> list[float]:
     return [(r - mean) / std for r in final_rewards]
 
 
-# ---------- turn-level advantage ----------
-
-
 def compute_turn_advantages(per_turn_rewards: list[list[float]]) -> list[list[float]]:
     """Position-wise group-normalized turn advantage.
 
-    For each absolute turn position t, normalize r̂_t^i across the K
-    trajectories that have a turn at position t (uneven trajectory lengths
-    are handled gracefully — turns missing at position t are skipped in the
-    mean/std but the advantage entry is still 0.0 for that trajectory).
-
-    Args:
-        per_turn_rewards: list[K] of list[T_i] of decomposed per-turn rewards
-                          r̂_t^i. T_i may differ across trajectories.
-
-    Returns:
-        list[K] of list[T_i], same shape as input, with each entry replaced
-        by `Â_turn(t, τ_i) = (r̂_t^i − r̄_t) / σ_{r̂_t}`.
+    For each absolute position t, normalize r_hat_t^i across the K
+    trajectories that reach position t. Uneven lengths are fine; missing
+    positions stay 0.0.
     """
     K = len(per_turn_rewards)
     if K == 0:
@@ -117,28 +88,14 @@ def compute_turn_advantages(per_turn_rewards: list[list[float]]) -> list[list[fl
     return out
 
 
-# ---------- combination + consistency ----------
-
-
 def combine(
     alpha: float,
     traj_advantages: list[float],
     turn_advantages: list[list[float]],
 ) -> list[list[float]]:
-    """Combine trajectory- and turn-level advantages.
+    """Combine advantages: A_H = alpha * A_traj + (1 - alpha) * A_turn.
 
-    Â_H(t, τ_i) = α · Â_traj(τ_i) + (1 − α) · Â_turn(t, τ_i)
-
-    Args:
-        alpha: weight on trajectory-level advantage in [0, 1].
-               α=1 ⇒ flat GRPO (turn signal dropped).
-               α=0 ⇒ pure turn-level signal (no group baseline).
-        traj_advantages: length-K list of `Â_traj(τ_i)`.
-        turn_advantages: list[K] of list[T_i] of `Â_turn(t, τ_i)`.
-
-    Returns:
-        list[K] of list[T_i] of combined per-turn advantages, ready to be
-        broadcast over action tokens for the PPO surrogate loss.
+    alpha=1 -> flat GRPO; alpha=0 -> pure turn-level signal.
     """
     if not (0.0 <= alpha <= 1.0):
         raise ValueError(f"alpha must be in [0, 1], got {alpha}")
@@ -159,18 +116,9 @@ def consistency_loss(
     traj_advantages: list[float],
     turn_advantages: list[list[float]],
 ) -> float:
-    """L_consistency = λ · mean_i ‖ Σ_t Â_turn(t, τ_i) − Â_traj(τ_i) ‖²
+    """L_consistency = lambda * mean_i (sum_t A_turn(t, tau_i) - A_traj(tau_i))^2.
 
-    Aligns the turn-level signal scale with the trajectory-level scale.
-    Returns 0 exactly when, for every i, Σ_t Â_turn(t, τ_i) = Â_traj(τ_i).
-
-    Args:
-        lam: weight on the regularizer (0 disables it).
-        traj_advantages: length-K list of `Â_traj(τ_i)`.
-        turn_advantages: list[K] of list[T_i] of `Â_turn(t, τ_i)`.
-
-    Returns:
-        Scalar loss (mean over the K trajectories of the squared deviation).
+    Aligns turn- and trajectory-level signal scales; 0 when they match.
     """
     if lam == 0.0:
         return 0.0
@@ -195,24 +143,12 @@ def consistency_loss_tensor(
     turn_adv,
     attention_mask,
 ):
-    """Torch-tensor twin of `consistency_loss`.
+    """Torch-tensor twin of `consistency_loss` so gradients reach a learnable
+    decomposer (Method B/TurnRD). Returns a scalar tensor
+    lam * mean_i (sum_t A_turn * m_t - A_traj)^2. Only called when
+    decomposer.has_learnable_params is True.
 
-    Mirrors the same math but returns a scalar `torch.Tensor` so the
-    gradient can flow back into a learnable decomposer (Method B/TurnRD).
-    The pure-Python `consistency_loss` above stays as the source of
-    truth for stats reporting on Methods A/C; `consistency_loss_tensor`
-    is only invoked from the trainer when
-    `decomposer.has_learnable_params is True`.
-
-    Args:
-        lam: weight on the regularizer (0.0 returns a zero scalar tensor
-            that still has a graph parent so `.backward()` doesn't fail).
-        traj_adv: `[B]` tensor of `Â_traj(τ_i)`.
-        turn_adv: `[B, T]` tensor of `Â_turn(t, τ_i)`.
-        attention_mask: `[B, T]` long/bool tensor (1 = real, 0 = padded).
-
-    Returns:
-        Scalar `torch.Tensor` `lam * mean_i ‖ Σ_t Â_turn(t, τ_i)·m_t − Â_traj(τ_i) ‖²`.
+    attention_mask is [B, T] (1 = real, 0 = padded).
     """
     # Local import: keep module load torch-free for pure-Python tests.
     import torch  # type: ignore[import-not-found]
@@ -244,7 +180,7 @@ def consistency_loss_tensor(
         )
 
     if turn_adv.shape[0] == 0:
-        # Empty batch — return a 0 that still depends on traj_adv so the
+        # Empty batch - return a 0 that still depends on traj_adv so the
         # graph stays connected if the caller wants .backward() on it.
         return lam * (traj_adv.sum() * 0.0)
 

@@ -1,75 +1,48 @@
 #!/usr/bin/env bash
-# AlfWorld SOTA — Flat GRPO baseline (α=1.0) to quantify credit-assignment lift.
+# AlfWorld SOTA - Flat GRPO baseline (alpha=1.0) to quantify credit-assignment lift.
 #
-# Why this exists
-# ===============
 # The alpha-sweep (reports/alfworld_alpha_sweep_README.md) tested
-# α ∈ {0.25, 0.50, 0.75} but never α=1.0 — so we can't isolate how
-# much of the TurnRDV2 SOTA gain is the per-turn signal vs the
-# Tier-2 fix-package (lr=5e-6, K=8, dead-K guard).
+# alpha in {0.25, 0.50, 0.75} but never alpha=1.0, so we can't isolate how
+# much of the TurnRDV2 SOTA gain is the per-turn signal vs the Tier-2
+# fix-package (lr=5e-6, K=8, dead-K guard).
 #
-# This run flips ONLY two knobs vs the SOTA recipe:
-#   1. hgpo.alpha          : 0.5 → 1.0   (drop per-turn signal; A_H = A_traj)
-#   2. hgpo.decomposer     : turnrd → progress
-#                            (decomposer is mathematically inert at α=1.0;
-#                             switching to 'progress' removes the TurnRD
-#                             model + replay buffer + train_turnrd-per-round
-#                             cycle entirely → cheaper run, cleaner baseline)
+# This run flips two knobs vs the SOTA recipe:
+#   1. hgpo.alpha          : 0.5 -> 1.0   (drop per-turn signal; A_H = A_traj)
+#   2. hgpo.decomposer     : turnrd -> progress
+#                            (decomposer is inert at alpha=1.0; switching to
+#                             'progress' removes the TurnRD model + replay
+#                             buffer + per-round train_turnrd cycle)
 # Everything else (env, K=8, lr=5e-6, kl=0.04, rank-32 LoRA + MLP targets,
 # num_train_games=400, dense intermediate_reward signals, eval pool, warm-start
-# adapter family, rounds=10, eps/round=80, T=1.0) is byte-for-byte identical
-# to scripts/run_alfworld_SOTA_10round_mlpr32_v3.sh — guaranteeing the
-# eval delta isolates the per-turn signal's contribution.
+# adapter family, rounds=10, eps/round=80, T=1.0) is identical to
+# scripts/run_alfworld_SOTA_10round_mlpr32_v3.sh, so the eval delta isolates
+# the per-turn signal's contribution.
 #
-# Why decomposer="progress" not "turnrd" at α=1.0
-# -----------------------------------------------
-# At α=1.0 the combined advantage is A_H = 1.0·A_traj + 0.0·A_turn, so
-# A_turn is multiplied by zero regardless of the decomposer. But the
-# trainer still calls the decomposer (and the orchestrator still runs
-# train_turnrd between rounds) unless we switch to a pure-Python one.
-# decomposer='progress' is parameter-free + costs ~0 → the cleanest
-# null hypothesis for "is the per-turn signal worth the compute?"
+# decomposer='progress' (not 'turnrd') at alpha=1.0: the combined advantage
+# is A_H = 1.0*A_traj + 0.0*A_turn, so A_turn is multiplied by zero regardless
+# of the decomposer (see combine in src/algorithms/grpo/advantage.py:130).
+# 'progress' is pure-Python and parameter-free, so it avoids building a V-head
+# and running train_turnrd per round. This is NOT Progress-HGPO (Method C),
+# which runs decomposer='progress' at alpha<1.0 so the per-turn signal flows.
 #
-# IMPORTANT — this is NOT "Progress HGPO" (Method C). The
-# `progress_decomposer` (src/algorithms/grpo/trainer.py:131) is the
-# same callable Method C uses, but Method C runs it at α<1.0 so the
-# per-turn raw_env_reward actually flows through (1-α)·A_turn. Here
-# at α=1.0 the per-turn signal is multiplied by zero in `combine`
-# (src/algorithms/grpo/advantage.py:130), and lambda_consistency=0.0
-# means it doesn't feed the consistency loss either. So the
-# decomposer call is a discarded computation — the math is exactly
-# pure flat GRPO. We pick 'progress' specifically because it's
-# pure-Python and parameter-free (vs 'turnrd' which would build a
-# V-head + run train_turnrd per round, wasting ~5 min × 10 rounds).
-# For a real Progress-HGPO baseline you'd want a separate config with
-# alpha=0.5 + decomposer='progress'.
-#
-# Geometry (seed=41, rounds=10, eps=80)
-# =====================================
-#   base_task_id_offset = 41 × 10 × 80 = 32800
+# Geometry (seed=41, rounds=10, eps=80):
+#   base_task_id_offset = 41 * 10 * 80 = 32800
 #   train task range    = [32800, 33600)
 #   eval task range     = [6500, 6600)   (disjoint, identical to v3 SOTA)
-#   disjoint from v1 (seed=11 → [5280, 5760)) ✓
-#   disjoint from v2 (seed=23 → [14720, 15360)) ✓
-#   disjoint from v3 (seed=31 → [24800, 25600)) ✓
+#   disjoint from v1 (seed=11 -> [5280, 5760))
+#   disjoint from v2 (seed=23 -> [14720, 15360))
+#   disjoint from v3 (seed=31 -> [24800, 25600))
 #
-# Compute envelope
-# ================
-# ~4-5 hours wall-clock, ~$25. Faster than v3 SOTA (~6-8h, ~$45) because
-# there's no train_turnrd per round (~5 min × 10 rounds saved) and no
-# /vol/cache/turnrd_* IO. Can be launched in parallel with v3 SOTA —
-# disjoint task slice + disjoint run-name prefix → no Modal volume
-# cache or adapter-dir collision.
+# ~4-5 hours wall-clock. Faster than v3 SOTA because there's no train_turnrd
+# per round and no /vol/cache/turnrd_* IO. Can run in parallel with v3 SOTA -
+# disjoint task slice and run-name prefix.
 #
-# Pass criterion
-# ==============
-# Expected α=1.0 mean pct_success should land near α=0.75 mean (0.518)
-# from the alpha-sweep — extrapolating the unimodal-in-α pattern. The
-# credit-assignment lift is then quantified as:
-#     lift = (v3 SOTA α=0.5 best mean) − (this run α=1.0 best mean)
-# A null result (this run ≥ v3 SOTA mean − noise floor) would imply
-# the per-turn signal contributes <2pp lift, consistent with the
-# noise-analysis predictions in reports/turn_adv_noise_analysis.md.
+# Pass criterion: expected alpha=1.0 mean pct_success should land near
+# alpha=0.75 mean (0.518) from the alpha-sweep. The credit-assignment lift is
+# quantified as: lift = (v3 SOTA alpha=0.5 best mean) - (this run alpha=1.0
+# best mean). A null result (this run >= v3 SOTA mean - noise floor) would
+# imply the per-turn signal contributes <2pp lift, consistent with
+# reports/turn_adv_noise_analysis.md.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -143,15 +116,15 @@ if [[ -z "${MAX_TURNS}" ]]; then
   echo "ERROR: env.max_steps probe returned empty for ${CONFIG}"; exit 1
 fi
 
-echo "═══════════════════════════════════════════════════════════════════════"
-echo "AlfWorld SOTA — Flat GRPO baseline α=1.0 (seed=${SEED}, eps=${EPS_PER_ROUND}, T=${ROLLOUT_TEMP})"
+echo "========================================"
+echo "AlfWorld SOTA - Flat GRPO baseline alpha=1.0 (seed=${SEED}, eps=${EPS_PER_ROUND}, T=${ROLLOUT_TEMP})"
 echo "  config             : ${CONFIG}"
 echo "  sft_adapter (R0)   : ${SFT_ADAPTER}"
 echo "  run-name-prefix    : ${RUN_PREFIX}"
 echo "  rounds             : ${ROUNDS} (start at R${START_ROUND})"
 echo "  episodes/round     : ${EPS_PER_ROUND}"
 echo "  eval episodes      : ${EVAL_EPS}"
-echo "  seed               : ${SEED}  (\u2260 v1=11, v2=23, v3=31 \u2014 disjoint task slice)"
+echo "  seed               : ${SEED}  (!= v1=11, v2=23, v3=31 - disjoint task slice)"
 echo "  K per task         : ${K_PER_TASK}    (from config)"
 echo "  max_turns          : ${MAX_TURNS}    (from config env.max_steps)"
 echo "  gpu_mem_util       : ${GPU_MEM_UTIL:-<unset>}    (from config)"
@@ -164,12 +137,12 @@ echo "  adapter dir (vol)  : ${ADAPTER_DIR}"
 echo "  log                : ${LOG}"
 echo "  pidfile            : ${PIDFILE}"
 echo ""
-echo "  H-GRPO blend       : α=1.0 (pure trajectory advantage; per-turn signal OFF)"
-echo "  Decomposer         : 'progress' (inert at α=1.0; no TurnRD model built)"
+echo "  H-GRPO blend       : alpha=1.0 (pure trajectory advantage; per-turn signal OFF)"
+echo "  Decomposer         : 'progress' (inert at alpha=1.0; no TurnRD model built)"
 echo "  Driver             : per-round \`modal run\` loop (run_turnrd_modal.py"
 echo "                       requires decomposer='turnrd'; not applicable here)."
-echo "  Parallel-safe      : YES \u2014 disjoint task ranges + disjoint run-name prefix."
-echo "═══════════════════════════════════════════════════════════════════════"
+echo "  Parallel-safe      : YES - disjoint task ranges + disjoint run-name prefix."
+echo "========================================"
 
 # In-bash per-round driver. Adapter chaining mirrors run_turnrd_modal.py's
 # carry-policy mode: R0 loads ${SFT_ADAPTER}; R_N>0 loads R_{N-1}'s saved
@@ -218,11 +191,11 @@ run_rounds () {
         fi
 
         echo ""
-        echo "┌── Round ${round_idx}/${ROUNDS} (offset=${task_offset}, load=${load_adapter##*/}, save=${save_adapter##*/})"
-        echo "│  $ ${cmd[*]}"
+        echo "-- Round ${round_idx}/${ROUNDS} (offset=${task_offset}, load=${load_adapter##*/}, save=${save_adapter##*/})"
+        echo "   $ ${cmd[*]}"
         "${cmd[@]}"
         rc=$?
-        echo "└── Round ${round_idx} exit=${rc}"
+        echo "-- Round ${round_idx} exit=${rc}"
         if [[ ${rc} -ne 0 ]]; then
             echo "ERROR: round ${round_idx} exited ${rc}. Aborting; restart with START_ROUND=${round_idx}." >&2
             return ${rc}
@@ -248,21 +221,21 @@ run_rounds
 ORCH_PID=$!
 disown $ORCH_PID
 echo $ORCH_PID > "$PIDFILE"
-echo "AlfWorld flatGRPO α=1.0 baseline launched: PID=$ORCH_PID"
+echo "AlfWorld flatGRPO alpha=1.0 baseline launched: PID=$ORCH_PID"
 echo "  Log: $LOG"
 echo "  PID: $PIDFILE"
-echo "  ETA: ~4-5 hours, ~\$25"
+echo "  ETA: ~4-5 hours"
 echo ""
 echo "Tail the log with:   tail -f $LOG"
 echo ""
 echo "Analysis after completion:"
 echo "  1. Each round's eval pct_success is in the round's train_log.json on"
 echo "     /vol/manifests/${RUN_PREFIX}_seed${SEED}_round<NN>_<ts>/."
-echo "  2. Compare against TurnRDV2_alfworld_SOTA_10round_mlpr32_v3 (α=0.5)"
-echo "     and the existing alpha-sweep mean (α=0.5: 0.540, α=0.75: 0.518,"
-echo "     α=0.25: 0.514). Expected α=1.0 ≈ α=0.75 ≈ 0.52."
+echo "  2. Compare against TurnRDV2_alfworld_SOTA_10round_mlpr32_v3 (alpha=0.5)"
+echo "     and the existing alpha-sweep mean (alpha=0.5: 0.540, alpha=0.75: 0.518,"
+echo "     alpha=0.25: 0.514). Expected alpha=1.0 ~ alpha=0.75 ~ 0.52."
 echo "  3. Credit-assignment lift estimate ="
-echo "       (v3 SOTA final-round eval) − (this run's final-round eval)."
-echo "     Lift > noise floor (\u00b15pp at n=100) confirms TurnRD adds signal;"
-echo "     lift ≤ noise floor confirms the noise-analysis prediction that"
+echo "       (v3 SOTA final-round eval) - (this run's final-round eval)."
+echo "     Lift > noise floor (+/-5pp at n=100) confirms TurnRD adds signal;"
+echo "     lift <= noise floor confirms the noise-analysis prediction that"
 echo "     the per-turn channel contributes <2pp."

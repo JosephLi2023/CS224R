@@ -93,66 +93,32 @@ class RolloutCollector:
         reuse_envs: bool = True,
         *,
         # Optional TurnRD replay-buffer producer hook.
-        # All None ⇒ producer disabled, default behavior unchanged.
+        # All None -> producer disabled, default behavior unchanged.
         turnrd_emit_path: str | os.PathLike[str] | None = None,
         turnrd_embedder: TurnEmbedder | None = None,
-        # Mode-2 only — supplies per-trajectory normalized labels via a
-        # JudgeDecomposer call. None ⇒ Mode 1 (no judge_labels emitted;
-        # records have judge_labels=None which the dataset reader keeps
-        # for Mode 1 and drops for Mode 2).
+        # Mode-2 only - per-trajectory normalized labels via a
+        # JudgeDecomposer call. None -> Mode 1 (judge_labels=None).
         judge_decomposer: TurnRewardDecomposerLike | None = None,
-        # Round index (0-based) under the orchestrator's protocol. When
-        # set, the value is written into every emitted TurnRD replay row
-        # as `round_idx`, enabling the recency-decay path in
-        # `src.turnrd.train.train_turnrd`. `None` preserves legacy
-        # behavior (rows lack the field; loaders treat them as legacy
-        # and apply a fixed default weight when decay is enabled).
+        # Round index (0-based); written to each emitted row as `round_idx`
+        # for the recency-decay path. None -> legacy rows without the field.
         round_idx: int | None = None,
-        # When True (and `turnrd_emit_path` is set), the producer parses
-        # the AlfWorld goal substring from each trajectory's Turn 0
-        # observation (via `src.turnrd.goal_extractor.extract_goal_text`)
-        # and writes it as `goal_text` on the emitted record. Used by the
-        # FiLM goal-conditioned V-head. No-op (goal_text stays None) on
-        # non-AlfWorld envs or when the Turn 0 obs doesn't contain the
-        # canonical "Your task is to: ..." pattern. Default False
-        # preserves byte-for-byte legacy producer output.
+        # When True (and turnrd_emit_path set), parse the AlfWorld goal from
+        # each trajectory's Turn 0 obs and write it as `goal_text`. No-op on
+        # non-AlfWorld envs. Default False preserves legacy output.
         turnrd_emit_goal_text: bool = False,
-        # Optional FiLM goal embedding. When True and goal text emission is
-        # enabled, the producer additionally calls
-        # `turnrd_embedder` on a synthetic single-turn trajectory whose
-        # observation_text is the parsed `goal_text`, taking the
-        # resulting `[1, D]` row 0 as a `[D]` per-trajectory goal
-        # embedding. The embedding is written to the JSONL as
-        # `goal_emb` and consumed by the FiLM-modulated V-head at
-        # train time. Default False preserves byte-for-byte legacy
-        # behaviour. Cached within a `collect_group` call by
-        # `goal_text` since the same task's K rollouts share a goal.
+        # When True (with goal-text emission), also embed the goal text and
+        # write it as `goal_emb` for the FiLM V-head. Cached per goal_text
+        # within a collect_group call. Default False.
         turnrd_emit_goal_emb: bool = False,
     ) -> None:
         """K-trajectory rollout collector.
 
-        Args:
-            reuse_envs: when True (default), env instances built on the first
-                `collect_group` call are cached and reused across episodes
-                via `env.reset()`. Skips the ~5–8 s of WebShop product/goal
-                loading per episode (review M2). Set False for unit tests
-                that require fresh env state on every call.
-            turnrd_emit_path: optional path to a JSONL file. When set,
-                `collect_group` appends one row per non-empty trajectory
-                using the schema defined by
-                `src.turnrd.dataset.TurnRDRecord`. The parent directory is
-                created lazily on first emit. Append + flush + fsync per
-                row so a crash never leaves a half-written line.
-            turnrd_embedder: required when `turnrd_emit_path` is set. A
-                `Callable[[Trajectory], torch.Tensor]` returning per-turn
-                embeddings of shape `[T_i, D]` (CPU fp32 recommended; the
-                producer calls `.tolist()` to serialize as JSON).
-            judge_decomposer: optional. When set, each `collect_group` call
-                runs `judge_decomposer.decompose(group)` ONCE per group
-                and writes the returned `list[T_i]` of normalized labels
-                into each row's `judge_labels` field — enabling Mode-2
-                replay buffers. With a warm Method-A judge cache this is
-                a pure read (no fresh judge calls).
+        With reuse_envs=True (default), env instances are cached and reused
+        across episodes via env.reset() (skips WebShop reload; review M2).
+        When turnrd_emit_path is set, each collect_group appends one
+        TurnRDRecord JSONL row per non-empty trajectory (flush + fsync per
+        row); turnrd_embedder is required and judge_decomposer enables Mode-2
+        labels.
         """
         self.runner = runner
         self.env_factory = env_factory
@@ -203,7 +169,7 @@ class RolloutCollector:
         K: int,
         sampling: Any,
     ) -> tuple[TrajectoryGroup, CollectStats]:
-        """K parallel rollouts on the same task → populated TrajectoryGroup."""
+        """K parallel rollouts on the same task -> populated TrajectoryGroup."""
         if getattr(sampling, "n", 1) != 1:
             sampling = _override_n(sampling, 1)
 
@@ -228,15 +194,9 @@ class RolloutCollector:
             outs = self.runner.generate_rich(prompts, sampling)
 
             for j, i in enumerate(live_idx):
-                # Defensive: vLLM can return an EMPTY completion list for a
-                # prompt when greedy sampling (T=0) immediately predicts
-                # EOS as the top-1 token — `outs[j] = []`, and the next
-                # line would raise IndexError. Treat as a no-op turn:
-                # empty action text + no tokens. The env will step on
-                # "" and likely return done=True with reward 0, which is
-                # the correct eval behavior (the policy failed to
-                # produce an action). Same defensive guard for the very
-                # rare case where len(outs) < len(live_idx).
+                # Defensive: vLLM may return an empty completion list (e.g.
+                # greedy EOS as top-1) -> treat as a no-op turn (empty action,
+                # no tokens). Also guards len(outs) < len(live_idx).
                 gen_list = outs[j] if j < len(outs) else []
                 if not gen_list:
                     class _EmptyGen:  # noqa: D401  (defensive empty stub)
@@ -260,14 +220,9 @@ class RolloutCollector:
                 prompt_token_count = int(getattr(gen, "prompt_token_count", 0) or 0)
                 prompt_token_ids = tuple(getattr(gen, "prompt_token_ids", ()) or ())
 
-                # Optional dense per-turn shaping signal sourced from
-                # the env adapter via `info["intermediate_reward"]`. On
-                # ALFWorld this is the expert-plan-length reduction
-                # ("did this action move strictly closer to the goal?").
-                # Other envs (WebShop, FakeWebShop) don't surface the
-                # field → stays None → the producer's `progress_signal`
-                # all-or-nothing emission gate keeps them on the legacy
-                # `progress` (raw_env_reward) path.
+                # Optional dense per-turn shaping signal from the env adapter
+                # via info["intermediate_reward"] (ALFWorld expert-plan-length
+                # delta). None on envs that don't surface it (WebShop).
                 inter_raw = info.get("intermediate_reward") if isinstance(info, dict) else None
                 intermediate_reward = float(inter_raw) if inter_raw is not None else None
 
@@ -321,27 +276,15 @@ class RolloutCollector:
 
         return group, stats
 
-    # -------------------------------------------------------------------
     # TurnRD replay-buffer producer
-    # -------------------------------------------------------------------
 
     def _emit_turnrd_records(self, group: TrajectoryGroup) -> None:
-        """Append one JSONL row per non-empty trajectory in `group`.
+        """Append one JSONL row (TurnRDRecord) per non-empty trajectory.
 
-        Schema matches `src.turnrd.dataset.TurnRDRecord`:
-          {"task_id", "turn_embeds", "final_reward", "judge_labels"}.
-
-        Mode 2 (when `judge_decomposer` is set) calls
-        `judge_decomposer.decompose(group)` once per group; the returned
-        `list[K] of list[T_i]` is sliced into per-row `judge_labels`.
-        Mode 1 (no judge decomposer) writes `judge_labels: None` and the
-        dataset reader keeps the row.
-
-        Empty trajectories are skipped (matches the dataset reader's
-        drop-and-warn semantics — keeps producer + reader aligned).
-
-        Atomicity: append-mode write + flush + fsync per row so a crash
-        between trajectories never leaves a half-written line.
+        Mode 2 (judge_decomposer set) calls decompose(group) once and slices
+        the result into per-row judge_labels; Mode 1 writes judge_labels=None.
+        Empty trajectories are skipped. Each row is flushed + fsync'd so a
+        crash never leaves a half-written line.
         """
         # Local import keeps the collector module torch-free at import time.
         from src.turnrd.dataset import TurnRDRecord  # type: ignore[import-not-found]
@@ -386,7 +329,7 @@ class RolloutCollector:
             for i, traj in enumerate(group.trajectories):
                 if not traj.turns:
                     # Match dataset-reader behavior: empty trajectories are
-                    # skipped (no row → no later warning at load time).
+                    # skipped (no row -> no later warning at load time).
                     continue
                 embed_t = self._turnrd_embedder(traj)
                 # Defensive: validate shape before serialising. The
@@ -398,11 +341,8 @@ class RolloutCollector:
                         f"{len(traj.turns)} turns (task_id={traj.task_id})."
                     )
                 turn_embeds = embed_t.detach().to(device="cpu").tolist()
-                # Per-turn env signal: AlfWorld + WebShop step rewards are
-                # already deltas (env.step returns the per-step reward,
-                # not cumulative), so we forward them as-is. Used by the
-                # v2 trainer as the per-turn value-head target (replaces
-                # the placeholder R/T_i target).
+                # Per-turn env signal: step rewards are already deltas, so
+                # forward as-is (v2 trainer's per-turn value-head target).
                 progress: list[float] = [float(t.raw_env_reward) for t in traj.turns]
                 # Optional dense progress signal sourced from the env
                 # adapter (e.g. ALFWorld expert-plan-length deltas). All-
@@ -412,34 +352,10 @@ class RolloutCollector:
                 # signal or none at all (no partial coverage that would
                 # masquerade as zeros at masked-out positions).
                 progress_signal: list[float] | None
-                # Per-trajectory coverage gate. Originally "all turns must
-                # have intermediate_reward" — too strict in production:
-                # ALFWorld trajectories occasionally have a single turn
-                # with `info["intermediate_reward"]=None` (e.g., recovered
-                # mid-rollout from a transient env exception, or from a
-                # turn that ran on a stale image where the adapter didn't
-                # populate the field). The all-or-nothing gate dropped the
-                # ENTIRE trajectory's V-head supervision signal in those
-                # cases — observed ~33% trajectory dropout in the
-                # facts-diff bake-off (2026-05-13 telemetry).
-                #
-                # New rule: emit if ANY turn has a non-None
-                # intermediate_reward, zero-filling the missing turns.
-                # Rationale:
-                #   - "ANY turn has signal" cleanly distinguishes envs
-                #     that SUPPORT the field (ALFWorld) from envs that
-                #     don't (WebShop — produces None every turn → still
-                #     emits progress_signal=None, preserving legacy gate
-                #     behavior for non-ALFWorld envs).
-                #   - Missing-turn → 0.0 is a semantically valid V-head
-                #     target ("no PDDL fact change observed for this
-                #     step"). The downstream V-head loss is regression
-                #     against this scalar, so a zero-filled position is
-                #     just a "no progress" supervised example, not a
-                #     masked-out artifact.
-                #   - Empty trajectories still produce None (the absence
-                #     sentinel) — see the empty-trajectory regression
-                #     test.
+                # Emit if ANY turn has a non-None intermediate_reward,
+                # zero-filling missing turns (a zero is a valid "no progress"
+                # V-head target). Envs that never set it (WebShop) -> None.
+                # Empty trajectories still produce None.
                 if traj.turns and any(t.intermediate_reward is not None for t in traj.turns):
                     progress_signal = [
                         float(t.intermediate_reward) if t.intermediate_reward is not None else 0.0
@@ -459,12 +375,9 @@ class RolloutCollector:
                     judge_labels = [float(x) for x in raw]
                 else:
                     judge_labels = None
-                # Goal text (FiLM goal-conditioned V-head input). When
-                # the collector is configured to emit goal text AND the
-                # AlfWorld goal-extractor finds a "Your task is to: ..."
-                # line in the Turn 0 observation, populate `goal_text`.
-                # Otherwise stays None — back-compat for non-AlfWorld
-                # envs and malformed prompts.
+                # Goal text for the FiLM goal-conditioned V-head. Populated
+                # when goal-text emission is on and the extractor finds a goal
+                # in the Turn 0 obs; otherwise None.
                 goal_text_v: str | None = None
                 goal_emb_v: list[float] | None = None
                 if (
@@ -475,14 +388,9 @@ class RolloutCollector:
                     goal_text_v = extract_goal_text(
                         traj.turns[0].observation_text or ""
                     )
-                    # Compute a per-trajectory goal embedding with the same
-                    # embedder used for per-turn embeddings. Use a synthetic
-                    # single-turn trajectory whose observation is the parsed goal,
-                    # call the embedder, and take row 0. This keeps the
-                    # V-head's inputs in a consistent representation
-                    # space without introducing a separate text-encoder
-                    # dependency. Cached by goal_text within the round
-                    # so K rollouts of the same task share the call.
+                    # Goal embedding: run the same embedder on a synthetic
+                    # single-turn trajectory (obs = goal text), take row 0.
+                    # Cached by goal_text so the K rollouts share one call.
                     if (
                         self._turnrd_emit_goal_emb
                         and goal_text_v is not None
@@ -518,10 +426,8 @@ class RolloutCollector:
                                 )
                                 self._goal_emb_cache[cache_key] = goal_emb_v
                             except Exception as exc:  # pragma: no cover
-                                # Embedder failures (e.g., tokenizer
-                                # quirk on an unusual goal string) must
-                                # not crash the producer — fall back to
-                                # goal_emb=None on this trajectory.
+                                # Embedder failure must not crash the
+                                # producer - fall back to goal_emb=None.
                                 logger.warning(
                                     "TurnRD producer: goal_emb embedder failed "
                                     "for task_id=%s (%s); emitting goal_emb=None.",

@@ -7,12 +7,12 @@ keeps training while TurnRD's reward decomposition is periodically
 re-fitted from the accumulated replay buffer.
 
   Round 0: warm-up
-    - train_loop emits replay rows (no TurnRD ckpt yet → trainer's
+    - train_loop emits replay rows (no TurnRD ckpt yet -> trainer's
       refresh_fn logs a warning and skips the load; the in-memory
       decomposer trains from random init).
     - train_turnrd then fits TurnRD on the accumulated rows and writes
       the first ckpt.
-  Round i ≥ 1: refresh-driven
+  Round i >= 1: refresh-driven
     - train_loop runs `--episodes-per-round` more episodes. The
       trainer's refresh_fn (built by build_trainer_from_config when
       `cfg.turnrd.ckpt_path` is set) loads the previous round's ckpt
@@ -21,7 +21,7 @@ re-fitted from the accumulated replay buffer.
     - train_turnrd re-fits on the (now larger) replay buffer.
 
 The `/vol/...` paths are shared across Modal container instances via
-the cs224r project Volume — see `infra/common.py::volume`.
+the cs224r project Volume - see `infra/common.py::volume`.
 
 Usage:
   scripts/run_turnrd_modal.py --rounds 5 --episodes-per-round 40
@@ -29,16 +29,16 @@ Usage:
   scripts/run_turnrd_modal.py --rounds 1 --episodes-per-round 2 --turnrd-epochs 1   # tiny smoke
 
 Wall-clock budget (real protocol, real WebShop, K=4 trajectories):
-  Per round: ~12-15 min train_loop + ~30 s standalone fit ≈ 13-16 min.
+  Per round: ~12-15 min train_loop + ~30 s standalone fit ~ 13-16 min.
   5-round protocol: ~65-80 min total (assume 90 min for safety).
 
-  → If running from a devmate session, set the execute_command timeout
+  - If running from a devmate session, set the execute_command timeout
     to >= 7200000 ms (2 hours). The previous 60-min cap killed the
     LOCAL polling subprocess at the boundary between Round 3 and
-    Round 4 — note that this only kills the local poller; the cloud
+    Round 4 - note that this only kills the local poller; the cloud
     jobs themselves are detached so they continue, but the
     orchestrator stops submitting subsequent rounds.
-  → For long unattended runs, prefer running this script under
+  - For long unattended runs, prefer running this script under
     `nohup` in a separate terminal so its lifetime is bounded only
     by the actual orchestration, not by any IDE/agent session
     timeout. Example:
@@ -88,7 +88,7 @@ class OrchestrationConfig:
     turnrd_mode: int = 1
     turnrd_batch_size: int = 16
     turnrd_lr: float = 1e-4
-    # Modal volume paths — must match `cfg.turnrd.replay_buffer_path`
+    # Modal volume paths - must match `cfg.turnrd.replay_buffer_path`
     # and `cfg.turnrd.ckpt_path` in the JSON config (we cross-check
     # below to surface mismatches before launching anything on Modal).
     replay_path: str = "/vol/cache/turnrd_replay.jsonl"
@@ -98,7 +98,7 @@ class OrchestrationConfig:
     # set, the parent train_loop loads it via PEFT.load_adapter() and
     # syncs the merged weights into vLLM before the first episode.
     # Without this, cold-start RL on real WebShop typically produces
-    # R≈0 for hundreds of episodes — the protocol's TurnRD signal
+    # R~0 for hundreds of episodes - the protocol's TurnRD signal
     # depends on having non-trivially-trained policy producing
     # reward variance from episode 0.
     sft_adapter: str = ""
@@ -106,13 +106,13 @@ class OrchestrationConfig:
     # greedy sampling on a disjoint task range so the eval is stable
     # AND comparable across rounds + methods + seeds. Default
     # `[6500, 6550)` is INSIDE WebShop's ~6910-goal range AND disjoint
-    # from training task ranges (seed 11 → [2200, 2400),
-    # seed 23 → [4600, 4800)). Higher offsets like 10000 raise
+    # from training task ranges (seed 11 -> [2200, 2400),
+    # seed 23 -> [4600, 4800)). Higher offsets like 10000 raise
     # `IndexError` in WebShop's `web_agent_text_env.py:512`. Set
     # --eval-episodes 0 to disable.
     eval_episodes: int = 50
     eval_task_id_base: int = 6500
-    # Multi-seed protocol support. None ⇒ no seed-specific offset
+    # Multi-seed protocol support. None -> no seed-specific offset
     # applied (legacy single-run behavior). When set, each seed gets a
     # disjoint task_id range so different seeds never train on the same
     # WebShop tasks. Also tags the run-name-prefix with `_seed{N}`.
@@ -121,7 +121,7 @@ class OrchestrationConfig:
     # all prior single-env sweeps). When set to `alfworld`, the
     # orchestrator calls `train_loop_alfworld.remote(...)` (binding
     # the AlfWorld-runtime image) and the eval-task-id-range guard is
-    # widened — AlfWorld's adapter wraps task_id with `% len(games)`
+    # widened - AlfWorld's adapter wraps task_id with `% len(games)`
     # so any non-negative integer is safe, but training/eval ranges
     # must still be disjoint per the same per-seed offset math.
     env_name: str = "webshop"
@@ -146,7 +146,7 @@ class OrchestrationConfig:
     # often produce all-same outcomes (so groups have zero advantage variance
     # and contribute zero gradient).
     rollout_temperature: float = 1.0
-    # ---- Cross-run carry-policy lineage. OPT-IN. When True (and
+    # Cross-run carry-policy lineage. OPT-IN. When True (and
     # `--carry-policy-across-rounds` is also set), the FIRST iterated
     # round (`round_idx == cfg.start_round`) loads `cfg.sft_adapter`
     # instead of the prefix-derived `<prefix>_round{start_round-1:02d}_adapter`
@@ -167,7 +167,7 @@ class OrchestrationConfig:
         are guaranteed to operate on disjoint task ranges as long as
         the per-run cap stays the same.
 
-        When `seed is None`, returns 0 (legacy behavior — preserves
+        When `seed is None`, returns 0 (legacy behavior - preserves
         the single-run case where the caller may want to manually
         thread a `--task-id-offset` through `--extra-train-loop-args`).
         """
@@ -183,9 +183,7 @@ class OrchestrationConfig:
         return f"{self.run_name_prefix}_seed{int(self.seed)}"
 
 
-# ---------------------------------------------------------------------------
 # Argument parsing
-# ---------------------------------------------------------------------------
 
 
 def _parse_args(argv: Sequence[str]) -> OrchestrationConfig:
@@ -219,7 +217,7 @@ def _parse_args(argv: Sequence[str]) -> OrchestrationConfig:
              "the parent train_loop as --sft-adapter so the policy "
              "starts from a non-trivially-trained checkpoint. Without "
              "this, cold-start RL on real WebShop typically produces "
-             "R≈0 for hundreds of episodes.",
+             "R~0 for hundreds of episodes.",
     )
     parser.add_argument(
         "--config",
@@ -231,7 +229,7 @@ def _parse_args(argv: Sequence[str]) -> OrchestrationConfig:
         "--rounds",
         type=int,
         default=5,
-        help="Number of producer↔trainer alternations (default: 5).",
+        help="Number of producer<->trainer alternations (default: 5).",
     )
     parser.add_argument(
         "--start-round",
@@ -248,7 +246,7 @@ def _parse_args(argv: Sequence[str]) -> OrchestrationConfig:
         "--episodes-per-round",
         type=int,
         default=40,
-        help="H-GRPO episodes per round (default: 40 → 5 × 40 = 200 total).",
+        help="H-GRPO episodes per round (default: 40 -> 5 x 40 = 200 total).",
     )
     parser.add_argument(
         "--turnrd-epochs",
@@ -400,9 +398,7 @@ def _parse_args(argv: Sequence[str]) -> OrchestrationConfig:
     )
 
 
-# ---------------------------------------------------------------------------
 # Pre-flight checks
-# ---------------------------------------------------------------------------
 
 
 def _preflight(cfg: OrchestrationConfig) -> None:
@@ -413,7 +409,7 @@ def _preflight(cfg: OrchestrationConfig) -> None:
     3. Config's `turnrd.replay_buffer_path` and `turnrd.ckpt_path` match
        the orchestration's `--replay-path` and `--ckpt-path` (otherwise
        the producer writes to one path and the standalone trainer reads
-       from another — a silent split-brain).
+       from another - a silent split-brain).
     4. Round count > 0.
     """
     if shutil.which("modal") is None and not cfg.dry_run:
@@ -454,7 +450,7 @@ def _preflight(cfg: OrchestrationConfig) -> None:
             f"ERROR: orchestration --replay-path={cfg.replay_path!r} does not "
             f"match {cfg.config_path}::turnrd.replay_buffer_path={cfg_replay!r}. "
             "Producer would write to one file and the standalone trainer "
-            "would read another — a silent split-brain. Align them before launching."
+            "would read another - a silent split-brain. Align them before launching."
         )
     cfg_ckpt = turnrd_cfg.get("ckpt_path")
     if cfg_ckpt and cfg_ckpt != cfg.ckpt_path:
@@ -516,9 +512,7 @@ def _preflight(cfg: OrchestrationConfig) -> None:
         )
 
 
-# ---------------------------------------------------------------------------
 # Modal command builders
-# ---------------------------------------------------------------------------
 
 
 def _to_container_path(local_path: Path) -> str:
@@ -571,12 +565,12 @@ def _wait_for_app_finish(
     Default timeout is 3 hours, sufficient for AlfWorld K=8 with 200-eps
     eval (~70-90 min/round) and WebShop K=8 (~30-40 min/round).
     """
-    print(f"   ↻ polling {app_id} ({label})…")
+    print(f"   polling {app_id} ({label})...")
     t0 = time.time()
     while True:
         elapsed = time.time() - t0
         if elapsed > timeout_s:
-            print(f"   ⚠ timeout waiting for {app_id} after {elapsed:.0f}s.")
+            print(f"   WARNING: timeout waiting for {app_id} after {elapsed:.0f}s.")
             return 124
         try:
             res = subprocess.run(
@@ -587,11 +581,11 @@ def _wait_for_app_finish(
                 timeout=30,
             )
         except subprocess.TimeoutExpired:
-            print("   ⚠ `modal app list` timed out; retrying.")
+            print("   WARNING: `modal app list` timed out; retrying.")
             time.sleep(poll_interval_s)
             continue
         if res.returncode != 0:
-            print(f"   ⚠ `modal app list` exited {res.returncode}; retrying.")
+            print(f"   WARNING: `modal app list` exited {res.returncode}; retrying.")
             time.sleep(poll_interval_s)
             continue
         # Find our row.
@@ -611,17 +605,17 @@ def _wait_for_app_finish(
                     state = "unknown"
                 break
         if state == "stopped":
-            print(f"   ✓ {app_id} finished after {elapsed:.0f}s.")
+            print(f"   OK {app_id} finished after {elapsed:.0f}s.")
             return 0
         if state is None:
             # Newly-submitted apps may not appear in `app list` for a
-            # few seconds — keep waiting rather than fail.
+            # few seconds - keep waiting rather than fail.
             print(
-                f"   ↻ {app_id} not yet visible in app list (elapsed: {elapsed:.0f}s)…"
+                f"   {app_id} not yet visible in app list (elapsed: {elapsed:.0f}s)..."
             )
         else:
             print(
-                f"   ↻ {app_id} still {state} (elapsed: {elapsed:.0f}s)…"
+                f"   {app_id} still {state} (elapsed: {elapsed:.0f}s)..."
             )
         time.sleep(poll_interval_s)
 
@@ -630,7 +624,7 @@ def _has_app_traceback(app_id: str) -> bool:
     """Best-effort detection of an unhandled exception inside the app.
 
     Modal marks a function as "stopped" even when its Python process raised
-    — the `_wait_for_app_finish` polling above just checks the lifecycle
+    - the `_wait_for_app_finish` polling above just checks the lifecycle
     state and can't tell crashed apart from clean exit. That's exactly the
     bug that bit the AlfWorld SOTA 8-round run twice: R4's `save_adapter`
     raised `RuntimeError: CUDA error: an illegal memory access`, but the
@@ -639,7 +633,7 @@ def _has_app_traceback(app_id: str) -> bool:
     failing identically with `HFValidationError`).
 
     We grep `modal app logs <app_id>` for a Python traceback. False
-    positives are unlikely — train_loop and train_turnrd don't normally
+    positives are unlikely - train_loop and train_turnrd don't normally
     print "Traceback (most recent call last)" on success. False negatives
     (a non-Python crash or a swallowed exception that still rewrites state)
     are possible but acceptable; the per-tensor CPU fallback in
@@ -731,7 +725,7 @@ def _train_loop_cmd(cfg: OrchestrationConfig, round_idx: int) -> list[str]:
     # consume vLLM's ~30-sync state-corruption budget per
     # src/policy/vllm_runner.py). Setting sync_every = K_trajectories_per_task
     # = 8 aligns syncs to actual optimizer steps and reduces in-round
-    # sync count by 8× — critical for the rank-32 MLP+attn experiment
+    # sync count by 8x - critical for the rank-32 MLP+attn experiment
     # where larger per-sync payload accelerates the corruption.
     sync_every_cfg = (cfg_json.get("train", {}) or {}).get("sync_every")
     if sync_every_cfg is not None:
@@ -748,7 +742,7 @@ def _train_loop_cmd(cfg: OrchestrationConfig, round_idx: int) -> list[str]:
     #   Cross-run lineage opt-in: when `--sft-adapter-overrides-derived`
     #   is set, the FIRST iterated round (`round_idx == cfg.start_round`)
     #   loads `cfg.sft_adapter` instead of the prefix-derived path. This
-    #   covers WebShop attention v2 R7 ← v1 R7. Default off preserves the
+    #   covers WebShop attention v2 R7 <- v1 R7. Default off preserves the
     #   legacy `<prefix>_round{N-1}_adapter` resume convention used by
     #   e.g. `scripts/run_alfworld_SOTA_10round_mlpr32_v3_extend_R10R12.sh`.
     if cfg.carry_policy_across_rounds:
@@ -848,7 +842,7 @@ def _train_turnrd_cmd(cfg: OrchestrationConfig, round_idx: int = 0) -> list[str]
         ("--recency-decay-half-life", "recency_decay_half_life", None),
         ("--legacy-decay-weight", "legacy_decay_weight", None),
         ("--min-batch-weight", "min_batch_weight", None),
-        # ---- LR schedule + fresh-emphasis (plan: turnrd_v2_continual_larger).
+        # LR schedule + fresh-emphasis (plan: turnrd_v2_continual_larger).
         # Forwarded only when present in the JSON's turnrd block so configs
         # without these keys preserve legacy behavior (constant LR, no
         # fresh-emphasis pass).
@@ -874,7 +868,7 @@ def _train_turnrd_cmd(cfg: OrchestrationConfig, round_idx: int = 0) -> list[str]
             "goal-conditioned-value-head",
             bool(turnrd_block["goal_conditioned_value_head"]),
         ))
-    # ---- Cumulative warm-start (plan: turnrd_v2_continual_larger).
+    # Cumulative warm-start (plan: turnrd_v2_continual_larger).
     # When `turnrd.cumulative_train` is true AND we're past round 0,
     # pass `--ckpt-in <cfg.ckpt_path>` so the standalone trainer warm-
     # starts from the prior round's saved ckpt instead of cold-restart
@@ -886,13 +880,11 @@ def _train_turnrd_cmd(cfg: OrchestrationConfig, round_idx: int = 0) -> list[str]
     return cmd
 
 
-# ---------------------------------------------------------------------------
 # Runner
-# ---------------------------------------------------------------------------
 
 
 def _run(cmd: list[str], *, dry_run: bool, label: str) -> int:
-    """Submit a `modal run --detach …` command, parse its app ID, then
+    """Submit a `modal run --detach ...` command, parse its app ID, then
     poll `modal app list` until that app finishes.
 
     Returns 0 on success, non-zero on failure.
@@ -914,9 +906,9 @@ def _run(cmd: list[str], *, dry_run: bool, label: str) -> int:
     CLI exit code. Only a missing app ID is treated as a hard
     submission failure.
     """
-    print(f"\n┌── {label}")
-    print(f"│  $ {' '.join(cmd)}")
-    print("└──")
+    print(f"\n-- {label}")
+    print(f"   $ {' '.join(cmd)}")
+    print("--")
     if dry_run:
         return 0
     t0 = time.time()
@@ -928,7 +920,7 @@ def _run(cmd: list[str], *, dry_run: bool, label: str) -> int:
     # infra/app_train_loop.py use `.remote()` internally, which Modal
     # warns "may be canceled when the local caller disconnects."
     # Killing the local CLI subprocess (e.g. via SIGTERM after parsing
-    # app_id) propagates a cancel to the cloud function — the cloud
+    # app_id) propagates a cancel to the cloud function - the cloud
     # app shows up as "stopped" with no work done.
     #
     # Proper fix would be in infra/app_*.py: use `.spawn()` + manual
@@ -946,19 +938,19 @@ def _run(cmd: list[str], *, dry_run: bool, label: str) -> int:
     # Try to parse the app ID from EITHER stream regardless of exit code.
     app_id = _parse_app_id(submit.stdout) or _parse_app_id(submit.stderr)
     if app_id is None:
-        # No app ID at all → the submit truly failed before reaching Modal.
+        # No app ID at all -> the submit truly failed before reaching Modal.
         print(
-            f"⚠ Could not parse app ID from `modal run --detach` output. "
+            f"WARNING: Could not parse app ID from `modal run --detach` output. "
             f"The submit likely failed before the cloud function started "
             f"(CLI exit={submit.returncode}). Aborting this round."
         )
         return submit.returncode if submit.returncode != 0 else 1
     if submit.returncode != 0:
         # CLI exited non-zero but we DO have an app ID. Trust the cloud
-        # state instead — Modal CLI's exit code is unreliable on
+        # state instead - Modal CLI's exit code is unreliable on
         # transient network glitches.
         print(
-            f"⚠ Modal CLI exited {submit.returncode} but app {app_id} was "
+            f"WARNING: Modal CLI exited {submit.returncode} but app {app_id} was "
             f"submitted. Trusting cloud state via polling."
         )
     # Phase 2: poll for completion.
@@ -973,7 +965,7 @@ def _run(cmd: list[str], *, dry_run: bool, label: str) -> int:
     # adapter and cascades).
     if rc == 0 and _has_app_traceback(app_id):
         print(
-            f"⚠ {app_id} state=stopped but logs contain a Python traceback "
+            f"WARNING: {app_id} state=stopped but logs contain a Python traceback "
             "or known crash signature. Treating this round as FAILED to "
             "prevent silent cascade. Inspect with:\n"
             f"   modal app logs {app_id}"
@@ -1001,7 +993,7 @@ def _orchestrate(cfg: OrchestrationConfig) -> int:
     print(f"  skip warmup fit    : {cfg.skip_warmup_fit}")
 
     for round_idx in range(cfg.start_round, cfg.rounds):
-        # ---- (a) Parent H-GRPO loop: trains policy + emits replay rows.
+        # (a) Parent H-GRPO loop: trains policy + emits replay rows.
         rc = _run(
             _train_loop_cmd(cfg, round_idx),
             dry_run=cfg.dry_run,
@@ -1015,7 +1007,7 @@ def _orchestrate(cfg: OrchestrationConfig) -> int:
             )
             return rc
 
-        # ---- (b) Standalone TurnRD fit on the accumulated replay buffer.
+        # (b) Standalone TurnRD fit on the accumulated replay buffer.
         if round_idx == 0 and cfg.skip_warmup_fit:
             print(
                 f"Round {round_idx}: skipping standalone TurnRD fit "
@@ -1036,7 +1028,7 @@ def _orchestrate(cfg: OrchestrationConfig) -> int:
             return rc
 
     print(
-        f"\n=== Done. {cfg.rounds} rounds × {cfg.episodes_per_round} episodes = "
+        f"\n=== Done. {cfg.rounds} rounds x {cfg.episodes_per_round} episodes = "
         f"{cfg.rounds * cfg.episodes_per_round} total H-GRPO episodes. ==="
     )
     return 0

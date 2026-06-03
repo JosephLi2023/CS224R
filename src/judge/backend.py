@@ -2,7 +2,7 @@
 
 Both backends consume the same trajectory representation and return per-turn
 scores normalized so that `sum(scores) == final_reward` (the proposal's
-`Σ_t r̂_t = R` invariant). The `model_tag` field is included in cache keys so
+`sum_t r_t = R` invariant). The `model_tag` field is included in cache keys so
 OpenAI and Qwen entries never collide.
 """
 
@@ -37,7 +37,7 @@ class TurnScore:
 
     turn_idx: int
     raw_score: float        # judge's raw 0-10 (or env-specific) score
-    normalized: float       # rescaled so Σ normalized == final_reward
+    normalized: float       # rescaled so sum(normalized) == final_reward
 
 
 @runtime_checkable
@@ -45,7 +45,7 @@ class JudgeBackend(Protocol):
     """Common interface for all judge implementations.
 
     Implementations are responsible only for producing raw per-turn scores;
-    normalization to `Σ r̂_t = R` is handled in `src.judge.prompts.normalize_scores`
+    normalization to `sum_t r_t = R` is handled in `src.judge.prompts.normalize_scores`
     by callers, so backends remain stateless and easy to swap.
     """
 

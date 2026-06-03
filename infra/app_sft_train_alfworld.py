@@ -17,7 +17,7 @@ This is a near line-for-line clone of `infra/app_sft_train.py` with:
     `load_sft_examples_from_directory(dir)`
   - default `run_name = "sft_alfworld_v1"`
   - image: `image` (NOT `alfworld_image`); the trainer doesn't need
-    AlfWorld at runtime — the SFT data file is fully pre-rendered by
+    AlfWorld at runtime - the SFT data file is fully pre-rendered by
     the SFT-gen app, so the trainer is purely a tokenize+CE loop.
 
 Cost: ~$0.50, ~30 min for 3 epochs over ~2000+ examples on A100.
@@ -32,7 +32,7 @@ from infra.image import image
 app = modal.App("cs224r-hgpo-sft-train-alfworld")
 
 
-# Default location of the AlfWorld SFT JSONL on the shared Volume —
+# Default location of the AlfWorld SFT JSONL on the shared Volume -
 # matches `infra/app_alfworld_sft_gen.py::SFT_OUTPUT_PATH`.
 DEFAULT_SFT_DATA_PATH = "/vol/data/alfworld/sft_trajs.jsonl"
 
@@ -104,7 +104,7 @@ def sft_train(
     for ex in examples:
         prompt_ids = tokenizer(ex.prompt, add_special_tokens=False).input_ids
         # Target is the full ReAct emission ` <thought>\nAction: <body>` so
-        # the SFT model learns to produce Thought + Action together — the
+        # the SFT model learns to produce Thought + Action together - the
         # exact format the runtime ReAct loop expects.
         target_str = synthesize_sft_target(ex.action) + tokenizer.eos_token
         action_ids = tokenizer(target_str, add_special_tokens=False).input_ids

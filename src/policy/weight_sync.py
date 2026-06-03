@@ -1,4 +1,4 @@
-"""Pure-Python helpers for LoRA → vLLM weight synchronization.
+"""Pure-Python helpers for LoRA -> vLLM weight synchronization.
 
 The PEFT-wrapped policy stores parameters under names like:
 
@@ -56,10 +56,10 @@ def canonicalize_lora_target_name(name: str) -> str:
     vLLM expects `<module>.weight`. This helper handles both halves of the rename:
 
       base_model.model.model.layers.0.self_attn.q_proj.base_layer.weight
-        →  model.layers.0.self_attn.q_proj.weight
+        ->  model.layers.0.self_attn.q_proj.weight
 
       base_model.model.lm_head.weight
-        →  lm_head.weight
+        ->  lm_head.weight
 
     Returns the name unchanged if it doesn't carry the PEFT prefix or
     `.base_layer.` segment.
@@ -74,7 +74,7 @@ def plan_weight_sync(state_dict_keys: list[str]) -> dict[str, list[str]]:
     Produces a manifest the trainer can use to validate its merge step:
 
         {
-          "passthrough": [...]      # base layers — pass directly to vLLM with renamed key
+          "passthrough": [...]      # base layers - pass directly to vLLM with renamed key
           "lora_pair":   [...]      # lora_A / lora_B that need merging into the matching base layer
           "skipped":     [...]      # PEFT bookkeeping (e.g. modules_to_save) we ignore for sync
         }
@@ -87,7 +87,7 @@ def plan_weight_sync(state_dict_keys: list[str]) -> dict[str, list[str]]:
         if is_lora_param_name(key):
             out["lora_pair"].append(key)
         elif ".base_layer." in key or key.startswith(_PEFT_PREFIX):
-            # Standard wrapped weight — passes through after canonicalization.
+            # Standard wrapped weight - passes through after canonicalization.
             out["passthrough"].append(key)
         else:
             # Anything else (e.g. modules_to_save buffers) is not part of the

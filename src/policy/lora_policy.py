@@ -1,6 +1,6 @@
 """LoRA-wrapped Qwen2.5-1.5B-Instruct policy for H-GRPO training.
 
-Heavy module — torch / transformers / peft are required at runtime. Locally
+Heavy module - torch / transformers / peft are required at runtime. Locally
 on macOS arm64 these aren't installed; `import` is therefore guarded so the
 rest of `src.policy.*` (pure-Python helpers) stays loadable for unit tests.
 """
@@ -50,11 +50,11 @@ class LoRAPolicy:
     """Wraps `transformers.AutoModelForCausalLM` + PEFT LoRA.
 
     Public surface:
-      - `tokenizer` — HF tokenizer (PreTrainedTokenizer)
-      - `model`    — peft.PeftModel (the trainable wrapper)
-      - `parameters()` — yields trainable LoRA parameters (for AdamW)
-      - `merged_state_dict()` — non-destructive merge → state-dict ready for vLLM
-      - `save_adapter(path)` / `load_adapter(path)` — PEFT-style adapter persistence
+      - `tokenizer` - HF tokenizer (PreTrainedTokenizer)
+      - `model`    - peft.PeftModel (the trainable wrapper)
+      - `parameters()` - yields trainable LoRA parameters (for AdamW)
+      - `merged_state_dict()` - non-destructive merge -> state-dict ready for vLLM
+      - `save_adapter(path)` / `load_adapter(path)` - PEFT-style adapter persistence
     """
 
     def __init__(self, cfg: LoRAPolicyConfig) -> None:
@@ -98,19 +98,11 @@ class LoRAPolicy:
         )
         self.model: PeftModel = get_peft_model(base, lora_cfg)
 
-        # H1 (v11) memory fix: enable HF gradient checkpointing on the
-        # PEFT-wrapped policy. PPO under K=8 microbatched forwards in
-        # `_batched_logprobs` retained 30-50 GiB of activations until
-        # `backward()` (every microbatch's `grad_fn` chain stays alive
-        # in the `out[]` collection). Gradient checkpointing trades
-        # ~30% extra compute for re-running the forward during
-        # backward, freeing those activations between forward and
-        # backward. `use_reentrant=False` is required for PEFT
-        # (the reentrant variant breaks LoRA gradient flow).
-        # `enable_input_require_grads()` ensures the embedded input has
-        # `requires_grad=True` so the recomputation chain reaches LoRA
-        # params (the frozen base would otherwise short-circuit grad
-        # through the input embeddings).
+        # Enable HF gradient checkpointing to free activations between
+        # forward and backward (trades ~30% compute for memory).
+        # use_reentrant=False is required for PEFT; the reentrant variant
+        # breaks LoRA gradient flow. enable_input_require_grads() ensures
+        # the recomputation chain reaches the LoRA params.
         try:
             self.model.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False}
@@ -120,9 +112,7 @@ class LoRAPolicy:
         if hasattr(self.model, "enable_input_require_grads"):
             self.model.enable_input_require_grads()
 
-    # ------------------------------------------------------------------
     # Trainer-facing API
-    # ------------------------------------------------------------------
 
     def trainable_parameters(self) -> list[Any]:
         """Yield only the LoRA parameters (what AdamW should touch)."""
@@ -138,7 +128,7 @@ class LoRAPolicy:
         """Materialize all merged-LoRA weights as a single dict.
 
         Backward-compat wrapper around `iter_merged_weights()`. Prefer the
-        iterator form for vLLM weight sync — it streams one tensor at a
+        iterator form for vLLM weight sync - it streams one tensor at a
         time and avoids holding the full base+LoRA state-dict in memory
         simultaneously.
         """
@@ -154,23 +144,14 @@ class LoRAPolicy:
         copies the data into its own buffer, then the tensor is freed
         before the next iteration.
 
-        Memory profile: per-layer transient peaks around 5–6× one LoRA
-        target's bf16 weight during the fp32-promoted merge expression
-        (intermediate fp32 base + fp32 sum + bf16 downcast all alive
-        briefly), then drops to ~3× across the `yield` (live: fp32
-        `delta` + bf16 `merged` + the shared bf16 base). Concretely for a
-        Qwen-1.5B `down_proj` (8960×1536, ~14M params): ~165 MB peak
-        during the merge expression, ~83 MB held across `yield`. For a
-        q_proj (1536×1536, ~2.4M params): ~28 MB peak, ~14 MB across
-        yield. Compare to the ~3 GB transient of the deepcopy path.
-        Transients are released before the next layer's merge, so the
-        full-sync cost is bounded by ONE layer, not the sum.
+        Per-layer transient peaks are bounded by ONE layer (not the sum),
+        since each layer's merge transients are released before the next.
         """
         import torch  # type: ignore[import-not-found]
 
         from src.policy.weight_sync import canonicalize_lora_target_name
 
-        # Map module-name → PEFT LoRA layer (if any). PEFT wraps a Linear
+        # Map module-name -> PEFT LoRA layer (if any). PEFT wraps a Linear
         # with a LoraLayer that holds .base_layer (the original weight) and
         # .lora_A.<adapter>, .lora_B.<adapter>, plus .scaling[adapter].
         adapter_name = "default"
@@ -196,7 +177,7 @@ class LoRAPolicy:
                 # Skip ANY .base_layer.weight whose parent module is LoRA-wrapped;
                 # we yield the merged version below instead.
                 # raw_name like 'base_model.model.<...>.q_proj.base_layer.weight'
-                # → its parent module name is everything up to '.base_layer.<...>'
+                # -> its parent module name is everything up to '.base_layer.<...>'
                 if ".base_layer." in raw_name:
                     parent = raw_name.split(".base_layer.")[0]
                     parent_short = parent[len("base_model.model.") :] if parent.startswith("base_model.model.") else parent
@@ -218,26 +199,18 @@ class LoRAPolicy:
                 lora_A = module.lora_A[adapter_name].weight  # [r, in]
                 lora_B = module.lora_B[adapter_name].weight  # [out, r]
                 scaling = float(module.scaling[adapter_name])
-                # Promote the matmul accumulator + add to fp32 BEFORE casting
-                # back to the base dtype. Mirrors PEFT's own
-                # `get_delta_weight()` and the codebase's fp32 promotion of
-                # logits before log_softmax
-                # (src/algorithms/grpo/trainer.py:363-365). Without this,
-                # rank-32 MLP+attn produces inf/NaN entries after ~10-20 RL
-                # steps because bf16's ~3 mantissa decimals can't represent
-                # (B @ A) * scaling for large LoRA-B entries; vLLM then
-                # silent-copies the bad tensor and the next forward pass
-                # dies as "CUDA illegal memory access" far from the true
-                # site (root cause of the AlfWorld SOTA 8-round R0 crashes
-                # at ep=9/19/21, 2026-05-21).
+                # Promote the matmul + add to fp32 before casting back to
+                # the base dtype (mirrors PEFT's get_delta_weight). Without
+                # this, rank-32 LoRA produces inf/NaN after ~10-20 RL steps
+                # because bf16 can't represent (B @ A) * scaling for large
+                # LoRA-B entries, which vLLM then silently copies.
                 delta = (lora_B.to(torch.float32) @ lora_A.to(torch.float32)) * scaling
                 merged = (base_weight.to(torch.float32) + delta).to(base_weight.dtype)
                 # Finite-check at the true bug site (the LoRA layer), not
-                # at vLLM's async forward. Cheap (~1µs on-GPU); will not
+                # at vLLM's async forward. Cheap (~1us on-GPU); will not
                 # fire post-fp32 promotion for well-behaved weights. If it
                 # DOES fire, the module name + abs-max value tells us
-                # exactly which layer blew up — invaluable diagnostic for
-                # any residual gradient-explosion issue.
+                # exactly which layer blew up.
                 if not torch.isfinite(merged).all():
                     raise LoRAMergeNonFiniteError(
                         f"iter_merged_weights: non-finite merged weight at "
@@ -250,7 +223,7 @@ class LoRAPolicy:
                 # the wrapped PeftModel). Don't double-prefix here.
                 full_name = f"{mod_name}.weight"
                 yield canonicalize_lora_target_name(full_name), merged
-                # `merged` and `delta` go out of scope here → freed before
+                # `merged` and `delta` go out of scope here -> freed before
                 # next iteration.
 
     def save_adapter(self, path: str) -> None:
@@ -283,7 +256,7 @@ class LoRAPolicy:
                 "Falling back to per-tensor CPU copy."
             )
 
-        # ---- Fallback path: per-tensor manual CPU copy + direct safetensors write
+        # Fallback path: per-tensor manual CPU copy + direct safetensors write
         import os
         import json
         from safetensors.torch import save_file as _st_save_file
@@ -336,9 +309,7 @@ class LoRAPolicy:
     def load_adapter(self, path: str) -> None:
         self.model.load_adapter(path, adapter_name="default")
 
-    # ------------------------------------------------------------------
     # Diagnostics
-    # ------------------------------------------------------------------
 
     def describe(self) -> dict[str, Any]:
         return {

@@ -4,10 +4,10 @@ Inference-only adapter that the trainer plugs in.
 
 torch is imported at the top of this file; the embedder callable is supplied
 by the caller, so unit tests can drive the adapter with a deterministic
-stub embedder that returns plain tensors — no LoRAPolicy or HF model needed.
+stub embedder that returns plain tensors - no LoRAPolicy or HF model needed.
 
-The invariant `Σ_t r̂_t = R` per trajectory holds by construction
-(`TurnRDOutput.decompose(R) = α · R` where `Σ α = 1` after masking).
+The invariant `sum_t r_hat_t = R` per trajectory holds by construction
+(`TurnRDOutput.decompose(R) = alpha * R` where `sum alpha = 1` after masking).
 """
 
 from __future__ import annotations
@@ -59,7 +59,7 @@ TurnRDLike = Union[TurnRD, TurnRDv2]
 #       since the adapter only needs the values. The adapter's `no_grad`
 #       wrapper neutralises a careless implementation but does NOT free a
 #       graph that already exists on tensors returned BEFORE the wrapper
-#       takes effect — so production embedders SHOULD still detach.
+#       takes effect - so production embedders SHOULD still detach.
 TurnEmbedder = Callable[[Trajectory], torch.Tensor]
 
 
@@ -132,7 +132,7 @@ class TurnRDDecomposer:
         observation, embeds it via the SAME `self.embedder` (synthetic
         single-turn trajectory whose observation_text IS the goal_text),
         and stacks into a per-row tensor. Rows whose goal text doesn't
-        parse get a zero placeholder + mask=0 — the model's FiLM block
+        parse get a zero placeholder + mask=0 - the model's FiLM block
         then reverts to the unconditioned path for those rows.
         """
         if not self._goal_emb_enabled or not nonempty_indices:
@@ -178,7 +178,7 @@ class TurnRDDecomposer:
                     )
                     ge_t = self.embedder(synth)
                     if ge_t.dim() != 2 or ge_t.shape[0] < 1 or ge_t.shape[1] != D:
-                        # Embedder gave us the wrong shape — skip this
+                        # Embedder gave us the wrong shape - skip this
                         # row (mask stays 0, model falls back to
                         # unconditioned for it). Don't raise so an
                         # embedder bug doesn't kill the whole train
@@ -195,12 +195,12 @@ class TurnRDDecomposer:
         return (goal_emb, goal_emb_mask)
 
     def decompose(self, group: TrajectoryGroup) -> list[list[float]]:
-        """Return list[K] of list[T_i] per-turn rewards `r̂_t = α_t · R`.
+        """Return list[K] of list[T_i] per-turn rewards `r_hat_t = alpha_t * R`.
 
         Steps:
-        1. Embed each non-empty trajectory via `self.embedder` → `[T_i, D]`,
+        1. Embed each non-empty trajectory via `self.embedder` -> `[T_i, D]`,
            inside `torch.no_grad()` so a careless embedder can't leak the
-           policy's autograd graph into our K×T padded stack.
+           policy's autograd graph into our KxT padded stack.
         2. Pad to `[K, T_max, D]` (cast to the model's param device+dtype)
            and build `attention_mask = [K, T_max]`.
         3. Forward through `model` under `torch.no_grad()` + `eval()`.
@@ -336,19 +336,13 @@ class TurnRDDecomposer:
             cursor += 1
         return out_list
 
-    # -------------------------------------------------------------------
     # Learnable surface
-    # -------------------------------------------------------------------
 
     def __call__(self, group: TrajectoryGroup) -> list[list[float]]:
-        """Make the decomposer object directly callable.
-
-        The trainer's `build_advantages` invokes `self.decomposer(group)`
-        for stats reporting (Methods A/C path); making the object
-        callable lets the user pass a `TurnRDDecomposer` instance as the
-        trainer's `decomposer` argument and still reach
-        `decompose_with_grad` / `parameters` / `has_learnable_params`
-        on the same object.
+        """Make the decomposer object directly callable, forwarding to
+        `decompose`, so a `TurnRDDecomposer` instance can be passed as the
+        trainer's `decomposer` argument while still exposing the learnable
+        surface (`decompose_with_grad` / `parameters` / `has_learnable_params`).
         """
         return self.decompose(group)
 
@@ -356,11 +350,9 @@ class TurnRDDecomposer:
     def has_learnable_params(self) -> bool:
         """TurnRD is the learnable Method B decomposer.
 
-        The trainer (`HGPOTrainer.__init__` + `compute_loss`) reads this
-        via `getattr(decomposer, "has_learnable_params", False)` so other
-        decomposers (Methods A/C) need NOT define it — they implicitly
-        read False and the trainer skips the second optimizer + the C3
-        consistency-loss reattach for them.
+        The trainer reads this via `getattr(decomposer, "has_learnable_params",
+        False)`, so Methods A/C need not define it (they read False and the
+        trainer skips the second optimizer + the C3 consistency-loss reattach).
         """
         return True
 
@@ -395,15 +387,15 @@ class TurnRDDecomposer:
         - Does NOT call `model.eval()` (TurnRD is *training* on this path).
         - Returns a dict of tensors instead of a Python list, so the
           caller can compute torch-tensor advantages without re-padding:
-            * `alpha`:           `[K_real, T_max]` (the model's α weights)
+            * `alpha`:           `[K_real, T_max]` (the model's alpha weights)
             * `attention_mask`:  `[K_real, T_max]` long
             * `nonempty_indices`: `list[int]` (indices into `group.trajectories`
                                   for the rows present in `alpha`)
             * `final_R`:         `[K_real]` aligned with `alpha` rows.
 
         Important: the embedder loop still runs under `torch.no_grad()`
-        and detaches each returned tensor — the gradient path we care
-        about is α_t → TurnRD params (NOT into the policy backbone the
+        and detaches each returned tensor - the gradient path we care
+        about is alpha_t -> TurnRD params (NOT into the policy backbone the
         embedder hits).
         """
         K = len(group.trajectories)

@@ -9,19 +9,19 @@ so we build a deterministic oracle from the goal-payload primitives
 already exposed by `src/envs/webshop_adapter.py` for the
 attribute-progress intermediate reward signal:
 
-  * `_extract_target_attrs(env)`  → set[str] target attr tokens.
-  * `_extract_target_asin(env)`   → str|None target product ASIN.
-  * `_extract_selected_attrs(env)` → currently engaged options.
+  * `_extract_target_attrs(env)`  -> set[str] target attr tokens.
+  * `_extract_target_asin(env)`   -> str|None target product ASIN.
+  * `_extract_selected_attrs(env)` -> currently engaged options.
 
 Per-episode oracle policy:
-  1. Reset → snapshot `env.goal["query"]`, `env.goal["asin"]` (or
+  1. Reset -> snapshot `env.goal["query"]`, `env.goal["asin"]` (or
      `goal["asins"][0]`), `env.goal["attributes"]`.
   2. Emit `search[<query>]`.
   3. Up to N=5 search-result pages: if `target_asin` substring appears
      in the rendered obs, emit `click[<asin>]` and move on; else emit
      `click[Next >]` and recurse. If never found, drop the trajectory.
   4. On the item page, for each canonicalised goal attribute token, try
-     `click[<token>]` (best-effort — values not surfaced as options
+     `click[<token>]` (best-effort - values not surfaced as options
      are simply no-ops). Cap at len(attributes)+a few safety turns.
   5. Emit `click[Buy Now]`.
 
@@ -34,7 +34,7 @@ Output schema (one row per turn, single JSONL file):
      "trajectory_id": str, "final_reward": float}
 
 `prompt` is pre-rendered via the runtime renderer
-`src.envs.prompts.react_webshop.render_webshop_turn_prompt` — the SAME
+`src.envs.prompts.react_webshop.render_webshop_turn_prompt` - the SAME
 module the runtime ReAct collector uses + the SAME module that the
 SFT loader's `default_render_prompt` shim delegates to. That guarantees
 SFT-rollout prompt-parity (the v3 R=0 template-drift root cause).
@@ -57,9 +57,9 @@ app = modal.App("cs224r-hgpo-webshop-sft-gen")
 
 
 # Where the oracle gen app writes the SFT trajectories on the shared
-# Volume. Single JSONL (AlfWorld pattern) — vs the gdown human-trajs
+# Volume. Single JSONL (AlfWorld pattern) - vs the gdown human-trajs
 # directory-of-files layout. The trainer's `--data-path` flag dispatches
-# on suffix (.jsonl → single-file loader) so this path Just Works.
+# on suffix (.jsonl -> single-file loader) so this path Just Works.
 SFT_OUTPUT_PATH = "/vol/data/webshop/oracle_trajs.jsonl"
 
 # Where the upstream WebShop gdown human-trajectory dump lives on the
@@ -104,22 +104,22 @@ def _instruction_from_goal(goal: dict | None) -> str:
 def _query_from_goal(goal: dict | None) -> str:
     """Build the BM25 search query the oracle should issue.
 
-    WebShop caps `search[…]` results at 50 (5 pages × 10/page) so the
+    WebShop caps `search[...]` results at 50 (5 pages x 10/page) so the
     query must be SELECTIVE enough to surface the target ASIN inside
     the top-50 BM25 hits. The goal payload exposes (in increasing
     order of BM25 selectivity):
 
-      * `goal["query"]` — short user-typed category, e.g.
+      * `goal["query"]` - short user-typed category, e.g.
         "men's polos". 0/N oracle win rate on real env (way too
-        generic — top-50 BM25 hits don't include the target ASIN).
-      * `goal["instruction_text"]` — verbose generated description
+        generic - top-50 BM25 hits don't include the target ASIN).
+      * `goal["instruction_text"]` - verbose generated description
         listing every required attribute, e.g. "Find me slim fit,
         moisture wicking men's polos with short sleeve, ...".
         Marginally better but attribute tokens (sizes, materials) can
         BM25-dominate and pull the wrong category of products
         (e.g. "underwater photography ... 8x6.5ft" pulls 8x6.5ft
         BACKDROPS instead of actual photography equipment).
-      * `goal["name"]` — the target product's actual title. Pinpoint
+      * `goal["name"]` - the target product's actual title. Pinpoint
         precision: searching for the title returns the exact target
         ASIN as the top BM25 hit virtually 100% of the time.
 
@@ -225,12 +225,12 @@ def _oracle_episode(
     # buttons whose labels are the EXACT option values, not the goal's
     # short attribute tokens. Two goal fields contribute:
     #
-    #   * `goal["goal_options"]` — dict like {"color": "dark blue",
-    #     "size": "x-large"} mapping option NAME → exact VALUE the
+    #   * `goal["goal_options"]` - dict like {"color": "dark blue",
+    #     "size": "x-large"} mapping option NAME -> exact VALUE the
     #     env's reward function expects. These values match the
-    #     item-page button labels byte-for-byte → click[<value>] is
+    #     item-page button labels byte-for-byte -> click[<value>] is
     #     the precise option-engagement signal.
-    #   * `goal["attributes"]` — flat list of attribute tokens like
+    #   * `goal["attributes"]` - flat list of attribute tokens like
     #     "moisture wicking", "stretch fabric". Some of these surface
     #     as item-page buttons (then click[<token>] works), some don't
     #     (they're hidden product-description attributes the env
@@ -308,7 +308,7 @@ def _oracle_episode(
         state = new_state
         return new_state, float(reward), bool(done), info, False
 
-    # ----- step 1: initial search -----
+    # step 1: initial search
     action = f"search[{query}]"
     out = _record_and_step(action)
     if out[-1]:
@@ -320,7 +320,7 @@ def _oracle_episode(
             "won" if reward >= reward_threshold else "lost"
         )
 
-    # ----- step 2-N: walk search result pages, find target ASIN -----
+    # step 2-N: walk search result pages, find target ASIN
     asin_clicked = False
     for _ in range(max_result_pages):
         if len(traj_rows) >= max_steps_per_episode:
@@ -338,7 +338,7 @@ def _oracle_episode(
                     "won" if reward >= reward_threshold else "lost"
                 )
             break
-        # Not on this page → next page.
+        # Not on this page -> next page.
         action = "click[Next >]"
         out = _record_and_step(action)
         if out[-1]:
@@ -352,7 +352,7 @@ def _oracle_episode(
     if not asin_clicked:
         return [], 0.0, "asin_not_found"
 
-    # ----- step N+1..: best-effort attribute option clicks -----
+    # step N+1..: best-effort attribute option clicks
     for attr in target_attrs:
         if len(traj_rows) >= max_steps_per_episode:
             return [], 0.0, "truncated"
@@ -369,7 +369,7 @@ def _oracle_episode(
                 "won" if reward >= reward_threshold else "lost"
             )
 
-    # ----- terminal: click Buy Now -----
+    # terminal: click Buy Now
     if len(traj_rows) >= max_steps_per_episode:
         return [], 0.0, "truncated"
     out = _record_and_step("click[Buy Now]")
@@ -427,7 +427,7 @@ def generate_sft_trajectories(
         n_sessions: how many distinct sessions to attempt. WebShop's
                     upstream env picks the goal via `reset(session=i)`.
         output_path: where to write the JSONL on the shared Volume.
-                     Truncated on entry — re-running this app produces
+                     Truncated on entry - re-running this app produces
                      a fresh dataset.
         session_id_base: starting session id. Default 0 mirrors the
                          upstream's training-split start. Bumps useful
@@ -437,7 +437,7 @@ def generate_sft_trajectories(
                           target ASIN before giving up on the session.
         max_steps_per_episode: hard cap on adapter steps per episode.
         reward_threshold: minimum terminal env reward to keep a
-                          trajectory. 0.99 ≈ "all target attrs matched".
+                          trajectory. 0.99 ~ "all target attrs matched".
         include_human_trajs: when True, also pre-render the
                              ~50 upstream gdown human trajectories at
                              `human_trajs_dir` and append them to the
@@ -520,7 +520,7 @@ def generate_sft_trajectories(
 
     n_oracle_examples = n_examples
 
-    # ----- optional: pre-render & concat upstream human trajs -----
+    # optional: pre-render & concat upstream human trajs
     n_human_examples = 0
     if include_human_trajs:
         if not os.path.isdir(human_trajs_dir):
@@ -681,8 +681,6 @@ def diagnose_oracle(
     the oracle's search query more selective, or (c) drop the
     attribute-engagement step.
     """
-    import json
-
     _add_local_render_paths()
 
     from src.envs.webshop_adapter import WebShopAdapter
@@ -809,7 +807,7 @@ def validate_dense_signal(
 ) -> dict:
     """Validate WebShop's per-turn `intermediate_reward` dense signal.
 
-    WebShop has NO PDDL facts-diff signal (unlike AlfWorld) — its only
+    WebShop has NO PDDL facts-diff signal (unlike AlfWorld) - its only
     per-turn supervision for TurnRDv2's V-head is the attribute-progress
     intermediate reward synthesised by `WebShopAdapter.step()` when
     `use_attribute_progress_intermediate_reward=True` (the flag set in
@@ -827,16 +825,16 @@ def validate_dense_signal(
       * `mean_ir_by_action_kind`: per-bucket means. Expected pattern
         (this is what makes the signal HIGH QUALITY for TurnRD
         supervision):
-          - search ≈ 0.0           (no option engagement)
-          - click_nav ≈ 0.0        (Next/Prev/Back has no IR delta)
-          - click_target_asin ≈ 0.25 (one-time ASIN-landing bonus)
-          - click_option ≈ 1/|target_attrs| (per-attribute delta when
+          - search ~ 0.0           (no option engagement)
+          - click_nav ~ 0.0        (Next/Prev/Back has no IR delta)
+          - click_target_asin ~ 0.25 (one-time ASIN-landing bonus)
+          - click_option ~ 1/|target_attrs| (per-attribute delta when
             the click hits an option in the goal-options set)
-          - click_buy_now ≈ 0.0    (terminal; no further engagement)
+          - click_buy_now ~ 0.0    (terminal; no further engagement)
       * `cum_ir_per_session`: per-session (cumulative_IR, final_raw_reward)
         pairs. CORRELATION between cum_IR and final_raw_reward is the
-        single most diagnostic metric — if it's > 0.7, the signal is
-        carrying real per-turn credit; if it's ≈ 0, the signal is
+        single most diagnostic metric - if it's > 0.7, the signal is
+        carrying real per-turn credit; if it's ~ 0, the signal is
         noise and TurnRD's V-head will learn nothing.
       * `pearson_r`: Pearson correlation between cum_IR and final
         reward across captured sessions.
@@ -851,13 +849,10 @@ def validate_dense_signal(
     """
     _add_local_render_paths()
 
-    from src.envs.webshop_adapter import (
-        WebShopAdapter,
-        _extract_selected_attrs,
-    )
+    from src.envs.webshop_adapter import WebShopAdapter
 
     # CRITICAL: build the adapter with the dense-signal flag ENABLED.
-    # This is the only difference from the SFT-gen path — same env,
+    # This is the only difference from the SFT-gen path - same env,
     # same goal payloads, same oracle action sequence; just an extra
     # `info["intermediate_reward"]` field per step.
     adapter = WebShopAdapter(
@@ -1012,8 +1007,8 @@ def main(
     """Local entrypoint dispatching on `--action`.
 
     Actions:
-      generate            — run `generate_sft_trajectories(...)`
-      summarize / inspect — pretty-print the dataset summary + first row
+      generate            - run `generate_sft_trajectories(...)`
+      summarize / inspect - pretty-print the dataset summary + first row
     """
     import json as _json
 

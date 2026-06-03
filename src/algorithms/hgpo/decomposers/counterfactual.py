@@ -1,123 +1,54 @@
 """CounterFactual per-turn reward decomposer (Method A revival).
 
-Idea
-----
-For each turn ``t`` in trajectory ``τ_i`` we estimate the *counterfactual*
+For each turn ``t`` in trajectory ``tau_i`` we estimate the counterfactual
 contribution of the action the policy actually took:
 
-    r̂_t = R_actual − R_baseline_t
+    r_hat_t = R_actual - R_baseline_t
 
 where ``R_baseline_t`` is the mean episode return obtained by replacing
 ``a_t`` with one of ``N`` alternative actions sampled from the policy at
 state ``s_t`` and completing the rollout greedily for up to
 ``max_completion_turns`` more turns.
 
-This is the literal "counterfactual rollouts" signal the original
-design listed as **Method A** but had to cut from the WebShop
-plan because WebShop's *in-progress* state is not snapshot-able. The
-trick we use here is **deterministic replay**: WebShop episodes are
-deterministic given ``(task_id, action_sequence)``, so we can recover
-``s_t`` by ``env.reset(task_id=...) → step(a_0) → … → step(a_{t-1})``.
-This works for FakeWebShop (the unit-test env) and the real WebShop
-text env (whose ``session=task_id`` reset is deterministic).
-
-Why we want it
---------------
-The learned TurnRD decomposer (Method B) currently underperforms the
-trivial Method C (`progress_decomposer`) on our 4-method bake-off
-(`experiments/manifests/4method_comparison.txt`). Counterfactual
-rollouts are the only credit signal in our toolbox that has a defensible
-*causal* interpretation rather than a learned proxy — exactly the kind
-of strong baseline a "TurnRD ≥ CF" or "TurnRD ≤ CF" comparison needs.
-
-Cost
-----
-For ``K`` trajectories × average ``T̄`` turns × ``N`` alt actions ×
-``C`` completion turns, the worst-case env-step count per group is::
-
-    K * N * [ T̄(T̄-1)/2  +  1  +  C ]
-        ↑ prefix replay     ↑ alt   ↑ completion
-
-The ``T̄(T̄-1)/2`` term comes from Phase A: the unit at turn index ``t``
-replays exactly ``t`` env.step calls to reach ``s_t``, summed across
-``t = 0..T̄-1``. Earlier drafts of this docstring used the loose bound
-``K * T̄ * N * (T̄ + C)`` which over-counted the trivially-true
-rectangle area; the triangular sum is what real WebShop will pay.
-
-With the defaults (K=4, T̄=4, N=2, C=3) the per-group budget is
-``4 · 2 · (6 + 1 + 3) = 80`` env steps. With the production WebShop
-setting (K=8, T̄=5, N=2, C=3) it's ``8 · 2 · (10 + 1 + 3) ≈ 224`` env
-steps when ``n_turns_per_traj`` runs all turns; subsampling 2 turns per
-trajectory (the production config default) cuts it roughly in half.
-The matching number of LLM calls is ``≤ K * T̄`` batched alt-action
-samples (one prompt per (i, t) at ``n=N``) plus ``≤ C`` batched greedy
-calls during completion. On FakeWebShop the env steps run in
-milliseconds; on real WebShop (each step ~100 ms over HTTP) this adds
-≈ 3-5× wall-clock per training group.
-
-Resident memory: ``self._env_pool`` grows monotonically up to
-``len(cf_units)`` env instances across the largest group seen. Each
-WebShop instance carries the full product/goal corpus in memory, so a
-full-turns K=8/T̄=5/N=2 run can keep ≈80 env instances resident for
-the lifetime of the trainer, in addition to the ``K=8`` envs the
-``RolloutCollector`` keeps. Cap with ``max_env_pool_size`` when running
-on a constrained Modal worker; ``None`` (default) lets the pool grow
-freely.
+We recover ``s_t`` by deterministic replay:
+``env.reset(task_id=...) -> step(a_0) -> ... -> step(a_{t-1})``. This works
+for FakeWebShop (the unit-test env) and the real WebShop text env (whose
+``session=task_id`` reset is deterministic).
 
 Knobs:
-* ``n_alt_actions`` — N. 2 is the cheapest meaningful value.
-* ``max_completion_turns`` — C. Cap at ``rollout.max_turns − t`` since
+* ``n_alt_actions`` - N. 2 is the cheapest meaningful value.
+* ``max_completion_turns`` - C. Cap at ``rollout.max_turns - t`` since
   beyond the original trajectory's horizon there is no signal.
-* ``n_turns_per_traj`` — randomly sample this many turns per trajectory
+* ``n_turns_per_traj`` - randomly sample this many turns per trajectory
   for CF instead of all of them. ``0`` (default) = all turns.
-* ``skip_if_zero_R`` — when the trajectory's actual ``R`` is 0 the
-  shape of α doesn't matter (any decomposition multiplies to 0); skip
+* ``skip_if_zero_R`` - when the trajectory's actual ``R`` is 0 the
+  shape of alpha doesn't matter (any decomposition multiplies to 0); skip
   the CF rollouts entirely and emit ``[0.0] * T``.
-* ``max_env_pool_size`` — cap on the resident env-pool size; ``None``
+* ``max_env_pool_size`` - cap on the resident env-pool size; ``None``
   (default) means unlimited (the pool grows to the largest group seen
-  and never shrinks). Set this when running on a constrained Modal
-  worker that can't afford ~80 WebShop instances live; values lower
-  than ``len(cf_units)`` for a given call cause envs to be re-built
-  per-call instead of reused (correctness preserved, wall-clock
-  worse).
-* ``check_state_consistency`` — debug-only knob. When ``True`` the
+  and never shrinks). Values lower than ``len(cf_units)`` for a given
+  call cause envs to be re-built per-call instead of reused (correctness
+  preserved, wall-clock worse).
+* ``check_state_consistency`` - debug-only knob. When ``True`` the
   decomposer asserts that the per-unit env states sharing the same
   ``(i, t)`` carry identical ``observation_text`` after the Phase-A
-  replay. Default ``False`` (zero-overhead production path). Useful
-  on stochastic envs (e.g., AlfWorld variants) where deterministic
-  replay is not guaranteed; turn on to surface state divergence early
-  rather than silently rendering a single state's prompt for all alt
-  units in the (i, t) bucket.
+  replay. Default ``False``. Useful on stochastic envs where deterministic
+  replay is not guaranteed.
 * ``output_mode``:
-   - ``"raw_delta"`` (default) — emit ``R_actual − R_baseline_t``
-     directly. Matches the natural causal-attribution semantics; per-turn
-     values may NOT sum to ``R``. The trainer's
-     ``compute_turn_advantages`` normalizes per-position across the
-     K-group so absolute scale matters less than ordering.
-   - ``"normalized"`` — rescale so ``Σ_t r̂_t = R`` (preserves the
-     sum invariant the C3 consistency loss expects). Falls back to
-     uniform ``R/T`` when all Δ_t ≤ 0.
+   - ``"raw_delta"`` (default) - emit ``R_actual - R_baseline_t``
+     directly; per-turn values may NOT sum to ``R``.
+   - ``"normalized"`` - rescale so ``sum_t r_hat_t = R``. Falls back to
+     uniform ``R/T`` when all delta_t <= 0.
 
-Reward accounting precondition
-------------------------------
-This decomposer assumes that ``traj.final_reward`` accumulates ALL
-step rewards over the whole episode (the ``RolloutCollector`` contract
-at ``src/algorithms/grpo/collectors.py``). To keep ``R_actual`` and
-``R_baseline_t`` on the same accounting basis, the Phase-A prefix
+Reward accounting precondition: this decomposer assumes ``traj.final_reward``
+accumulates ALL step rewards over the whole episode. The Phase-A prefix
 replay reward is captured into ``unit["prefix_R"]`` and added back to
-``unit["R"]`` BEFORE the alt step — i.e. the baseline includes the
-same prefix step rewards the original rollout earned. This makes
-Δ_t = R_actual − R_baseline_t correct on envs that emit non-terminal
-(shaping) rewards, not just on the sparse-terminal WebShop /
-FakeWebShop case.
+``unit["R"]`` before the alt step, so the baseline is on the same
+accounting basis as ``R_actual`` on envs that emit non-terminal rewards.
 
-Adapter contract
-----------------
-Callable matching ``PerTurnDecomposer = Callable[[TrajectoryGroup],
-list[list[float]]]``. Signature parity with ``JudgeDecomposer.decompose``
-and ``progress_decomposer``. ``has_learnable_params = False`` (the
-trainer detects this via ``getattr`` and skips the second optimizer
-+ the C3 consistency-loss reattach — same path as Methods A/C today).
+Adapter contract: callable matching ``PerTurnDecomposer =
+Callable[[TrajectoryGroup], list[list[float]]]``.
+``has_learnable_params = False``.
 """
 
 from __future__ import annotations
@@ -149,7 +80,7 @@ a no-arg dataclass factory.
 
 We accept a factory rather than two pre-built sampling objects because
 ``SamplingParams`` lives in ``src.policy.vllm_runner`` (which imports
-torch lazily) — keeping the construction at the call site lets the
+torch lazily); keeping the construction at the call site lets the
 decomposer module remain torch-free for unit tests.
 """
 
@@ -182,7 +113,7 @@ class CounterFactualDecomposer:
     matching the existing ``PerTurnDecomposer`` callable contract. The
     object is also directly callable via ``__call__`` so callers can
     pass either ``cf_decomposer`` or ``cf_decomposer.decompose`` to
-    ``HGPOTrainer(decomposer=...)`` — same convention as
+    ``HGPOTrainer(decomposer=...)`` - same convention as
     ``TurnRDDecomposer``.
     """
 
@@ -250,13 +181,11 @@ class CounterFactualDecomposer:
         # and we step them through replay + alt + completion. Pool is
         # grown on demand and capped at `max_env_pool_size` (None =
         # unlimited). Pool overflow falls back to ephemeral envs that
-        # are discarded after each decompose() call — correctness is
+        # are discarded after each decompose() call - correctness is
         # preserved at the cost of extra factory invocations.
         self._env_pool: list[Any] = []
 
-    # ------------------------------------------------------------------
     # Internal helpers
-    # ------------------------------------------------------------------
 
     def _acquire_envs(self, n: int) -> list[Any]:
         """Return ``n`` env instances, drawing from the pool first.
@@ -283,8 +212,8 @@ class CounterFactualDecomposer:
     def _select_turn_indices(self, T: int) -> list[int]:
         """Return the turn indices we'll run CF on for one trajectory.
 
-        ``n_turns_per_traj == 0`` ⇒ all turns ``[0..T-1]``.
-        ``n_turns_per_traj > 0``  ⇒ sample without replacement.
+        ``n_turns_per_traj == 0`` -> all turns ``[0..T-1]``.
+        ``n_turns_per_traj > 0``  -> sample without replacement.
         """
         if T <= 0:
             return []
@@ -310,9 +239,7 @@ class CounterFactualDecomposer:
             return_logprobs=False,
         )
 
-    # ------------------------------------------------------------------
     # Public API
-    # ------------------------------------------------------------------
 
     def __call__(self, group: TrajectoryGroup) -> list[list[float]]:
         return self.decompose(group)
@@ -330,12 +257,12 @@ class CounterFactualDecomposer:
             if T == 0:
                 plans.append((traj, [], []))
                 continue
-            # Default per-turn rewards = 0.0 (so turns we skip — either
-            # because of zero-R short-circuit or because of subsample —
+            # Default per-turn rewards = 0.0 (so turns we skip - either
+            # because of zero-R short-circuit or because of subsample -
             # contribute 0 to the H-GRPO advantage).
             per_turn = [0.0] * T
             if self.skip_if_zero_R and float(traj.final_reward) == 0.0:
-                # Zero R ⇒ no information to attribute; uniform 0 is
+                # Zero R -> no information to attribute; uniform 0 is
                 # what Method C would produce too.
                 plans.append((traj, [], per_turn))
                 continue
@@ -368,27 +295,18 @@ class CounterFactualDecomposer:
             # plans hold (zeros).
             return [p[2] for p in plans]
 
-        # --------------------------------------------------------------
-        # Phase A: replay every CF env to its starting state s_t.
-        #
-        # We acquire one env per CF unit (each needs its own state).
-        # On real WebShop this is the expensive step (~3 s reset);
-        # the env pool reuses instances across decompose() calls so the
-        # fixed per-task reset cost is only paid once.
-        # --------------------------------------------------------------
+        # Phase A: replay every CF env to its starting state s_t. One env
+        # per CF unit; the env pool reuses instances across decompose() calls.
         envs = self._acquire_envs(len(cf_units))
         states: list[Any] = []
         for unit, env in zip(cf_units, envs):
             state = _safe_reset(env, group.task_id)
             # Accumulate prefix-replay rewards so R_baseline_t is on the
             # same accounting basis as R_actual (which sums step rewards
-            # across the WHOLE episode — see
-            # `src/algorithms/grpo/collectors.py::collect_group` where
-            # `rewards_so_far[i] += float(reward)` runs every step).
-            # Sparse-terminal envs (WebShop, FakeWebShop) emit 0 here
-            # and the bookkeeping is a no-op; shaping-reward envs need
-            # this term or Δ_t = R_actual − R_baseline_t would be
-            # biased upward by the prefix step rewards.
+            # across the WHOLE episode). Sparse-terminal envs (WebShop,
+            # FakeWebShop) emit 0 here and the bookkeeping is a no-op;
+            # shaping-reward envs need this term or
+            # delta_t = R_actual - R_baseline_t would be biased upward.
             prefix_R = 0.0
             for action_text in unit["prefix_actions"]:
                 state, _r, _done, _info = env.step(action_text)
@@ -396,14 +314,10 @@ class CounterFactualDecomposer:
             unit["prefix_R"] = prefix_R
             states.append(state)
 
-        # --------------------------------------------------------------
         # Phase B: sample alt actions for every CF unit in ONE batched
-        # call. The runner returns a list of n=N completions per prompt;
-        # we deduplicate by (i, t) so we only build one prompt per
-        # turn-position and slice the N alts back into the matching
-        # CF units.
-        # --------------------------------------------------------------
-        # Map (i, t) → slice indices in cf_units for that group.
+        # call. Deduplicate by (i, t) so we build one prompt per turn-position
+        # and slice the N alts back into the matching CF units.
+        # Map (i, t) -> slice indices in cf_units for that group.
         groups_by_it: dict[tuple[int, int], list[int]] = {}
         for ci, unit in enumerate(cf_units):
             groups_by_it.setdefault((unit["i"], unit["t"]), []).append(ci)
@@ -412,14 +326,11 @@ class CounterFactualDecomposer:
         alt_owners: list[tuple[int, int]] = []  # (i, t) per prompt
         for (i, t), indices in groups_by_it.items():
             # All units in `indices` share the same prefix; render once
-            # using the first unit's state. For a deterministic env
-            # (real WebShop, FakeWebShop) the per-unit replays produce
-            # byte-identical states, so this is a perfect optimisation.
-            # For stochastic envs (e.g., a future AlfWorld variant with
-            # random seeds in `info`) the per-unit states may diverge
-            # and rendering only one would silently bias the alt-action
-            # sample — enable `check_state_consistency=True` to surface
-            # such divergence early instead of letting it slip through.
+            # using the first unit's state. For a deterministic env the
+            # per-unit replays produce byte-identical states. For stochastic
+            # envs the states may diverge and rendering only one would bias
+            # the alt-action sample - enable `check_state_consistency=True`
+            # to surface such divergence early.
             first = indices[0]
             if self.check_state_consistency and len(indices) > 1:
                 ref_obs = getattr(states[first], "observation_text", None)
@@ -454,11 +365,8 @@ class CounterFactualDecomposer:
                 )
                 cf_units[ci]["alt_action"] = action_text
 
-        # --------------------------------------------------------------
-        # Step every CF env with its alt action — this is the actual
-        # *intervention*. We track per-unit (R_so_far, done, history)
-        # as Phase C's bookkeeping.
-        # --------------------------------------------------------------
+        # Step every CF env with its alt action - the actual intervention.
+        # Track per-unit (R_so_far, done, history) as Phase C's bookkeeping.
         for ci, unit in enumerate(cf_units):
             env = envs[ci]
             alt_action = unit.get("alt_action", "")
@@ -486,10 +394,9 @@ class CounterFactualDecomposer:
             unit["R"] += float(reward)
             # Append the alt step to the history so the next-turn
             # renderer sees the full transcript. We intentionally do NOT
-            # `... or ""` the obs — the getattr default already returns
+            # `... or ""` the obs - the getattr default already returns
             # "" for the missing-attribute case, and a legitimately empty
-            # observation (which a well-behaved env may emit between
-            # successful clicks) should be preserved verbatim.
+            # observation should be preserved verbatim.
             obs_text = getattr(states[ci], "observation_text", "")
             unit["history"].append(
                 TurnRecord(
@@ -501,14 +408,10 @@ class CounterFactualDecomposer:
             states[ci] = next_state
             unit["done"] = bool(done)
 
-        # --------------------------------------------------------------
         # Phase C: greedy completion. Loop up to `max_completion_turns`
-        # batched generate_rich calls — one per completion depth — and
-        # step each live unit's env. The heavy artillery from
-        # `RolloutCollector` (token-id capture, prompt-budget tracking)
-        # is intentionally absent because we ONLY need the final R per
-        # CF rollout; tokens are not used downstream.
-        # --------------------------------------------------------------
+        # batched generate_rich calls - one per completion depth - and step
+        # each live unit's env. We only need the final R per CF rollout, so
+        # token-id capture / prompt-budget tracking are intentionally absent.
         completion_sampling = self._build_completion_sampling()
         for _depth in range(self.max_completion):
             live = [ci for ci, u in enumerate(cf_units) if not u["done"]]
@@ -552,9 +455,7 @@ class CounterFactualDecomposer:
                 states[ci] = next_state
                 cf_units[ci]["done"] = bool(done)
 
-        # --------------------------------------------------------------
-        # Phase D: aggregate per-(i, t) baseline ⇒ Δ_t ⇒ optional rescale.
-        # --------------------------------------------------------------
+        # Phase D: aggregate per-(i, t) baseline -> delta_t -> optional rescale.
         # baseline_R[(i, t)] = mean(unit["R"] across alt rollouts at (i, t))
         baseline_R: dict[tuple[int, int], float] = {}
         for (i, t), indices in groups_by_it.items():
@@ -569,8 +470,8 @@ class CounterFactualDecomposer:
                 per_turn[t] = R_actual - baseline_R.get((i, t), 0.0)
             if self.output_mode == "normalized":
                 # Rescale so the per-turn rewards sum to R, preserving the
-                # §3.2 invariant. Distribute weight by max(0, Δ_t) since
-                # negative deltas (alt did better than actual) shouldn't
+                # section 3.2 invariant. Distribute weight by max(0, delta_t)
+                # since negative deltas (alt did better than actual) shouldn't
                 # take credit AWAY from R. Fall back to uniform R/T when
                 # all weights are non-positive.
                 weights = [max(0.0, x) for x in per_turn]
@@ -582,14 +483,12 @@ class CounterFactualDecomposer:
             out.append(per_turn)
         return out
 
-    # ------------------------------------------------------------------
     # PerTurnDecomposer surface helpers
-    # ------------------------------------------------------------------
 
     @property
     def has_learnable_params(self) -> bool:
         """Mirror of `JudgeDecomposer` / `progress_decomposer`. CF has no
-        trainable parameters — the trainer's `compute_loss` will skip the
+        trainable parameters - the trainer's `compute_loss` will skip the
         second AdamW + the C3 consistency-loss reattach.
         """
         return False

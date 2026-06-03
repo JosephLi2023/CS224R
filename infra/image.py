@@ -1,23 +1,23 @@
 """Shared Modal Images for CS224R H-GRPO.
 
 Three images, all built off the same heavy ML base:
-- `image`          — trainer + policy + judge (default).
-- `webshop_image`  — same base + Java JDK + WebShop env runtime deps
+- `image`          - trainer + policy + judge (default).
+- `webshop_image`  - same base + Java JDK + WebShop env runtime deps
                      (pyserini, spaCy, rank_bm25, Flask, gym, ...). Used by
                      `infra/app_webshop_install.py` and any app that
                      instantiates `WebAgentTextEnv` directly.
-- `alfworld_image` — same base + AlfWorld + TextWorld runtime deps. Used by
+- `alfworld_image` - same base + AlfWorld + TextWorld runtime deps. Used by
                      `infra/app_alfworld_install.py` (one-time
                      `alfworld-download` into the Volume) and any app that
                      instantiates `AlfredTWEnv` directly. Much lighter than
-                     `webshop_image` — no Java, no pyserini, no spaCy. The
+                     `webshop_image` - no Java, no pyserini, no spaCy. The
                      `ALFWORLD_DATA` env var is set to the volume-resident
                      data path so the upstream `$ALFWORLD_DATA` interpolation
                      in the env config dict resolves correctly inside the
                      container.
 
 WebShop's own `requirements.txt` pins legacy torch/transformers/numpy that
-would clobber our modern stack — we install its EXTRA deps explicitly here
+would clobber our modern stack - we install its EXTRA deps explicitly here
 and `pip install -e webshop --no-deps` at runtime in the install app.
 """
 from __future__ import annotations
@@ -55,7 +55,7 @@ _PIP_PACKAGES = [
 
 _BASE_APT = ["git", "build-essential"]
 
-# WebShop runtime deps — installed ON TOP of the modern stack. We
+# WebShop runtime deps - installed ON TOP of the modern stack. We
 # deliberately pin only what WebShop genuinely needs at env-reset/step
 # time and leave torch/transformers/numpy at our modern versions.
 _WEBSHOP_PIP_EXTRAS = [
@@ -76,7 +76,7 @@ _WEBSHOP_PIP_EXTRAS = [
 _WEBSHOP_APT = ["default-jdk", "default-jre"]
 
 
-# AlfWorld runtime deps. Much smaller than WebShop's — `alfworld` brings in
+# AlfWorld runtime deps. Much smaller than WebShop's - `alfworld` brings in
 # `textworld` (TextWorld game engine) + `gym` itself; no Java, no pyserini,
 # no spaCy. The `--extra` flag during install also brings the THOR/embodied
 # assets, but those are downloaded by `app_alfworld_install.py` into the
@@ -113,13 +113,13 @@ def _add_workspace(img: modal.Image) -> modal.Image:
             "HF_HOME": "/vol/hf_cache",
             # Use PyTorch's expandable-segments CUDA caching allocator.
             # Forces `torch.cuda.mem_get_info()` to reflect actual OS-level
-            # free memory honestly across alloc → empty_cache cycles.
+            # free memory honestly across alloc -> empty_cache cycles.
             # Workaround for vLLM 0.6.3.post1's
             # `assert peak_memory > 0` (vllm/worker/worker.py:232) which
-            # fires on the train→eval vLLM handoff in
+            # fires on the train->eval vLLM handoff in
             # `infra/app_train_loop._train_loop_impl` because the default
             # caching allocator returns transient profile-run blocks to a
-            # pool that mem_get_info no longer sees as "free" → delta == 0.
+            # pool that mem_get_info no longer sees as "free" -> delta == 0.
             # See PyTorch 2.4 release notes ("expandable_segments").
             "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
         })

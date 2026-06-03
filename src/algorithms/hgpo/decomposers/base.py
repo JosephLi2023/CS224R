@@ -1,8 +1,8 @@
 """Decomposer Protocol + factory.
 
-A decomposer maps a `TrajectoryGroup` to per-turn rewards `r̂_t^i` (one float
+A decomposer maps a `TrajectoryGroup` to per-turn rewards `r_hat_t^i` (one float
 per turn per trajectory). This is the contract the trainer's `compute_loss`
-consumes — see `src/algorithms/grpo/trainer.py::PerTurnDecomposer` (line 74)
+consumes - see `src/algorithms/grpo/trainer.py::PerTurnDecomposer` (line 74)
 which is structurally identical.
 """
 
@@ -33,7 +33,7 @@ class TurnRewardDecomposer(Protocol):
     """Common shape for any per-turn reward decomposer.
 
     `decompose(group)` must return a list shape `[K][T_i]` of floats with
-    the §3.2 invariant `Σ_t out[i][t] == group.trajectories[i].final_reward`
+    the section 3.2 invariant `sum_t out[i][t] == group.trajectories[i].final_reward`
     (within ~1e-9) for the judge/turnrd methods. Method C (progress) does
     NOT enforce that invariant since raw env-progress signals don't sum to
     the final reward by construction.
@@ -70,9 +70,9 @@ def build_decomposer(
     - "counterfactual": requires `runner`, `env_factory`, `prompt_renderer`,
       `action_parser`, and `sampling_factory`. Returns a
       `CounterFactualDecomposer` instance whose `__call__` matches the
-      `PerTurnDecomposer` contract — re-samples N alternative actions per
+      `PerTurnDecomposer` contract - re-samples N alternative actions per
       turn from the policy, completes a short greedy rollout, and emits
-      `r̂_t = R − R_baseline_t`. See
+      `r_hat_t = R - R_baseline_t`. See
       `src/algorithms/hgpo/decomposers/counterfactual.py` for the full
       design + cost rationale.
 

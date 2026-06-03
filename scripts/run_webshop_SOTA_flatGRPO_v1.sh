@@ -1,30 +1,25 @@
 #!/usr/bin/env bash
-# WebShop SOTA — Flat GRPO v1.
+# WebShop SOTA - Flat GRPO v1.
 #
 # Recipe-transplant from AlfWorld SOTA (rank-32 + MLP target modules,
-# K=8, kl=0.04, lr=5e-6, T=1.0) PLUS the new WebShop-specific
-# attribute-progress dense signal (env.use_attribute_progress_intermediate_reward=true).
-# alpha=1.0 (turn-level signal off), decomposer=progress (inert at α=1.0).
+# K=8, kl=0.04, lr=5e-6, T=1.0) PLUS the WebShop-specific attribute-progress
+# dense signal (env.use_attribute_progress_intermediate_reward=true).
+# alpha=1.0 (turn-level signal off), decomposer=progress (inert at alpha=1.0).
 # See plan /Users/shoupeili/.llms/plans/webshop_sota_recipe_transplant_dense_signal.plan.md.
 #
-# Even though Flat GRPO doesn't use the turn-level decomposition, the
-# dense signal feeds the per-turn raw_env_reward field, which the
-# trajectory-level advantage still benefits from (non-zero progress on
-# intermediate turns gives the policy a sharper gradient than the
-# all-zeros-then-terminal-spike Phase 0 signal).
+# Even though Flat GRPO doesn't use the turn-level decomposition, the dense
+# signal feeds the per-turn raw_env_reward field, which the trajectory-level
+# advantage still benefits from (non-zero progress on intermediate turns gives
+# a sharper gradient than the all-zeros-then-terminal-spike Phase 0 signal).
 #
-# Geometry (seed=23, rounds=10, eps=80)
-# =====================================
-#   base_task_id_offset = 23 × 10 × 80 = 18400
+# Geometry (seed=23, rounds=10, eps=80):
+#   base_task_id_offset = 23 * 10 * 80 = 18400
 #   train task range    = [18400, 19200)
 #   eval task range     = [6500, 6600)   (disjoint)
-#   disjoint from attention v1 (seed=11) ✓ and LLMJudge v1 (seed=31) ✓
+#   disjoint from attention v1 (seed=11) and LLMJudge v1 (seed=31)
 #
-# Compute envelope
-# ================
-# ~2.5-3 hours wall-clock, ~$15. K=8 + 100-eps eval, 10 rounds × 80 eps.
-# Slightly faster than the attention variant since there's no TurnRD
-# train step per round.
+# ~2.5-3 hours wall-clock. K=8 + 100-eps eval, 10 rounds * 80 eps. Slightly
+# faster than the attention variant since there's no TurnRD step per round.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -33,7 +28,7 @@ cd "$(dirname "$0")/.."
 # `scripts/run_webshop_sft_v3_mlpr32.sh` (see
 # ~/.llms/plans/webshop_sft_mlpr32_oracle_baseline.plan.md).
 #
-# PLACEHOLDER — replace `REPLACE_WITH_TS_FROM_PHASE4` with the
+# PLACEHOLDER - replace `REPLACE_WITH_TS_FROM_PHASE4` with the
 # timestamp suffix of the actual adapter dir produced by Phase 4,
 # or override at invocation time:
 #   SFT_ADAPTER=/vol/checkpoints/sft_webshop_v3_mlpr32_<ts> \
@@ -79,8 +74,8 @@ se = tr.get('sync_every')
 print(k, '' if gmu is None else float(gmu), '' if se is None else int(se))
 ")
 
-echo "═══════════════════════════════════════════════════════════════════════"
-echo "WebShop SOTA — Flat GRPO v1 (seed=${SEED}, eps=${EPS_PER_ROUND}, T=${ROLLOUT_TEMP})"
+echo "========================================"
+echo "WebShop SOTA - Flat GRPO v1 (seed=${SEED}, eps=${EPS_PER_ROUND}, T=${ROLLOUT_TEMP})"
 echo "  config             : ${CONFIG}"
 echo "  sft_adapter (R0)   : ${SFT_ADAPTER}"
 echo "  run-name-prefix    : ${RUN_PREFIX}"
@@ -105,8 +100,8 @@ echo "                       trajectory-level advantage still benefits from a sh
 echo "                       intermediate-turn signal vs the Phase 0 all-zeros-then-spike)."
 echo "  Driver             : per-round \`modal run\` loop (no TurnRD orchestrator;"
 echo "                       decomposer='progress' is incompatible with run_turnrd_modal.py)."
-echo "  Parallel-safe      : YES — disjoint task ranges + adapter run-name prefix."
-echo "═══════════════════════════════════════════════════════════════════════"
+echo "  Parallel-safe      : YES - disjoint task ranges + adapter run-name prefix."
+echo "========================================"
 
 # In-bash per-round driver. Adapter chaining mirrors run_turnrd_modal.py's
 # carry-policy mode: R0 loads ${SFT_ADAPTER}; R_N>0 loads R_{N-1}'s saved
@@ -129,7 +124,7 @@ run_rounds () {
 
         # Build the modal run command. `_to_container_path` analog: the
         # local repo gets mounted at /workspace inside the container, so
-        # `configs/foo.json` → `/workspace/configs/foo.json`.
+        # `configs/foo.json` -> `/workspace/configs/foo.json`.
         local config_container="/workspace/${CONFIG}"
         local cmd=(
             modal run --detach
@@ -154,11 +149,11 @@ run_rounds () {
         fi
 
         echo ""
-        echo "┌── Round ${round_idx}/${ROUNDS} (offset=${task_offset}, load=${load_adapter##*/}, save=${save_adapter##*/})"
-        echo "│  $ ${cmd[*]}"
+        echo "-- Round ${round_idx}/${ROUNDS} (offset=${task_offset}, load=${load_adapter##*/}, save=${save_adapter##*/})"
+        echo "   $ ${cmd[*]}"
         "${cmd[@]}"
         rc=$?
-        echo "└── Round ${round_idx} exit=${rc}"
+        echo "-- Round ${round_idx} exit=${rc}"
         if [[ ${rc} -ne 0 ]]; then
             echo "ERROR: round ${round_idx} exited ${rc}. Aborting; restart with START_ROUND=${round_idx}." >&2
             return ${rc}
@@ -186,7 +181,7 @@ echo $ORCH_PID > "$PIDFILE"
 echo "WebShop flatGRPO v1 launched: PID=$ORCH_PID"
 echo "  Log: $LOG"
 echo "  PID: $PIDFILE"
-echo "  ETA: ~2.5-3 hours, ~\$15"
+echo "  ETA: ~2.5-3 hours"
 echo ""
 echo "Tail the log with:   tail -f $LOG"
-echo "Pass criterion       : final-round eval ≥ 0.40 (current 0.28 baseline + 12 pp lift)."
+echo "Pass criterion       : final-round eval >= 0.40 (current 0.28 baseline + 12 pp lift)."

@@ -3,7 +3,7 @@
 Pure-Python: no torch / transformers / vLLM dependency, so the prompt format
 is unit-testable without a GPU.
 
-Mirrors `src/envs/prompts/react_webshop.py` — same `render_*_turn_prompt`
+Mirrors `src/envs/prompts/react_webshop.py` - same `render_*_turn_prompt`
 signature, same `_format_history` truncation pattern, same `parse_react_action`
 body. Only the system prompt + action vocabulary differs.
 
@@ -114,7 +114,7 @@ def render_alfworld_turn_prompt(
 def parse_react_action(generation: str) -> str:
     """Extract the `Action: ...` line from a model generation.
 
-    Identical body to `react_webshop.parse_react_action` — duplicated here
+    Identical body to `react_webshop.parse_react_action` - duplicated here
     rather than imported so the env-dispatch test in
     `tests/unit/test_train_loop_env_dispatch.py` can verify each env's
     parser is independently importable.

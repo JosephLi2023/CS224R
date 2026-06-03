@@ -55,7 +55,7 @@ class SFTExample:
     final_reward: float
 
 
-# --------- Action → Thought template ------------------------------------
+# Action -> Thought template
 
 
 def _action_to_thought(action: str) -> str:
@@ -84,7 +84,7 @@ def _action_to_thought(action: str) -> str:
         return f"I'll pick up the {body.strip()}."
     if low.startswith("put "):
         body = a[len("put "):]
-        # ALFWorld uses both "in" and "on" — handle either.
+        # ALFWorld uses both "in" and "on" - handle either.
         for sep in (" in/on ", " in ", " on "):
             if sep in body:
                 obj, _, dst = body.partition(sep)
@@ -124,7 +124,7 @@ def _action_to_thought(action: str) -> str:
 def synthesize_sft_target(action: str) -> str:
     """Build the multi-line SFT label matching the prompt's `Thought:` ending.
 
-    Returns the string the model should emit AFTER the prompt ends — i.e.
+    Returns the string the model should emit AFTER the prompt ends - i.e.
     ` <synthesized thought>\\nAction: <action body>`. The leading space
     is deliberate so it concatenates cleanly with the prompt's trailing
     `Thought:` (which has no trailing whitespace). Mirrors
@@ -133,7 +133,7 @@ def synthesize_sft_target(action: str) -> str:
     return f" {_action_to_thought(action)}\nAction: {action}"
 
 
-# --------- JSONL loader -------------------------------------------------
+# JSONL loader
 
 
 def _row_to_example(row: dict[str, Any]) -> SFTExample | None:
@@ -182,21 +182,9 @@ def load_sft_examples_from_jsonl(
 ) -> list[SFTExample]:
     """Load SFTExamples from a single ALFWorld trajectory JSONL file.
 
-    Args:
-        path: filesystem path to the `.jsonl` file produced by
-              `infra/app_alfworld_sft_gen.py`. Each line is one
-              (prompt, action) pair plus metadata.
-        min_reward: drop examples whose `final_reward < min_reward`.
-              Default 0.0 keeps all rows. Set to e.g. 0.5 to keep
-              only successful expert trajectories (the SFT-gen app
-              already filters non-`won` trajectories so any row in
-              the file should have `final_reward == 1.0` in practice,
-              but the filter is preserved as a defensive guard).
-        max_examples: optional cap on returned rows (for smoke tests).
-
-    Returns:
-        list of `SFTExample` in the order they appear in the file.
-        Skips malformed rows silently (logged via print to stderr).
+    `min_reward` drops examples whose `final_reward` is below it (default
+    0.0 keeps all rows); `max_examples` optionally caps the returned rows.
+    Returns examples in file order and skips malformed rows.
     """
     if not os.path.isfile(path):
         raise FileNotFoundError(f"SFT JSONL not found: {path}")
@@ -209,7 +197,7 @@ def load_sft_examples_from_jsonl(
             try:
                 row = json.loads(line)
             except json.JSONDecodeError:
-                # Skip malformed lines but keep loading — partial files
+                # Skip malformed lines but keep loading - partial files
                 # from a crashed SFT-gen run are still usable.
                 continue
             if not isinstance(row, dict):

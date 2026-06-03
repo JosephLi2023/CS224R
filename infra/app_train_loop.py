@@ -14,15 +14,15 @@ Persists `train_log.json` to /vol/manifests/<run_name>/train_log.json so we
 have a per-episode reward curve we can plot offline.
 
 Env-name dispatch:
-  Two `@app.function` entrypoints — `train_loop_webshop` (binds
+  Two `@app.function` entrypoints - `train_loop_webshop` (binds
   `webshop_image`, deps include Java/pyserini/spaCy) and
   `train_loop_alfworld` (binds `alfworld_image`, much lighter). Both
   delegate to `_train_loop_impl(env_name, ...)` which holds the actual
   training loop and resolves env-specific bindings via `_ENV_REGISTRY`.
   The `local_entrypoint` reads `--env-name` and dispatches.
 
-  Modal's image binding is decorator-time — a single `@app.function`
-  cannot switch images at call time — hence the two-entrypoint shape.
+  Modal's image binding is decorator-time - a single `@app.function`
+  cannot switch images at call time - hence the two-entrypoint shape.
 
 Cost: ~$3-5 for 50 episodes (~10-15 min on A100).
 """
@@ -97,7 +97,7 @@ def _train_loop_impl(
     `train_loop_alfworld` delegate here so the loop body lives in one
     place and image-binding is the only thing the entrypoints differ on.
 
-    `env_name` is "webshop" | "alfworld" — drives `_resolve_env_bindings`
+    `env_name` is "webshop" | "alfworld" - drives `_resolve_env_bindings`
     and is used as the `env_name` field on collected groups.
 
     `num_products` is WebShop-specific; ignored when env_name != "webshop".
@@ -110,8 +110,8 @@ def _train_loop_impl(
         `eval_task_id_base=6500` is WITHIN range AND disjoint from the
         per-seed training ranges used by `scripts/run_turnrd_modal.py`.
       - AlfWorld: `valid_seen` (~140) + `valid_unseen` (~140) is the
-        eval pool. The adapter maps task_id → `task_id % len(games)`
-        deterministically, so any non-negative integer is safe — but to
+        eval pool. The adapter maps task_id -> `task_id % len(games)`
+        deterministically, so any non-negative integer is safe - but to
         keep eval disjoint from training task_ids, the orchestrator
         pre-flight enforces `eval_task_id_base >= seed*rounds*ep_per_round`.
     """
@@ -142,22 +142,22 @@ def _train_loop_impl(
 
     adapter_cls, prompt_renderer, action_parser = _resolve_env_bindings(env_name)
 
-    # Optional JSON config — overrides the per-flag trainer/decomposer
+    # Optional JSON config - overrides the per-flag trainer/decomposer
     # construction with a `build_trainer_from_config` call. When config is
     # empty, the legacy flag-driven path runs unchanged (preserves all
-    # existing callers' behavior — Methods A/C and the flat-GRPO smoke tests).
+    # existing callers' behavior - Methods A/C and the flat-GRPO smoke tests).
     cfg_dict: dict | None = None
     if config:
         with open(config) as fh:
             cfg_dict = json.load(fh)
         # Per-config overrides for the loop knobs that the JSON owns.
         # NOTE: We do NOT override n_episodes, k, or run_name from the
-        # JSON — those describe protocol-wide / orchestrator-supplied
+        # JSON - those describe protocol-wide / orchestrator-supplied
         # semantics, not per-Modal-call semantics. The orchestrator
         # (`scripts/run_turnrd_modal.py`) passes per-round values via
         # --n-episodes / --k / --run-name explicitly. If the JSON
         # overrode these, the orchestrator's per-round naming
-        # (`<prefix>_round00`, `_round01`, …) would collapse onto a
+        # (`<prefix>_round00`, `_round01`, ...) would collapse onto a
         # single `cfg.run.name` and the per-round log aggregator
         # (`scripts/merge_turnrd_round_logs.py`) couldn't auto-detect
         # rounds.
@@ -169,8 +169,8 @@ def _train_loop_impl(
     print(">>> Loading LoRAPolicy")
     # Plumb-through of LoRA arch knobs from JSON config.
     # Without this, policy.lora_rank / policy.lora_target_modules in the
-    # JSON were silently ignored (the dataclass defaults — rank 16,
-    # attention-only — were always used). See plan
+    # JSON were silently ignored (the dataclass defaults - rank 16,
+    # attention-only - were always used). See plan
     # alfworld_8round_mlp_rank32_restart.plan.md for context.
     _lora_kwargs: dict = {}
     if cfg_dict is not None:
@@ -196,7 +196,7 @@ def _train_loop_impl(
     # Pre-vLLM cleanup. Without this, PyTorch's caching allocator
     # holds ~14 GB after the (base + LoRA + adapter) load, then vLLM's
     # probe forward at init time can't grow memory above that baseline
-    # → `_assert_memory_footprint_increased_during_profiling` fires.
+    # -> `_assert_memory_footprint_increased_during_profiling` fires.
     # This was the root cause of the rank-32 MLP+attn R0 crash on the
     # AlfWorld SOTA 8round (see plan
     # ~/.llms/plans/alfworld_8round_mlp_rank32_restart.plan.md).
@@ -227,7 +227,7 @@ def _train_loop_impl(
     )
 
     if sft_loaded:
-        # vLLM was just initialised with the BASE Qwen weights — push the
+        # vLLM was just initialised with the BASE Qwen weights - push the
         # SFT-merged LoRA into it so the very first episode samples from the
         # warm-started policy. Without this, episode 0 would still be
         # base-Qwen.
@@ -239,13 +239,13 @@ def _train_loop_impl(
         if _torch.cuda.is_available():
             _torch.cuda.empty_cache()
 
-    # --- Env factory: env-aware kwargs ---
+    # Env factory: env-aware kwargs
     # WebShop: legacy `num_products` flag has dominated the call surface;
     #   if the cfg JSON doesn't carry an `env.env_kwargs` block, fall back
     #   to {"num_products": num_products} for backward compat with all
     #   prior WebShop runs that use the flag-only path.
     # AlfWorld + others: read `env.env_kwargs` from the cfg JSON verbatim
-    #   (these envs need a non-trivial config dict — see configs/env_alfworld.json).
+    #   (these envs need a non-trivial config dict - see configs/env_alfworld.json).
     env_block: dict = {}
     if cfg_dict is not None and isinstance(cfg_dict.get("env"), dict):
         env_block = dict(cfg_dict["env"])
@@ -264,7 +264,7 @@ def _train_loop_impl(
     adapter_task_split = str(env_block.get("task_split", "train"))
     # Phase 2 (ALFWorld only): opt-in to TextWorld's native
     # `info["intermediate_reward"]` (PDDL-fluent flips) as the V-head
-    # supervision source. Default False ⇒ Phase 1 byte-for-byte
+    # supervision source. Default False -> Phase 1 byte-for-byte
     # preserved. WebShop's adapter doesn't accept this kwarg, so we
     # only thread it on the alfworld branch below.
     adapter_use_tw_ir = bool(env_block.get("use_textworld_intermediate_reward", False))
@@ -272,7 +272,7 @@ def _train_loop_impl(
     # as the V-head supervision source. Higher priority than the
     # (broken-in-prod) Phase 1 plan-length delta but still lower than
     # the (preferred) TextWorld upstream when both flags are on.
-    # Default False ⇒ Phase 1 byte-for-byte preserved.
+    # Default False -> Phase 1 byte-for-byte preserved.
     adapter_use_facts_diff_ir = bool(
         env_block.get("use_facts_diff_intermediate_reward", False)
     )
@@ -339,11 +339,11 @@ def _train_loop_impl(
             sampling_factory=SamplingParams,
         )
         # v6 BUG 2 fix plumbing: tell the trainer which round we're in
-        # so the V-baseline annealing schedule can compute β.
+        # so the V-baseline annealing schedule can compute beta.
         trainer.cfg.v_baseline_round_idx = int(round_idx)
         # Goal-aware producer plumbing: when these turnrd config flags
         # are set, the producer emits `goal_text` and per-trajectory
-        # `goal_emb` on every record so the V-head's FiLM γ/β path
+        # `goal_emb` on every record so the V-head's FiLM gamma/beta path
         # (built when `goal_conditioned_value_head=true`) has its input.
         # Both default False, keeping every existing config byte-for-byte
         # unchanged.
@@ -395,14 +395,14 @@ def _train_loop_impl(
     sampling = SamplingParams(
         n=1, temperature=rollout_temperature, top_p=0.95,
         max_tokens=48,
-        return_logprobs=True, seed=None,  # fresh sampling each call → diverse K trajectories
+        return_logprobs=True, seed=None,  # fresh sampling each call -> diverse K trajectories
     )
 
     if sft_loaded and use_sft_as_ref:
         n = trainer.snapshot_current_lora_as_ref()
         print(f">>> Snapshotted {n} LoRA modules as KL reference (RL-from-SFT)")
 
-    # ---- task-id iteration: legacy contiguous slice
+    # task-id iteration: legacy contiguous slice
     # `[task_id_offset, task_id_offset + n_episodes)`. Kept as a list so the
     # main loop can `for ep, task_id in enumerate(task_ids):` uniformly
     # regardless of how the list is generated.
@@ -413,7 +413,7 @@ def _train_loop_impl(
         f"(contiguous slice [{task_id_offset}, {task_id_offset + n_episodes}))"
     )
 
-    # Generic config snapshot for train_log.json — env-agnostic now that
+    # Generic config snapshot for train_log.json - env-agnostic now that
     # `num_products` is just one possible env_kwarg among many.
     def _config_snapshot() -> dict:
         # Tier-4 observability: surface the TurnRD ckpt-load outcome (set
@@ -482,7 +482,7 @@ def _train_loop_impl(
                 "alpha_max": round(stats.alpha_max, 6),
                 "alpha_entropy": round(stats.alpha_entropy, 6),
                 "alpha_progress_corr": round(stats.alpha_progress_corr, 6),
-                # ----- Tier-4 real-signal columns (see TrainStepStats) -----
+                # Tier-4 real-signal columns (see TrainStepStats)
                 "std_reward_group": round(stats.std_reward_group, 6),
                 "dead_K_group": int(stats.dead_K_group),
                 "mean_abs_traj_adv": round(stats.mean_abs_traj_adv, 6),
@@ -502,7 +502,7 @@ def _train_loop_impl(
             )
 
             if sync_every > 0 and (ep + 1) % sync_every == 0:
-                # Stream merged LoRA weights one tensor at a time — avoids
+                # Stream merged LoRA weights one tensor at a time - avoids
                 # the deepcopy(self.model) memory spike. Then explicitly
                 # release any leftover buffers before next episode.
                 runner.sync_weights(policy.iter_merged_weights())
@@ -518,7 +518,7 @@ def _train_loop_impl(
                 json.dump({"rows": log, "config": _config_snapshot()}, f, indent=2)
             volume.commit()
         except Exception as exc:
-            # LoRA merge produced a non-finite weight → vLLM is now in a
+            # LoRA merge produced a non-finite weight -> vLLM is now in a
             # half-updated state (the first N layers carry new fp32-promoted
             # weights, the remaining layers carry stale weights from the
             # prior sync). Continuing the loop would run every subsequent
@@ -527,7 +527,7 @@ def _train_loop_impl(
             # the eval block; `app_aggregate_alfworld` then correctly skips
             # this round via the missing-eval-block path. The assertion
             # message (with module name + abs-max) reaches the operator
-            # logs verbatim — that's exactly the diagnostic the finite check
+            # logs verbatim - that's exactly the diagnostic the finite check
             # was added to produce.
             if isinstance(exc, LoRAMergeNonFiniteError):
                 print(f"ep={ep} FATAL (LoRA merge): {exc!r}; aborting round.")
@@ -555,7 +555,7 @@ def _train_loop_impl(
             # `if sync_every > 0 ...` empty_cache block above is skipped.
             # That leaves the failed step's activations in the allocator
             # cache, dramatically increasing the chance the NEXT episode
-            # also OOMs — a cascading-OOM pattern previously observed
+            # also OOMs - a cascading-OOM pattern previously observed
             # (UnboundLocalError eps left ~1-2 GiB pinned, and the next
             # ep's larger forward immediately OOM'd). Flush proactively in
             # the except branch so each crash starts the next ep clean.
@@ -575,7 +575,7 @@ def _train_loop_impl(
     early = rewards[: max(1, len(rewards) // 10)]
     late = rewards[-max(1, len(rewards) // 10):]
 
-    # ---- Held-out eval pass on a disjoint task range, greedy sampling ----
+    # Held-out eval pass on a disjoint task range, greedy sampling
     eval_block: dict | None = None
     if eval_episodes > 0:
         print(
@@ -584,32 +584,32 @@ def _train_loop_impl(
         )
         # FIX #3 (Modal-bug bypass): instead of reusing the train-phase vLLM
         # instance for eval (which has accumulated state corruption after
-        # ~30+ sync_weights cycles → "CUDA illegal memory access" in
+        # ~30+ sync_weights cycles -> "CUDA illegal memory access" in
         # prepare_model_input, seen consistently at K=8 after R4-R5), we:
         #   1. Shutdown the train-phase vLLM (frees + un-poisons CUDA state)
         #   2. GC + empty_cache + synchronize (clear cached allocator state)
-        #   3. Save the LoRA adapter to disk (preserves training state) —
+        #   3. Save the LoRA adapter to disk (preserves training state) -
         #      now runs on a clean CUDA context
         #   4. Merge LoRA into the base on /tmp (yields full HF model)
-        #   5. Boot a FRESH vLLM with the merged model — no sync_weights ever
+        #   5. Boot a FRESH vLLM with the merged model - no sync_weights ever
         #   6. Run eval on the fresh vLLM
-        # LoRA adapter is preserved on disk → next round's train_loop will
+        # LoRA adapter is preserved on disk -> next round's train_loop will
         # reload it via load_adapter(save_adapter_out) for continued PPO.
         #
-        # ⚠ ORDERING FIX (2026-05-20, after R4 cascade):
+        # ORDERING FIX (2026-05-20, after R4 cascade):
         # The original FIX #3 ran `save_adapter` BEFORE `runner.shutdown()`.
-        # That is exactly when the bug bites — `.to("cpu")` on adapter
+        # That is exactly when the bug bites - `.to("cpu")` on adapter
         # tensors inherits the same poisoned CUDA context that already
         # killed `prepare_model_input`. We hit this twice on R4 of the
         # AlfWorld SOTA 8-round run (R0..R3 clean, R4 crashes deterministic-
-        # ally at `safetensors.torch._tobytes → tensor.to("cpu")`). The
+        # ally at `safetensors.torch._tobytes -> tensor.to("cpu")`). The
         # save also writes only README.md before crashing, which breaks
         # peft.load_adapter on the next round with HFValidationError
         # (path-as-Hub-repo cascade). Solution: shutdown vLLM FIRST, then
         # save. Adapter save then runs on a fresh CUDA state.
         # Merge order is preserved: merge_and_unload operates on
         # policy.model (the PEFT-wrapped HF model), not vLLM, so it works
-        # both before and after shutdown — we keep it AFTER save for the
+        # both before and after shutdown - we keep it AFTER save for the
         # same atomicity reason as before (save first so the disk-side
         # adapter is durable even if merge fails).
         print(">>> [pre-merge] Shutting down train-phase vLLM (FIRST, before save_adapter — un-poisons CUDA)")
@@ -632,11 +632,8 @@ def _train_loop_impl(
             os.makedirs(save_adapter_out, exist_ok=True)
             policy.save_adapter(save_adapter_out)
             volume.commit()  # persist to Modal volume so next round can load it
-            adapter_saved_early = True
-        else:
-            adapter_saved_early = False
         # Merge LoRA into base and save to /tmp/eval_merged for vLLM.
-        # This destroys policy.model's PEFT structure — only safe because
+        # This destroys policy.model's PEFT structure - only safe because
         # we're done training for this round.
         import shutil
         eval_merged_dir = "/tmp/eval_merged"
@@ -671,7 +668,7 @@ def _train_loop_impl(
                 # `free` value before and after the profile-time fake
                 # forward. That happens whenever the fake forward is
                 # satisfied out of cached blocks instead of growing
-                # the device footprint — exactly the state the
+                # the device footprint - exactly the state the
                 # allocator ends up in after a vLLM shutdown +
                 # merge_and_unload + save_pretrained sequence. Reset
                 # the peak/accumulated stats and force one real
@@ -695,7 +692,7 @@ def _train_loop_impl(
         # to the merged dir on local disk instead of HF cache.
         # `num_gpu_blocks_override=8000` bypasses vLLM 0.6.3.post1's
         # `peak_memory > 0` profile assertion that fires on the
-        # train→eval vLLM handoff (see VLLMRunnerConfig docstring).
+        # train->eval vLLM handoff (see VLLMRunnerConfig docstring).
         print(">>> [pre-merge] Booting fresh eval-vLLM with merged weights")
         runner = VLLMRunner(
             VLLMRunnerConfig(
@@ -717,7 +714,7 @@ def _train_loop_impl(
         # Single eval collector reused across all eval episodes. Its env
         # pool is built once on the first call and reused via env.reset()
         # for subsequent episodes (saves the per-ep env construction cost
-        # — ~5-8 s WebShop, much higher for AlfWorld). Producer hook is
+        # - ~5-8 s WebShop, much higher for AlfWorld). Producer hook is
         # disabled here so eval rollouts don't pollute the replay buffer.
         eval_collector = RolloutCollector(
             runner=runner,
@@ -800,7 +797,6 @@ def _train_loop_impl(
                 f, indent=2,
             )
         volume.commit()
-    # -----------------------------------------------------------------
 
     # Optional: save the trained LoRA adapter to a path on the volume so
     # the next round of a multi-round protocol can load it instead of
@@ -842,8 +838,8 @@ def _train_loop_impl(
     return summary
 
 
-# ---- Two image-bound entrypoints. Modal image binding is decorator-time so
-# ---- a single @app.function cannot switch images at call time.
+# Two image-bound entrypoints. Modal image binding is decorator-time so
+# a single @app.function cannot switch images at call time.
 
 @app.function(image=webshop_image, gpu="A100-80GB", volumes={VOLUME_MOUNT: volume}, secrets=maybe_openai_secret(), timeout=120 * 60)
 def train_loop_webshop(
@@ -886,7 +882,7 @@ def train_loop_alfworld(
     k: int = 4,
     max_turns: int = 30,
     task_id_offset: int = 0,
-    num_products: int = 0,  # unused for AlfWorld — kept for shared signature
+    num_products: int = 0,  # unused for AlfWorld - kept for shared signature
     sync_every: int = 1,
     run_name: str = "method_alfworld_smoke",
     sft_adapter: str = "",

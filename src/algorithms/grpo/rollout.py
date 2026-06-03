@@ -8,7 +8,7 @@ these from a vLLM policy + env lives in
 Conventions:
 - A "task" is one environment instance (one WebShop product query, one
   ALFWorld household goal).
-- For each task we sample K trajectories τ_1, ..., τ_K from π_θ.
+- For each task we sample K trajectories tau_1, ..., tau_K from pi_theta.
 - Each trajectory is a sequence of turns. A turn = (observation, action).
 - Each trajectory has a single scalar `final_reward` R_i (sparse outcome).
 """
@@ -32,7 +32,7 @@ class TurnRecord:
     # Per-turn intermediate reward as observed from the env (often 0 for
     # sparse-reward tasks; populated by `progress` decomposer for Method C).
     raw_env_reward: float = 0.0
-    # ----- token-level fields populated by the rollout collector -----
+    # token-level fields populated by the rollout collector
     # Token ids of the model-generated action (matches `action_text` after detokenization).
     action_token_ids: tuple[int, ...] = ()
     # Per-token log-probs under the rollout-time policy (used by the PPO
@@ -43,30 +43,21 @@ class TurnRecord:
     # Token ids of the prompt the policy was conditioned on at this turn.
     # Required by `HGPOTrainer.compute_loss` to recompute new-policy logprobs.
     prompt_token_ids: tuple[int, ...] = ()
-    # Optional dense per-turn shaping signal sourced from the env adapter
-    # via `info["intermediate_reward"]`. On ALFWorld this is the
-    # expert-plan-length reduction `\u0394 = max(0, prev_plan_len -
-    # curr_plan_len)` \u2014 "did this action move strictly closer to the
-    # goal?" \u2014 the dense V-head supervision target consumed by the
-    # standalone TurnRDv2 trainer (preferred over the near-degenerate
-    # `raw_env_reward` signal). Defaults to None so trajectories from
-    # envs without an adapter-side shaping signal (WebShop, FakeWebShop,
-    # legacy fixtures) round-trip unchanged. The collector emits a
-    # parallel `progress_signal` JSONL field only when EVERY turn in a
-    # trajectory carries a non-None value (mirrors the dataset's
-    # all-or-nothing semantics for the existing `progress` field).
+    # Optional dense per-turn shaping signal from the env adapter via
+    # info["intermediate_reward"] (ALFWorld expert-plan-length delta).
+    # None for envs that don't supply it (WebShop, fixtures).
     intermediate_reward: float | None = None
 
 
 @dataclass(frozen=True)
 class Trajectory:
-    """One sampled trajectory τ_i."""
+    """One sampled trajectory tau_i."""
 
     task_id: str
     env_name: str  # "webshop" | "alfworld"
     turns: list[TurnRecord]
     final_reward: float
-    # The seed used when sampling π_θ(τ | task) — kept for reproducibility.
+    # The seed used when sampling pi_theta(tau | task) - kept for reproducibility.
     sample_seed: int = 0
 
     @property
@@ -79,7 +70,7 @@ class TrajectoryGroup:
     """A K-sized group of trajectories sampled for the same task.
 
     All `Trajectory.task_id` MUST match `task_id`. Group sizes can be uneven
-    in turn count across trajectories — advantage math handles padding via
+    in turn count across trajectories - advantage math handles padding via
     explicit per-position masking.
     """
 

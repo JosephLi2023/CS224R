@@ -1,6 +1,6 @@
 """vLLM-served Qwen2.5-7B-Instruct judge backend (fallback).
 
-Talks to a Modal app (`modal/app_judge.py`) that exposes `/score_turns`.
+Talks to a Modal vLLM judge app that exposes `/score_turns`.
 Used when no OpenAI API key is available or for fully self-contained reproducibility.
 """
 

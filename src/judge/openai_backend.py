@@ -43,9 +43,7 @@ class OpenAIJudge:
         self._client: Any = None
         self._async_client: Any = None
 
-    # ------------------------------------------------------------------
     # Client init
-    # ------------------------------------------------------------------
 
     def _ensure_clients(self) -> None:
         """Lazy-import + lazy-construct both OpenAI clients.
@@ -53,12 +51,9 @@ class OpenAIJudge:
         Reads `OPENAI_API_KEY` implicitly from the process env (Modal Secret
         injects it; tests can monkeypatch this method to avoid network).
 
-        `max_retries=0` disables the OpenAI SDK's built-in retry layer so
-        the in-house retry loop in `score_turns` / `score_turns_async` is
-        the single source of truth. Without this, transient bursts could
-        trigger up to (sdk_retries + 1) * (self.max_retries + 1) HTTP
-        attempts per call, blowing through `max_judge_calls_per_run`
-        budgets and rate-limit headroom (review item I1).
+        `max_retries=0` disables the OpenAI SDK's built-in retry layer so the
+        in-house retry loop in `score_turns` / `score_turns_async` is the
+        single source of truth for retry behavior.
         """
         if self._client is not None and self._async_client is not None:
             return
@@ -69,9 +64,7 @@ class OpenAIJudge:
         if self._async_client is None:
             self._async_client = AsyncOpenAI(timeout=self.timeout_s, max_retries=0)
 
-    # ------------------------------------------------------------------
     # Shared helpers
-    # ------------------------------------------------------------------
 
     def _build_messages(self, request: JudgeRequest) -> list[dict[str, str]]:
         return [
@@ -82,7 +75,7 @@ class OpenAIJudge:
     def _parse_response_to_turn_scores(
         self, content: str, request: JudgeRequest
     ) -> list[TurnScore]:
-        """Parse the JSON object the model returned and apply the §3.2 invariant.
+        """Parse the JSON object the model returned and apply the section 3.2 invariant.
 
         Raises ValueError on any structural issue (per Protocol contract:
         backends must raise on parse failure rather than silently zero).
@@ -149,9 +142,7 @@ class OpenAIJudge:
         """Exponential backoff: base * 2**attempt."""
         return self.backoff_base_s * (2 ** attempt)
 
-    # ------------------------------------------------------------------
     # Public sync + async API
-    # ------------------------------------------------------------------
 
     def score_turns(self, request: JudgeRequest) -> list[TurnScore]:
         self._ensure_clients()
@@ -169,7 +160,7 @@ class OpenAIJudge:
                 if content is None:
                     raise ValueError("OpenAIJudge: response content was None")
                 return self._parse_response_to_turn_scores(content, request)
-            except Exception as exc:  # noqa: BLE001 — transient classification done in helper
+            except Exception as exc:  # noqa: BLE001 - transient classification done in helper
                 # Narrowed from BaseException so KeyboardInterrupt /
                 # SystemExit / asyncio.CancelledError propagate as Python
                 # intends (review item I2).
@@ -199,7 +190,7 @@ class OpenAIJudge:
                 if content is None:
                     raise ValueError("OpenAIJudge: response content was None")
                 return self._parse_response_to_turn_scores(content, request)
-            except Exception as exc:  # noqa: BLE001 — transient classification done in helper
+            except Exception as exc:  # noqa: BLE001 - transient classification done in helper
                 # Narrowed from BaseException so asyncio.CancelledError
                 # (a BaseException subclass) propagates the gather cancel
                 # cascade transparently per Python's contract (review I2).

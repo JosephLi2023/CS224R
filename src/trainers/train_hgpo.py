@@ -1,20 +1,9 @@
 """H-GRPO trainer config loader.
 
-`build_trainer_from_config(cfg, *, policy)` builds the full Method-A/B/C
-machinery from a `configs/method_hgpo_*.json`-shaped dict and returns
-the assembled `HGPOTrainer` plus the producer plumbing
-`infra/app_train_loop.py` needs to wire the rollout collector for
-Method B.
-
-This is a thin loader — all heavy lifting (decomposer construction,
-TurnRD model init, embedder factory, judge backend wiring) is delegated
-to the factories that already exist in
-`src.algorithms.hgpo.decomposers.{__init__, base, judge, turnrd,
-counterfactual}`, `src.judge.backend::build_judge`,
-`src.turnrd.{model, embedders}`.
-
-torch is imported at module top because `TurnRD` instantiation requires
-it. Mac-side tests gate via `pytest.importorskip("torch")`.
+`build_trainer_from_config(cfg, *, policy)` builds the trainer machinery
+from a method config dict and returns the assembled `HGPOTrainer` plus
+the producer plumbing for Method B. Heavy lifting is delegated to the
+decomposer/judge/turnrd factories.
 """
 from __future__ import annotations
 
@@ -28,7 +17,6 @@ from src.algorithms.grpo.kl import AdaptiveKLConfig
 from src.algorithms.grpo.trainer import (
     HGPOTrainer,
     HGPOTrainerConfig,
-    PerTurnDecomposer,
     progress_decomposer,
 )
 
@@ -41,7 +29,7 @@ if TYPE_CHECKING:
         SamplingFactory,
         _RunnerLike,
     )
-    from src.algorithms.hgpo.decomposers.turnrd import TurnEmbedder, TurnRDDecomposer
+    from src.algorithms.hgpo.decomposers.turnrd import TurnEmbedder
     from src.policy.lora_policy import LoRAPolicy
 
 logger = logging.getLogger(__name__)
@@ -58,12 +46,10 @@ BuildResult = Tuple[
 
 
 def _build_kl_cfg(cfg: dict[str, Any]) -> AdaptiveKLConfig:
-    """Map `cfg["train"]["kl_coeff"]` (existing JSON key) → `AdaptiveKLConfig`.
+    """Map `cfg["train"]["kl_coeff"]` -> `AdaptiveKLConfig`.
 
-    The existing method configs only specify a single `kl_coeff` scalar
-    that we feed into both `init_coef` and `target_kl` (the standard
-    PPO-RLHF-default symmetric setup). All other AdaptiveKL knobs keep
-    their dataclass defaults.
+    Feeds the single `kl_coeff` scalar into both `init_coef` and
+    `target_kl`; all other knobs keep dataclass defaults.
     """
     train_cfg = cfg.get("train", {}) or {}
     kl_coeff = train_cfg.get("kl_coeff")
@@ -132,14 +118,14 @@ def _build_turnrd_branch(
     producer plumbing.
 
     Reads cfg["turnrd"]:
-      version: "v1" | "v2" (default "v1") — selects architecture.
+      version: "v1" | "v2" (default "v1") - selects architecture.
       mode: 1 | 2
       layers: int
       hidden_size: int
       refresh_every_episodes: int
       replay_buffer_path: str | None  (forwarded as turnrd_emit_path)
       ckpt_path: str | None           (refresh fn loads this when not None)
-      max_turns: int (optional; defaults to 64 — matches `TurnRDConfig`)
+      max_turns: int (optional; defaults to 64 - matches `TurnRDConfig`)
       progress_prior_strength: float  (v2 only; defaults to TurnRDv2Config default)
     """
     turnrd_cfg = cfg.get("turnrd")
@@ -153,9 +139,8 @@ def _build_turnrd_branch(
     from src.turnrd.embedders import policy_hidden_state_embedder
     from src.turnrd.model import TurnRD, TurnRDConfig, TurnRDv2, TurnRDv2Config
 
-    # Read the policy's hidden size at runtime (1536 for Qwen2.5-1.5B).
-    # We DO NOT trust a JSON-supplied input_dim — the policy is the
-    # source of truth.
+    # Read the policy's hidden size at runtime (1536 for Qwen2.5-1.5B);
+    # the policy is the source of truth, not a JSON-supplied input_dim.
     try:
         input_dim = int(policy.model.config.hidden_size)
     except AttributeError as e:
@@ -174,9 +159,7 @@ def _build_turnrd_branch(
 
     if version == "v2":
         # v2 architecture: bidirectional encoder + per-turn score/value heads,
-        # progress-prior init bias. Reuses the same JSON keys for the encoder
-        # geometry (n_layers/hidden_size/n_heads/max_turns/dropout/causal) so
-        # configs can swap version with minimal churn.
+        # progress-prior init bias. Reuses the same JSON keys as v1.
         v2_defaults = TurnRDv2Config()
         turnrd_model: "TurnRD | TurnRDv2" = TurnRDv2(
             TurnRDv2Config(
@@ -217,9 +200,8 @@ def _build_turnrd_branch(
     embedder = policy_hidden_state_embedder(policy)
     decomposer = TurnRDDecomposer(model=turnrd_model, embedder=embedder)
 
-    # Refresh fn (None when no ckpt_path is configured — the trainer
-    # then disables the hook even if cfg.refresh_every_episodes > 0,
-    # via the constructor null check).
+    # Refresh fn (None when no ckpt_path is configured - the trainer
+    # then disables the hook even if cfg.refresh_every_episodes > 0).
     ckpt_path = turnrd_cfg.get("ckpt_path")
     refresh_fn: Callable[[], None] | None = None
     # Store the most recent checkpoint-refresh status for run manifests.
@@ -228,22 +210,18 @@ def _build_turnrd_branch(
         ckpt_path_resolved = Path(ckpt_path)
 
         def _refresh() -> None:
-            # The standalone train_turnrd writes the ckpt in a separate
-            # Modal container and calls volume.commit() before exiting.
-            # Reload here so this container's view of /vol/cache/ picks
-            # up the freshly-written ckpt (Modal Volumes are
-            # eventually-consistent across containers). No-op when the
-            # parent train_loop and the standalone trainer happen to
-            # share a container (single-process tests).
+            # Reload the Modal Volume so this container sees the ckpt the
+            # standalone train_turnrd committed in a separate container
+            # (Volumes are eventually-consistent). No-op when both share a
+            # container (single-process tests).
             try:
                 from infra.common import volume as _shared_volume  # type: ignore[import-not-found]
 
                 _shared_volume.reload()
             except Exception:
                 # `infra.common` is only importable inside a Modal
-                # container. Outside of Modal (e.g. CPU smoke test) the
-                # ckpt is on the local filesystem and reload is a no-op
-                # by definition — silently skip.
+                # container. Outside Modal the ckpt is local and reload is
+                # a no-op; silently skip.
                 pass
             if not ckpt_path_resolved.is_file():
                 logger.warning(
@@ -261,11 +239,9 @@ def _build_turnrd_branch(
                 map_location=next(decomposer.model.parameters()).device,
                 weights_only=True,
             )
-            # Load with strict=False so checkpoints with different FiLM
-            # settings can be inspected without failing the run. PyTorch's
-            # IncompatibleKeys return value reports any missing or
-            # unexpected keys; surface a one-line warning so the
-            # operator can spot accidental schema mismatches.
+            # strict=False so checkpoints with different FiLM settings
+            # don't fail the run; warn on any missing/unexpected keys to
+            # surface accidental schema mismatches.
             _load_result = decomposer.load_state_dict(sd, strict=False)
             try:
                 _missing = list(getattr(_load_result, "missing_keys", []) or [])
@@ -315,9 +291,8 @@ def _build_turnrd_branch(
     judge_decomposer: "TurnRewardDecomposer | None" = None
     if mode == 2:
         # Reuse the Method-A factory so the qualified-task-id math + cache
-        # read-through stays in one place. Requires a 'judge' block in the
-        # config (a Method-B Mode-2 run still needs the judge-cache read
-        # path to source labels).
+        # read-through stays in one place. Mode-2 still needs the judge
+        # block to source labels via the cache read path.
         judge_cfg = cfg.get("judge")
         if not isinstance(judge_cfg, dict):
             raise ValueError(
@@ -352,13 +327,11 @@ def _build_turnrd_branch(
         refresh_decomposer_fn=refresh_fn,
     )
 
-    # Eager startup load: the trainer's in-loop refresh hook only fires
-    # when `self._step % refresh_every_episodes == 0 AND self._step > 0`,
-    # so for round-based protocols where each round runs in a FRESH Modal
-    # container (`self._step` resets to 0), the hook would never load the
-    # standalone-fitter's checkpoint written between rounds. Load it once
-    # here so the very first episode of the round uses the latest fit.
-    # No-op when ckpt doesn't exist yet (Round 0 of the first protocol run).
+    # Eager startup load: the in-loop refresh hook only fires when
+    # `self._step % refresh_every_episodes == 0 and self._step > 0`, so a
+    # round running in a fresh container (`self._step` reset to 0) would
+    # never load the ckpt written between rounds. Load once here so the
+    # first episode uses the latest fit. No-op when the ckpt is absent.
     if refresh_fn is not None:
         try:
             refresh_fn()
@@ -387,11 +360,10 @@ def _build_counterfactual_branch(
 ) -> BuildResult:
     """Method D: counterfactual-rollout decomposer.
 
-    Reuses the SAME runner the rollout collector drives so we don't pay
-    a second vLLM init. The env factory must be the SAME function the
-    collector uses (it's already shared in `app_train_loop.py` —
-    `env_factory = lambda: WebShopAdapter(...)`); the CF decomposer
-    builds its own env pool from it for the replay rollouts.
+    Reuses the same runner the rollout collector drives to avoid a second
+    vLLM init. The env factory must be the same function the collector
+    uses; the CF decomposer builds its own env pool from it for the
+    replay rollouts.
 
     Reads `cfg["counterfactual"]` (forwarded to
     `build_counterfactual_decomposer`):
@@ -434,7 +406,7 @@ def _build_counterfactual_branch(
     )
     trainer = HGPOTrainer(
         policy=policy,
-        decomposer=cf_decomposer,  # __call__ → .decompose
+        decomposer=cf_decomposer,  # __call__ -> .decompose
         cfg=trainer_cfg,
     )
     # Method D doesn't need TurnRD producer plumbing; mirror Methods A/C.
@@ -445,9 +417,8 @@ def build_trainer_from_config(
     cfg: dict[str, Any],
     *,
     policy: "LoRAPolicy",
-    # Optional CF-only deps — passed through from `app_train_loop.py`
-    # only when `cfg["hgpo"]["decomposer"] == "counterfactual"`. Methods
-    # A/B/C ignore these.
+    # Optional CF-only deps, passed through only when
+    # `cfg["hgpo"]["decomposer"] == "counterfactual"`. Methods A/B/C ignore these.
     runner: Optional["_RunnerLike"] = None,
     env_factory: Optional["EnvFactory"] = None,
     prompt_renderer: Optional["PromptRenderer"] = None,

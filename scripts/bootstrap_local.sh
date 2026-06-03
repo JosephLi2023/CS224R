@@ -5,7 +5,7 @@
 # installs the lightweight requirements, runs the test suite to confirm.
 #
 # Heavy ML deps (torch, transformers, vllm, ...) intentionally NOT installed
-# locally — they live inside the Modal image (infra/image.py).
+# locally - they live inside the Modal image (infra/image.py).
 #
 # Usage:
 #   bash scripts/bootstrap_local.sh

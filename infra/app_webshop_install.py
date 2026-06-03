@@ -185,7 +185,7 @@ def build_index_full() -> dict:
 
     Symlinks `items_shuffle.json` (1.18M) + `items_ins_v2.json` as canonical
     filenames in repo/data, runs convert_product_file_format.py + pyserini
-    indexing for `resources/` → `indexes/`. Persists to
+    indexing for `resources/` -> `indexes/`. Persists to
     /vol/data/webshop/indexes_full.
     """
     import os, subprocess, sys, shutil

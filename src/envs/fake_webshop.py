@@ -3,18 +3,18 @@
 Mirrors the `WebShopAdapter` reset/step shape but does NOT depend on the real
 WebShop install (pyserini, spaCy, BM25 index). Behavior:
 
-- `reset(task_id)` → initial state with `instruction` + `observation_text` +
+- `reset(task_id)` -> initial state with `instruction` + `observation_text` +
   `valid_actions`.
-- `step(action_text)` → progresses through a fixed branching script:
+- `step(action_text)` -> progresses through a fixed branching script:
     turn 0: only `search[*]` actions are valid; any `search` advances.
     turn 1: must `click[item-N]`; clicking item-0 yields the highest reward.
     turn 2: must `click[buy]`; rewards finalize.
 - Episode terminates after the buy step or after `max_steps`.
 
 Reward model:
-- Clicking the canonical "best" item then buying ⇒ reward = 1.0.
-- Clicking a wrong item then buying    ⇒ reward = 0.4 (partial match).
-- Failing to buy by `max_steps`        ⇒ reward = 0.0.
+- Clicking the canonical "best" item then buying -> reward = 1.0.
+- Clicking a wrong item then buying    -> reward = 0.4 (partial match).
+- Failing to buy by `max_steps`        -> reward = 0.0.
 
 Determinism: derived purely from `task_id` (an int). Two FakeWebShopEnv
 instances with the same task_id reset to byte-identical states.
@@ -54,10 +54,10 @@ class FakeWebShopEnv:
         self.max_steps = max_steps
         self._task_id: int = 0
         self._steps: int = 0
-        self._stage: str = "search"  # search → click → buy → done
+        self._stage: str = "search"  # search -> click -> buy -> done
         self._clicked_correct: bool = False
 
-    # ---- gym-ish API -----------------------------------------------
+    # gym-ish API
 
     def reset(self, task_id: int = 0) -> FakeWebShopState:
         self._task_id = int(task_id)
@@ -97,7 +97,7 @@ class FakeWebShopEnv:
 
         return self._make_state(), reward, done, info
 
-    # ---- internals -------------------------------------------------
+    # internals
 
     def _make_state(self) -> FakeWebShopState:
         if self._stage == "search":

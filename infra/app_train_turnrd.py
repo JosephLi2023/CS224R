@@ -57,7 +57,7 @@ def train_turnrd_run(
     progress_prior_strength: float = 1.0,
     # Plan `turnrd_goal_conditioned_v_head`: opt-in FiLM
     # goal-conditioned V-head. When True (and version="v2"), the model
-    # is built with the FiLM γ/β projection layers and the trainer
+    # is built with the FiLM gamma/beta projection layers and the trainer
     # threads `goal_emb` from the replay rows into model.forward.
     # Default False preserves legacy byte-for-byte behaviour.
     goal_conditioned_value_head: bool = False,
@@ -81,17 +81,17 @@ def train_turnrd_run(
     recency_decay_half_life: float = 0.0,
     legacy_decay_weight: float = 0.5,
     min_batch_weight: float = 1e-3,
-    # ---- Cumulative warm-start (plan: turnrd_v2_continual_larger). When
+    # Cumulative warm-start (plan: turnrd_v2_continual_larger). When
     # non-empty AND the file exists, load model state_dict with
     # `strict=False` BEFORE training begins. Used by the orchestrator to
     # pass the prior round's ckpt for warm-start across rounds. Default
     # empty preserves byte-for-byte cold-start behaviour.
     ckpt_in: str = "",
-    # ---- LR schedule (plan: turnrd_v2_continual_larger). Threads through
+    # LR schedule (plan: turnrd_v2_continual_larger). Threads through
     # to `train_turnrd`. Default "constant" is a no-op.
     warmup_steps: int = 0,
     lr_schedule: str = "constant",
-    # ---- Fresh-emphasis pass (plan: turnrd_v2_continual_larger). Default
+    # Fresh-emphasis pass (plan: turnrd_v2_continual_larger). Default
     # 0/0 = disabled, byte-for-byte legacy behaviour.
     fresh_emphasis_window_rounds: int = 0,
     fresh_emphasis_n_epochs: int = 0,
@@ -166,7 +166,7 @@ def train_turnrd_run(
     if torch.cuda.is_available():
         model.to("cuda:0")
 
-    # ---- Cumulative warm-start (plan: turnrd_v2_continual_larger). -----
+    # Cumulative warm-start (plan: turnrd_v2_continual_larger).
     # When `--ckpt-in` is non-empty AND the file exists, load the prior
     # round's TurnRD ckpt into THIS round's freshly-constructed model
     # before training. `strict=False` so a legacy no-FiLM ckpt can warm-

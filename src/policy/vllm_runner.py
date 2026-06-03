@@ -85,9 +85,7 @@ class VLLMRunner:
             num_gpu_blocks_override=cfg.num_gpu_blocks_override,
         )
 
-    # ------------------------------------------------------------------
     # Generation
-    # ------------------------------------------------------------------
 
     def generate(self, prompts: list[str], sampling: SamplingParams) -> list[list[str]]:
         """Return list[len(prompts)] of list[sampling.n] generations."""
@@ -99,7 +97,7 @@ class VLLMRunner:
             top_p=sampling.top_p,
             max_tokens=sampling.max_tokens,
             stop=sampling.stop or None,
-            seed=sampling.seed,  # None ⇒ fresh randomness each call
+            seed=sampling.seed,  # None -> fresh randomness each call
         )
         outputs = self.llm.generate(prompts, params)
         return [[o.text for o in req.outputs] for req in outputs]
@@ -120,7 +118,7 @@ class VLLMRunner:
             top_p=sampling.top_p,
             max_tokens=sampling.max_tokens,
             stop=sampling.stop or None,
-            seed=sampling.seed,  # None ⇒ fresh randomness each call
+            seed=sampling.seed,  # None -> fresh randomness each call
             logprobs=1 if sampling.return_logprobs else None,
         )
         request_outputs = self.llm.generate(prompts, params)
@@ -158,9 +156,7 @@ class VLLMRunner:
             results.append(per_prompt)
         return results
 
-    # ------------------------------------------------------------------
     # Weight sync
-    # ------------------------------------------------------------------
 
     def shutdown(self) -> None:
         """Cleanly tear down vLLM to free GPU memory.
@@ -197,14 +193,9 @@ class VLLMRunner:
         policies can use `iter_merged_weights()` without materializing the
         full merged state-dict in memory (fixes sync_weights OOM at scale).
         """
-        # Surface deferred CUDA errors at the correct site instead of
-        # letting them masquerade as a vLLM `load_weights` bug. CUDA errors
-        # are async-reported: a bad kernel launched several steps ago can
-        # only manifest at the next synchronization point. Forcing a
-        # synchronize here means any latent error is raised with the
-        # `sync_weights` stack (not buried inside vLLM's load_weights copy).
-        # Mirrors the synchronize-first pattern in
-        # `LoRAPolicy.save_adapter` (src/policy/lora_policy.py:244-251).
+        # Force a synchronize so deferred (async-reported) CUDA errors are
+        # raised here with the sync_weights stack rather than buried inside
+        # vLLM's load_weights copy.
         import torch  # type: ignore[import-not-found]
         try:
             torch.cuda.synchronize()
@@ -219,7 +210,7 @@ class VLLMRunner:
             items_iter = iter(state_dict.items())
         else:
             items_iter = iter(state_dict)
-        # vLLM's `load_weights` itself streams — we count as we go.
+        # vLLM's `load_weights` itself streams - we count as we go.
         count = 0
 
         def counted():

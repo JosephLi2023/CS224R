@@ -17,14 +17,14 @@ Format variants accepted:
 - Period vs no period at end of goal.
 - Optional trailing whitespace / blank lines.
 - Multi-line preamble before the task line (TextWorld decorations).
-- Casing of the literal "Your task is to:" — case-insensitive match.
+- Casing of the literal "Your task is to:" - case-insensitive match.
 """
 from __future__ import annotations
 
 import re
 from typing import Optional
 
-# `Your task is to:` — anchored with non-greedy capture up to a newline (or
+# `Your task is to:` - anchored with non-greedy capture up to a newline (or
 # end-of-string). The `[ \t]*` after the colon tolerates extra whitespace
 # without consuming the goal text itself.
 _GOAL_RE = re.compile(
@@ -34,23 +34,12 @@ _GOAL_RE = re.compile(
 
 
 def extract_goal_text(turn0_obs: str) -> Optional[str]:
-    """Return the AlfWorld goal substring from a Turn 0 observation.
-
-    Args:
-        turn0_obs: the full text of the Turn 0 observation (typically the
-            "Welcome to TextWorld" preamble + room layout + "Your task is
-            to: <goal>." line).
-
-    Returns:
-        The trimmed goal text (e.g. ``"examine the cd with the desklamp."``)
-        or `None` when no `"Your task is to:"` line is found.
-    """
+    """Return the trimmed AlfWorld goal substring from a Turn 0 observation,
+    or `None` when no `"Your task is to:"` line is found."""
     if not isinstance(turn0_obs, str) or not turn0_obs:
         return None
-    # `re.DOTALL` lets `.+?` cross newlines, but our `\s*(?:\n|$)` anchor
-    # ensures we stop at the first line break — keeps the match scoped to a
-    # single line even when the preamble contains other colon-prefixed
-    # phrases.
+    # `re.DOTALL` lets `.+?` cross newlines, but the `\s*(?:\n|$)` anchor stops
+    # at the first line break, scoping the match to a single line.
     m = _GOAL_RE.search(turn0_obs)
     if not m:
         return None

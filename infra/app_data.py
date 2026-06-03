@@ -20,7 +20,7 @@ Cost-saving knobs:
   - `small=False`: pulls the full `items_shuffle.json` (~1.4 GB, 1.18 M
     products) needed for the full WebShop protocol runs.
 
-This app intentionally does NOT install pyserini/Java/spacy yet — those
+This app intentionally does NOT install pyserini/Java/spacy yet - those
 heavy deps are only needed when we actually instantiate `WebAgentTextEnv`.
 Keeping data acquisition cheap and fast.
 """
@@ -35,7 +35,7 @@ from infra.image import image
 APP_NAME = "cs224r-hgpo-data"
 app = modal.App(APP_NAME)
 
-# Lighter-weight image variant — gdown is baked into the base image
+# Lighter-weight image variant - gdown is baked into the base image
 # (see infra/image.py) so we just reuse `image` directly here.
 data_image = image
 
@@ -133,7 +133,7 @@ def download_webshop_data(small: bool = True) -> dict:
 
     os.makedirs(WEBSHOP_DATA_DIR, exist_ok=True)
 
-    # ---- 1. Shallow-clone the WebShop repo (so we always have setup.sh + py code) ----
+    # 1. Shallow-clone the WebShop repo (so we always have setup.sh + py code)
     if not os.path.isdir(os.path.join(WEBSHOP_REPO_DIR, ".git")):
         if os.path.isdir(WEBSHOP_REPO_DIR):
             shutil.rmtree(WEBSHOP_REPO_DIR)
@@ -144,7 +144,7 @@ def download_webshop_data(small: bool = True) -> dict:
     else:
         print(f"WebShop repo already cloned at {WEBSHOP_REPO_DIR}")
 
-    # ---- 2. Parse setup.sh for gdrive IDs ----
+    # 2. Parse setup.sh for gdrive IDs
     setup_path = os.path.join(WEBSHOP_REPO_DIR, "setup.sh")
     if not os.path.isfile(setup_path):
         raise FileNotFoundError(
@@ -161,7 +161,7 @@ def download_webshop_data(small: bool = True) -> dict:
     print(f"Parsed gdrive entries from setup.sh: "
           f"{[(f, m['split']) for f, m in fname_to_meta.items()]}")
 
-    # ---- 3. Filter to wanted files + download ----
+    # 3. Filter to wanted files + download
     wanted = _SMALL_FILES if small else _FULL_FILES
     downloaded: list[str] = []
     skipped: list[str] = []
@@ -204,7 +204,7 @@ def download_webshop_data(small: bool = True) -> dict:
     timeout=10 * 60,
 )
 def verify_webshop_data() -> dict:
-    """Inspect /vol/data/webshop/ — report each file's size + record count.
+    """Inspect /vol/data/webshop/ - report each file's size + record count.
 
     Use as: `modal run infra/app_data.py::verify_webshop_data`
     """

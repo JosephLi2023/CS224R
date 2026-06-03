@@ -1,27 +1,24 @@
 #!/usr/bin/env bash
-# WebShop SOTA — HGPO-LLMJudge v1.
+# WebShop SOTA - HGPO-LLMJudge v1.
 #
 # Recipe-transplant from AlfWorld SOTA (rank-32 + MLP target modules,
-# K=8, kl=0.04, lr=5e-6, T=1.0) PLUS the new WebShop-specific
-# attribute-progress dense signal (env.use_attribute_progress_intermediate_reward=true).
+# K=8, kl=0.04, lr=5e-6, T=1.0) PLUS the WebShop-specific attribute-progress
+# dense signal (env.use_attribute_progress_intermediate_reward=true).
 # alpha=0.5 + decomposer=judge (OpenAI gpt-4o-mini judge with the
 # /vol/cache/judge.sqlite dedup cache; budget capped at 5000 calls).
 # See plan /Users/shoupeili/.llms/plans/webshop_sota_recipe_transplant_dense_signal.plan.md.
 #
-# Geometry (seed=31, rounds=10, eps=80)
-# =====================================
-#   base_task_id_offset = 31 × 10 × 80 = 24800
+# Geometry (seed=31, rounds=10, eps=80):
+#   base_task_id_offset = 31 * 10 * 80 = 24800
 #   train task range    = [24800, 25600)
 #   eval task range     = [6500, 6600)   (disjoint)
-#   disjoint from attention v1 (seed=11) ✓ and flatGRPO v1 (seed=23) ✓
+#   disjoint from attention v1 (seed=11) and flatGRPO v1 (seed=23)
 #
-# Compute envelope
-# ================
-# ~3 hours wall-clock, ~$25 (incl. judge API budget at ~$0.01/call x 5000 capped).
-# Cache primes on first run; subsequent runs are mostly cache-hit.
+# ~3 hours wall-clock. Cache primes on first run; subsequent runs are
+# mostly cache-hit.
 #
 # Requires OpenAI key to be mounted onto the trainer container by
-# infra/app_train.py via Modal Secret "openai-secret".
+# infra/app_train_loop.py via Modal Secret "openai-secret".
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -30,7 +27,7 @@ cd "$(dirname "$0")/.."
 # `scripts/run_webshop_sft_v3_mlpr32.sh` (see
 # ~/.llms/plans/webshop_sft_mlpr32_oracle_baseline.plan.md).
 #
-# PLACEHOLDER — replace `REPLACE_WITH_TS_FROM_PHASE4` with the
+# PLACEHOLDER - replace `REPLACE_WITH_TS_FROM_PHASE4` with the
 # timestamp suffix of the actual adapter dir produced by Phase 4,
 # or override at invocation time:
 #   SFT_ADAPTER=/vol/checkpoints/sft_webshop_v3_mlpr32_<ts> \
@@ -76,8 +73,8 @@ se = tr.get('sync_every')
 print(k, '' if gmu is None else float(gmu), '' if se is None else int(se))
 ")
 
-echo "═══════════════════════════════════════════════════════════════════════"
-echo "WebShop SOTA — HGPO-LLMJudge v1 (seed=${SEED}, eps=${EPS_PER_ROUND}, T=${ROLLOUT_TEMP})"
+echo "========================================"
+echo "WebShop SOTA - HGPO-LLMJudge v1 (seed=${SEED}, eps=${EPS_PER_ROUND}, T=${ROLLOUT_TEMP})"
 echo "  config             : ${CONFIG}"
 echo "  sft_adapter (R0)   : ${SFT_ADAPTER}"
 echo "  run-name-prefix    : ${RUN_PREFIX}"
@@ -101,8 +98,8 @@ echo "                       (LLM judge sees richer per-turn raw_env_reward cont
 echo "  Judge backend      : openai (gpt-4o-mini, cache=/vol/cache/judge.sqlite, budget=5000)."
 echo "  Driver             : per-round \`modal run\` loop (no TurnRD orchestrator;"
 echo "                       decomposer='judge' is incompatible with run_turnrd_modal.py)."
-echo "  Parallel-safe      : YES — disjoint task ranges + adapter run-name prefix."
-echo "═══════════════════════════════════════════════════════════════════════"
+echo "  Parallel-safe      : YES - disjoint task ranges + adapter run-name prefix."
+echo "========================================"
 
 # In-bash per-round driver. Adapter chaining mirrors run_turnrd_modal.py's
 # carry-policy mode: R0 loads ${SFT_ADAPTER}; R_N>0 loads R_{N-1}'s saved
@@ -124,7 +121,7 @@ run_rounds () {
         fi
 
         # Build the modal run command. The local repo gets mounted at
-        # /workspace inside the container, so configs/foo.json →
+        # /workspace inside the container, so configs/foo.json ->
         # /workspace/configs/foo.json.
         local config_container="/workspace/${CONFIG}"
         local cmd=(
@@ -150,11 +147,11 @@ run_rounds () {
         fi
 
         echo ""
-        echo "┌── Round ${round_idx}/${ROUNDS} (offset=${task_offset}, load=${load_adapter##*/}, save=${save_adapter##*/})"
-        echo "│  $ ${cmd[*]}"
+        echo "-- Round ${round_idx}/${ROUNDS} (offset=${task_offset}, load=${load_adapter##*/}, save=${save_adapter##*/})"
+        echo "   $ ${cmd[*]}"
         "${cmd[@]}"
         rc=$?
-        echo "└── Round ${round_idx} exit=${rc}"
+        echo "-- Round ${round_idx} exit=${rc}"
         if [[ ${rc} -ne 0 ]]; then
             echo "ERROR: round ${round_idx} exited ${rc}. Aborting; restart with START_ROUND=${round_idx}." >&2
             return ${rc}
@@ -182,7 +179,7 @@ echo $ORCH_PID > "$PIDFILE"
 echo "WebShop LLMJudge v1 launched: PID=$ORCH_PID"
 echo "  Log: $LOG"
 echo "  PID: $PIDFILE"
-echo "  ETA: ~3 hours, ~\$25 (incl. judge API budget)"
+echo "  ETA: ~3 hours"
 echo ""
 echo "Tail the log with:   tail -f $LOG"
-echo "Pass criterion       : final-round eval ≥ 0.35 (current 0.22 baseline + 13 pp lift)."
+echo "Pass criterion       : final-round eval >= 0.35 (current 0.22 baseline + 13 pp lift)."

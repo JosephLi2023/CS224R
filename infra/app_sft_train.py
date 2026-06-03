@@ -21,7 +21,7 @@ app = modal.App("cs224r-hgpo-sft-train")
 
 
 # Legacy default data path. Directory of upstream WebShop gdown human
-# trajectories — consumed by `load_sft_examples_from_directory`. The
+# trajectories - consumed by `load_sft_examples_from_directory`. The
 # new oracle-gen single-JSONL path is
 # `/vol/data/webshop/oracle_trajs.jsonl`; dispatch happens on suffix
 # in the loader site below.
@@ -111,7 +111,7 @@ def sft_train(
     for ex in examples:
         prompt_ids = tokenizer(ex.prompt, add_special_tokens=False).input_ids
         # Target is the full ReAct emission ` <thought>\nAction: <body>` so
-        # the SFT model learns to produce Thought + Action together — the
+        # the SFT model learns to produce Thought + Action together - the
         # exact format the runtime ReAct loop expects.
         target_str = synthesize_sft_target(ex.action) + tokenizer.eos_token
         action_ids = tokenizer(target_str, add_special_tokens=False).input_ids

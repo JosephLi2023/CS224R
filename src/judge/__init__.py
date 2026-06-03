@@ -4,7 +4,7 @@ Exposes a `JudgeBackend` Protocol plus two implementations:
 - `OpenAIJudge` (default): GPT-4o-mini via OpenAI API.
 - `VLLMJudge` (fallback): Qwen2.5-7B-Instruct served behind a Modal vLLM app.
 
-Select the backend via config `judge.backend ∈ {openai, vllm}`.
+Select the backend via config `judge.backend` in {openai, vllm}.
 """
 
 from src.judge.backend import JudgeBackend, TurnScore, build_judge

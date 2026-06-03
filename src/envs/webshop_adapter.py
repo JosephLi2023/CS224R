@@ -6,34 +6,18 @@ from typing import Any
 
 
 def _normalize_attr_token(s: Any) -> str:
-    """Canonicalize an attribute token for set membership.
-
-    WebShop's `goal["attributes"]` is a list of free-text strings like
-    `"black"`, `"size 6"`, `"under $50"`. We lowercase + strip so trivial
-    whitespace/case differences against `clicked_options.values()` (which
-    come from the rendered page text) don't desync the overlap count.
-    """
+    """Canonicalize an attribute token (lowercase + strip) for set membership."""
     return str(s).strip().lower()
 
 
 def _extract_target_attrs(env: Any) -> set[str]:
     """Snapshot the target attribute set from the upstream WebShop env.
 
-    Tries the canonical attribute paths that the upstream `web_agent_site`
-    package exposes on `WebAgentTextEnv` and its `server` backend:
-
-      * `env.goal["attributes"]` — list[str] of attribute keywords.
-      * `env.goal["category"]` — str category label.
-      * `env.goal["query"]` — the user's free-text query (tokenised).
-      * `env.goal["price_upper"]` — float price bucket (stringified).
-      * `env.server.goals[env.session]["attributes" / ...]` — older forks.
-
-    All keys are optional — we union whatever is present. Returns the
-    empty set when no recognisable goal payload is found (the caller
-    treats this as "signal unavailable" and degrades to legacy zero-IR
-    behavior). Mirrors the AlfWorld `_extract_facts_set` defensiveness:
-    no introspection failure should be fatal to env construction or
-    step execution.
+    Unions whatever goal paths are present on WebAgentTextEnv / its server
+    backend (env.goal["attributes"/"category"/"price_upper"], or the older
+    env.server.goals[session] fork). All keys optional. Returns the empty
+    set when no recognisable goal payload is found (caller degrades to
+    legacy zero-IR behavior); no introspection failure is fatal.
     """
     target: set[str] = set()
     if env is None:
@@ -43,8 +27,8 @@ def _extract_target_attrs(env: Any) -> set[str]:
     # current task; mutated by `reset(session=...)`).
     goal: Any = getattr(env, "goal", None)
     if not isinstance(goal, dict):
-        # Tier 2: `env.server.goals[session_id]` — older `web_agent_site`
-        # forks store goals on a `server` sub-object indexed by session.
+        # Tier 2: env.server.goals[session_id] - older web_agent_site
+        # forks store goals on a server sub-object indexed by session.
         server = getattr(env, "server", None)
         goals_dict = getattr(server, "goals", None) if server is not None else None
         session = getattr(env, "session", None)
@@ -74,21 +58,10 @@ def _extract_target_attrs(env: Any) -> set[str]:
         price = goal.get("price_upper")
         if isinstance(price, (int, float)):
             target.add(f"price_under_{int(price)}")
-        # `goal_options` — dict like {"color": "mint", "size": "7"}
-        # mapping option NAME → exact VALUE the env's reward function
-        # expects. These values are the labels of the item-page
-        # selector buttons (`Select color: mint`, `Select size: 7`),
-        # which when clicked land in `env.cur_options.values()`. Without
-        # them in `target`, the attribute-progress delta is identically
-        # zero on every option click (the description-tag tokens in
-        # `goal.attributes` never overlap with the selector values in
-        # `cur_options`), and the dense signal collapses to a 1-bit
-        # ASIN-landing-bonus indicator — useless for TurnRDv2's V-head
-        # which needs per-turn credit. Validated via
-        # `infra/app_webshop_sft_gen.py::validate_dense_signal`:
-        # without this line, mean IR on click_option = 0.0 across 39
-        # captured option-click turns; with it, the delta fires
-        # whenever the agent engages an option that's in the goal set.
+        # goal_options maps option name -> exact value the env's reward
+        # function expects (item-page selector labels). Without these in
+        # target, the attribute-progress delta is zero on every option
+        # click since goal.attributes never overlaps cur_options values.
         goal_options = goal.get("goal_options")
         if isinstance(goal_options, dict):
             for v in goal_options.values():
@@ -101,15 +74,9 @@ def _extract_target_attrs(env: Any) -> set[str]:
 def _extract_target_asin(env: Any) -> str | None:
     """Pull the target product's ASIN from the upstream env, if exposed.
 
-    Used by `WebShopAdapter.step()` to award a one-time +0.25 bonus when
-    the agent's `click[<target_asin>]` lands on the goal product's item
-    page — the WebShop analogue of the AlfWorld "subgoal pickup" turn
-    that the facts-diff signal catches.
-
-    Tries `env.goal["asin"]` then `env.goal["asins"][0]` (some forks
-    track multiple acceptable ASINs). Returns None when neither is
-    available; the caller treats None as "no asin bonus signal" and
-    just emits the attribute-progress delta.
+    Used to award a one-time +0.25 bonus when click[<target_asin>] lands
+    on the goal product's item page. Tries env.goal["asin"] then
+    env.goal["asins"][0]. Returns None when neither is available.
     """
     if env is None:
         return None
@@ -140,38 +107,16 @@ def _extract_selected_attrs(env: Any) -> set[str]:
     """Snapshot the currently-selected attribute set from the upstream env.
 
     Used per-step to compute the attribute-progress delta against the
-    target set. Sources, tried in order until one yields a non-empty dict:
+    target set. Sources, tried until one yields a non-empty dict:
+      * env.cur_options (flat env-level attr on some forks).
+      * env.clicked_options (older-fork attr name).
+      * env.user_sessions[session]["options"] (canonical upstream path,
+        also read by the env's own reward function).
+      * env.server.user_sessions[session]["options"] (same via server).
 
-      * `env.cur_options` — dict of {option_name: option_value} on
-        forks that expose a flat env-level attr (rare in current
-        princeton-nlp/WebShop).
-      * `env.clicked_options` — alternative older-fork attr name.
-      * `env.user_sessions[env.session]["options"]` — the canonical
-        upstream path. The princeton-nlp/WebShop env stores
-        per-session click state on `self.user_sessions[session_id]`,
-        and option clicks populate the `"options"` sub-dict via
-        `web_agent_text_env.py:410 session["options"][clickable_key] = clickable_name`.
-        This is the path used by the env's own reward function to
-        compute the terminal score, so reading from here keeps the
-        IR signal consistent with the env's own evaluation.
-      * `env.server.user_sessions[env.session]["options"]` — same
-        attr but reached via the optional `server` wrapper (some
-        forks split env vs server into two classes).
-
-    Each value is canonicalised (lowercase + strip) and added. ASINs
-    are deliberately NOT pulled in here — the +0.25 ASIN-landing
-    bonus in `step()` handles that signal separately so we don't
-    double-count.
-
-    Always returns a set (possibly empty). Empty ⇒ no progress
-    contribution this step (delta stays at 0), which keeps the
-    fallback safe even when the upstream's option-tracking attr is
-    absent. Pre-fix (the fork-incorrect `cur_options`-only path)
-    `validate_dense_signal` showed mean_ir_by_action_kind[click_option]=0.0
-    across 39 option-click turns; with the upstream `user_sessions[...]
-    ["options"]` path added, the delta now fires whenever the agent
-    clicks an option in the goal-options set. See the regression
-    suite in tests/unit/test_webshop_adapter_attr_progress.py.
+    Each value is canonicalised (lowercase + strip). ASINs are not pulled
+    in here; the +0.25 ASIN-landing bonus in step() handles that
+    separately. Always returns a set (empty -> no progress this step).
     """
     selected: set[str] = set()
     if env is None:
@@ -223,41 +168,28 @@ class WebShopState:
 
 
 class WebShopAdapter:
-    """
-    WebShop environment adapter with normalized state/action wiring.
+    """WebShop environment adapter with normalized state/action wiring.
 
     Expected upstream API shape (common WebShop text env):
     - reset(...) -> obs OR (obs, info)
     - step(action_str) -> (obs, reward, done, info)
 
-    This adapter normalizes observations and action candidates so trainers can
-    consume a consistent interface.
+    Normalizes observations and action candidates to a consistent interface.
 
-    Dense-signal opt-in
-    -------------------
-    `use_attribute_progress_intermediate_reward=True` activates a per-step
-    attribute-progress dense reward sourced from the upstream env's goal
-    payload — the WebShop analogue of AlfWorld's `_use_facts_diff_ir`
-    opt-in. When on:
+    Dense-signal opt-in: use_attribute_progress_intermediate_reward=True
+    activates a per-step attribute-progress dense reward from the env's
+    goal payload (the WebShop analogue of AlfWorld's _use_facts_diff_ir).
+    When on:
+      * reset() snapshots the target attribute set and target ASIN.
+      * step() computes delta = max(0, |curr & target| - |prev & target|)
+        / |target| (fraction of target attrs newly engaged this turn).
+      * step() adds a one-time +0.25 bonus on the turn landing on the
+        target ASIN's item page.
+      * Writes info["intermediate_reward"] +
+        info["intermediate_reward_source"] = "attr_progress".
 
-      * `reset()` snapshots the target attribute set (color, size,
-        category, price-bucket tokens) via `_extract_target_attrs(self._env)`
-        and the target ASIN via `_extract_target_asin(self._env)`.
-      * `step()` computes the per-step delta:
-          `Δ = max(0, |curr ∩ target| − |prev ∩ target|) / |target|`
-        — the fraction of target attributes newly engaged this turn.
-      * `step()` adds a one-time +0.25 bonus on the turn that lands on
-        the target ASIN's item page (mirrors AlfWorld's subgoal-pickup
-        bonus pattern).
-      * Writes the reconciled value into `info["intermediate_reward"]` +
-        `info["intermediate_reward_source"] = "attr_progress"` — same
-        keys the producer-side collector reads at
-        `src/algorithms/grpo/collectors.py:251-252`.
-
-    Default False preserves all existing WebShop runs byte-for-byte
-    (no `intermediate_reward` key is added when the flag is off, so
-    `progress_signal=None` continues to flow through the downstream
-    dataset's per-batch gate exactly as before).
+    Default False preserves existing WebShop runs byte-for-byte (no
+    intermediate_reward key added when off).
     """
 
     def __init__(
@@ -276,24 +208,16 @@ class WebShopAdapter:
         self._steps = 0
         self._last_state: WebShopState | None = None
 
-        # Dense-signal opt-in. Default False preserves Phase 0 behavior
-        # byte-for-byte (no `intermediate_reward` key emitted; producer's
-        # per-trajectory gate keeps `progress_signal=None`).
+        # Dense-signal opt-in. Default False preserves prior behavior
+        # (no intermediate_reward key emitted).
         self._use_attr_progress_ir: bool = bool(use_attribute_progress_intermediate_reward)
-        # Per-trajectory state (reset on every `reset()`):
-        #   _target_attrs : set[str] — canonicalised target attribute
-        #                   tokens snapshot at reset. None ⇒ signal
-        #                   disabled OR introspection failed; step()
-        #                   silently degrades to no-emit.
-        #   _target_asin  : str|None — target product's ASIN (lowercased)
-        #                   for the +0.25 landing bonus. None ⇒ no bonus.
-        #   _prev_overlap : int — |prev_selected ∩ target| count carried
-        #                   across step() calls so the delta is positive
-        #                   only on the turn that newly engages a target
-        #                   attribute.
-        #   _asin_bonus_fired : bool — guards the +0.25 bonus to fire
-        #                   at most once per episode (subsequent ASIN
-        #                   page visits don't double-count).
+        # Per-trajectory state (reset on every reset()):
+        #   _target_attrs: canonicalised target tokens; None -> signal
+        #     disabled or introspection failed.
+        #   _target_asin: target product's ASIN for the +0.25 bonus.
+        #   _prev_overlap: |prev_selected & target| carried across step()
+        #     so the delta fires only when newly engaging a target attr.
+        #   _asin_bonus_fired: guards the +0.25 bonus to once per episode.
         self._target_attrs: set[str] | None = None
         self._target_asin: str | None = None
         self._prev_overlap: int = 0
@@ -407,7 +331,7 @@ class WebShopAdapter:
         return valid_actions[action]
 
     def reset(self, **kwargs: Any) -> WebShopState:
-        """Reset the env. Maps collector's `task_id=<int>` → WebShop's `session`
+        """Reset the env. Maps collector's task_id=<int> -> WebShop's session
         kwarg (which seeds goal selection); absorbs other unknown kwargs."""
         self._steps = 0
         if "task_id" in kwargs:
@@ -415,11 +339,9 @@ class WebShopAdapter:
             kwargs.setdefault("session", session)
         raw_obs, raw_info = self._normalize_reset(self._env.reset(**kwargs))
 
-        # Dense-signal: snapshot target attrs + asin AFTER reset() so
-        # the upstream env's per-task goal selection has fired. When the
-        # opt-in is off OR the upstream doesn't expose the attrs we
-        # expect, fall through silently (intermediate_reward will not be
-        # emitted ⇒ legacy `progress_signal=None` path).
+        # Snapshot target attrs + asin AFTER reset() so the env's per-task
+        # goal selection has fired. When opt-in is off or the attrs aren't
+        # exposed, fall through silently (no intermediate_reward emitted).
         self._prev_overlap = 0
         self._asin_bonus_fired = False
         if self._use_attr_progress_ir:
@@ -472,25 +394,17 @@ class WebShopAdapter:
         info["timeout"] = timeout
         info["resolved_action"] = action_cmd
 
-        # Dense-signal: attribute-progress delta (+ one-time ASIN bonus).
-        # Only fires when (a) the opt-in is on AND (b) target attrs were
-        # discovered at reset(). Otherwise no `intermediate_reward` key
-        # is added — Phase 0 byte-for-byte preserved.
+        # Attribute-progress delta (+ one-time ASIN bonus). Only fires
+        # when opt-in is on and target attrs were discovered at reset();
+        # otherwise no intermediate_reward key is added.
         #
         # Two components, summed:
-        #   1. Attribute progress: fraction of target attrs newly
-        #      engaged this turn. Computed as
-        #          max(0, |curr ∩ target| − prev_overlap) / |target|
-        #      Negative deltas (an option click that REMOVES a previously-
-        #      engaged option) are clamped to 0 so the V-head's
-        #      non-negative shaping contract holds.
+        #   1. Attribute progress: max(0, |curr & target| - prev_overlap)
+        #      / |target|. Negative deltas (option click removing a
+        #      previously-engaged option) clamp to 0.
         #   2. One-time +0.25 bonus on the first turn where
-        #      `resolved_action == click[<target_asin>]`. Fires at most
-        #      once per episode (subsequent visits don't double-count).
-        #      Mirrors the WebShop intuition that landing on the right
-        #      item page is a meaningful subgoal that an attribute-only
-        #      signal might miss (e.g. the target asin's listing happens
-        #      to expose all its options pre-selected).
+        #      resolved_action == click[<target_asin>] (at most once per
+        #      episode).
         if self._use_attr_progress_ir and self._target_attrs:
             curr_selected = _extract_selected_attrs(self._env)
             curr_overlap = len(curr_selected & self._target_attrs)

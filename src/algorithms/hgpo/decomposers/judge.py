@@ -1,11 +1,11 @@
 """LLM-as-judge per-turn reward decomposer (Method A).
 
-For each `Trajectory τ_i` in a `TrajectoryGroup`, builds a `JudgeRequest`
+For each `Trajectory tau_i` in a `TrajectoryGroup`, builds a `JudgeRequest`
 with one `JudgeTurn` per `TurnRecord`, hits the SQLite read-through cache
 to skip already-scored turns, and asks the `JudgeBackend` to score any
 missing turns. The returned per-turn rewards satisfy the invariant
-`Σ_t r̂_t = R` (within ~1e-9) by construction (`to_turn_scores` does the
-rescaling — see `src/judge/prompts.py:81`).
+`sum_t r_hat_t = R` (within ~1e-9) by construction (`to_turn_scores` does the
+rescaling - see `src/judge/prompts.py:81`).
 
 Cost guardrail: if the per-run hard cap on judge calls
 (`judge.limits.max_judge_calls_per_run` from the run config) would be
@@ -30,24 +30,11 @@ _logger = logging.getLogger(__name__)
 def _build_request(group_task_id: str, env_name: str, traj: Trajectory, k_index: int) -> JudgeRequest:
     """Build a JudgeRequest for one trajectory.
 
-    `task_id` is qualified as `{group_task_id}#k{k_index}` for a
-    correctness reason (NOT defensive uniqueness): the cache stores
-    `normalized` scores that are pre-rescaled against THIS trajectory's
-    `final_reward`. If two K-samples in a group shared cache entries
-    (because their action prefixes match) and they had different `R`s,
-    reading the stored `normalized` values would silently produce
-    per-turn rewards that DO NOT sum to that trajectory's `R`,
-    violating the invariant the cache exists to preserve.
-    Per-K qualification makes the entries disjoint so this can't happen.
-
-    Side effect: this defeats the cross-K prefix-sharing that the cache's
-    `prefix_hash` was designed to enable (`src/judge/cache.py::prefix_hash`).
-    That's acceptable today because `OpenAIJudge` sends the FULL trajectory
-    to the model (so per-turn raw scores are not actually prefix-conditioned
-    anyway, and cross-K sharing was aspirational). If future judges become
-    truly prefix-conditioned, the right fix is to cache `raw_score` only and
-    re-normalize at read time using `request.final_reward` — then the
-    `#k{i}` qualifier can be dropped.
+    `task_id` is qualified as `{group_task_id}#k{k_index}` so per-K cache
+    entries stay disjoint: the cache stores `normalized` scores pre-rescaled
+    against this trajectory's `final_reward`, so sharing entries across
+    K-samples with different `R`s would yield per-turn rewards that don't
+    sum to `R`, violating the cache invariant.
     """
     qualified_task_id = f"{group_task_id}#k{k_index}"
     turns = [
@@ -90,14 +77,12 @@ class JudgeDecomposer:
     ) -> None:
         self.backend = backend
         self.cache = cache
-        # None ⇒ unlimited. 0 ⇒ never call the backend (always fall back
-        # to uniform split). >0 ⇒ hard cap.
+        # None -> unlimited. 0 -> never call the backend (always fall back
+        # to uniform split). >0 -> hard cap.
         self.max_judge_calls_per_run = max_judge_calls_per_run
         self._calls_used: int = 0
 
-    # ------------------------------------------------------------------
     # Internal cache helpers
-    # ------------------------------------------------------------------
 
     def _normalized_from_cached(self, cached: list[TurnScore | None]) -> list[float]:
         # All entries non-None at this point.
@@ -178,9 +163,7 @@ class JudgeDecomposer:
             return True
         return self._calls_used < int(cap)
 
-    # ------------------------------------------------------------------
     # Public API matching the PerTurnDecomposer signature
-    # ------------------------------------------------------------------
 
     def decompose(self, group: TrajectoryGroup) -> list[list[float]]:
         """Score every trajectory in `group` and return list[K] of list[T_i].

@@ -4,11 +4,11 @@ Methods supported:
 - "progress" (Method C): per-turn reward = `TurnRecord.raw_env_reward`.
 - "judge"    (Method A): per-turn reward = LLM-as-judge normalized score.
 - "turnrd"   (Method B): per-turn reward = learned TurnRD model output
-  (`r̂_t = α_t · R` from a [CLS] cross-attention head). Provides the
+  (`r_hat_t = alpha_t * R` from a [CLS] cross-attention head). Provides the
   full learnable surface (`has_learnable_params`, `parameters`,
   `decompose_with_grad`, `state_dict`/`load_state_dict`) plus the
   HGPOTrainer refresh hook + C3 consistency-loss reattach.
-- "counterfactual" (Method D): per-turn reward = `R − R_baseline_t` from
+- "counterfactual" (Method D): per-turn reward = `R - R_baseline_t` from
   short re-rollouts that replace each turn's action with `N` alt samples
   from the policy. See `src/algorithms/hgpo/decomposers/counterfactual.py`.
 
@@ -21,7 +21,7 @@ learnable surface; the object's `__call__` keeps the existing
 
 torch-dependent decomposers (`TurnRDDecomposer`) are imported lazily via
 `__getattr__` so this package can be imported on hosts without torch
-(pure-Python decomposers — judge, progress, counterfactual — still work).
+(pure-Python decomposers - judge, progress, counterfactual - still work).
 """
 
 from __future__ import annotations

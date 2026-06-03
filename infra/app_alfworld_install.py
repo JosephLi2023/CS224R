@@ -88,11 +88,11 @@ def trim_data_dir(
     iterated at ~2-3 it/s = ~30-60 min per env). With K=4 parallel
     rollouts in H-GRPO, that's hours of pure setup before any episode
     runs. The `num_train_games` config knob does NOT short-circuit the
-    walk — it only truncates the final list. The walk is bounded by
+    walk - it only truncates the final list. The walk is bounded by
     the physical size of the data dir.
 
     Solution: trim the data dir once. Subsequent env constructions only
-    iterate the kept set (~300 entries × 0.5 s/entry = ~3 min/env vs
+    iterate the kept set (~300 entries x 0.5 s/entry = ~3 min/env vs
     ~60 min/env at full size).
 
     The deletion is destructive but easily reversed via
@@ -119,7 +119,7 @@ def trim_data_dir(
             manifest["kept"][split_name] = 0
             manifest["removed"][split_name] = 0
             continue
-        # Walk one level deep — task-type dirs (e.g. pick_and_place_simple-...).
+        # Walk one level deep - task-type dirs (e.g. pick_and_place_simple-...).
         task_dirs = sorted(
             entry.path for entry in os.scandir(split_dir) if entry.is_dir()
         )
@@ -165,7 +165,7 @@ def reset_smoke() -> dict:
 
     os.environ.setdefault("ALFWORLD_DATA", ALFWORLD_DATA_DIR)
 
-    # Minimal config dict — mirrors the upstream example YAML enough to
+    # Minimal config dict - mirrors the upstream example YAML enough to
     # boot a single text-env.
     config = {
         "dataset": {

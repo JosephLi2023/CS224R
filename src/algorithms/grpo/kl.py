@@ -24,8 +24,8 @@ class AdaptiveKLConfig:
     # Multiplicative steps applied when observed KL is far from target.
     increase_factor: float = 1.5
     decrease_factor: float = 0.5
-    high_threshold: float = 1.5  # observed > high*target → increase coef
-    low_threshold: float = 0.5   # observed < low*target → decrease coef
+    high_threshold: float = 1.5  # observed > high*target -> increase coef
+    low_threshold: float = 0.5   # observed < low*target -> decrease coef
 
 
 class AdaptiveKLController:

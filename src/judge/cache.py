@@ -28,7 +28,7 @@ def prefix_hash(env_name: str, turns: list[JudgeTurn], up_to_turn: int) -> str:
     K-sample index (`{task_id}#k{i}`) for a correctness reason: cached
     `normalized` values are pre-scaled against a specific `final_reward`,
     so cross-trajectory reuse with different `R`s would silently violate
-    the §3.2 `Σ_t r̂_t = R` invariant. As a result, cache entries from
+    the section 3.2 `sum_t r_t = R` invariant. As a result, cache entries from
     different K-samples are never shared even when their prefixes match.
     To genuinely re-enable cross-K prefix sharing, cache `raw_score` only
     and re-normalize at read time using `request.final_reward`, then drop

@@ -1,37 +1,31 @@
 #!/usr/bin/env bash
-# WebShop SOTA — HGPO-Progress (Method C) v1.
+# WebShop SOTA - HGPO-Progress (Method C) v1.
 #
 # Recipe-transplant from AlfWorld SOTA (rank-32 + MLP target modules,
-# K=8, kl=0.04, lr=5e-6, T=1.0) PLUS the new WebShop-specific
-# attribute-progress dense signal (env.use_attribute_progress_intermediate_reward=true).
-# alpha=0.5 (per-turn signal CONTRIBUTES), decomposer=progress
-# (reads TurnRecord.raw_env_reward, which is populated with the dense
-# IR signal). See plan ~/.llms/plans/webshop_sft_mlpr32_oracle_baseline.plan.md.
+# K=8, kl=0.04, lr=5e-6, T=1.0) PLUS the WebShop-specific attribute-progress
+# dense signal (env.use_attribute_progress_intermediate_reward=true).
+# alpha=0.5 (per-turn signal contributes), decomposer=progress (reads
+# TurnRecord.raw_env_reward, populated with the dense IR signal).
+# See plan ~/.llms/plans/webshop_sft_mlpr32_oracle_baseline.plan.md.
 #
-# Method C is the PARAMETER-FREE per-turn-supervision baseline:
-# TurnRDv2 learns a model to attribute credit; Progress just uses the
-# raw env-progress signal as the per-turn credit. With the
-# goal_options + user_sessions adapter fixes landed (verified via
-# infra/app_webshop_sft_gen.py::validate_dense_signal:
+# Method C is the parameter-free per-turn-supervision baseline: TurnRDv2
+# learns a model to attribute credit; Progress just uses the raw env-progress
+# signal as the per-turn credit. With the goal_options + user_sessions adapter
+# fixes landed (verified via infra/app_webshop_sft_gen.py::validate_dense_signal:
 # mean_ir_by_action_kind[click_option]=0.0384,
-# pearson_r(cum_IR, final_reward)=0.9651), this is now a real
-# per-turn-supervision experiment on WebShop — previously the dense
-# signal degenerated to a 1-bit ASIN-landing indicator so Method C
-# was equivalent to flatGRPO on WebShop.
+# pearson_r(cum_IR, final_reward)=0.9651), this is a real per-turn-supervision
+# experiment on WebShop; previously the dense signal degenerated to a 1-bit
+# ASIN-landing indicator so Method C was equivalent to flatGRPO on WebShop.
 #
-# Geometry (seed=41, rounds=10, eps=80)
-# =====================================
-#   base_task_id_offset = 41 × 10 × 80 = 32800
+# Geometry (seed=41, rounds=10, eps=80):
+#   base_task_id_offset = 41 * 10 * 80 = 32800
 #   train task range    = [32800, 33600)
 #   eval task range     = [6500, 6600)   (disjoint)
 #   disjoint from attention v1 (seed=11), flatGRPO v1 (seed=23),
-#   and LLMJudge v1 (seed=31) ✓
+#   and LLMJudge v1 (seed=31)
 #
-# Compute envelope
-# ================
-# ~2.5-3 hours wall-clock, ~$15. K=8 + 100-eps eval, 10 rounds × 80 eps.
-# Same cost profile as flatGRPO (no TurnRD trainer step per round;
-# decomposer=progress is zero additional training/inference cost).
+# ~2.5-3 hours wall-clock. K=8 + 100-eps eval, 10 rounds * 80 eps. Same
+# cost profile as flatGRPO (no TurnRD trainer step per round).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -40,7 +34,7 @@ cd "$(dirname "$0")/.."
 # `scripts/run_webshop_sft_v3_mlpr32.sh` (see
 # ~/.llms/plans/webshop_sft_mlpr32_oracle_baseline.plan.md).
 #
-# PLACEHOLDER — replace `REPLACE_WITH_TS_FROM_PHASE4` with the
+# PLACEHOLDER - replace `REPLACE_WITH_TS_FROM_PHASE4` with the
 # timestamp suffix of the actual adapter dir produced by Phase 4,
 # or override at invocation time:
 #   SFT_ADAPTER=/vol/checkpoints/sft_webshop_v3_mlpr32_<ts> \
@@ -86,8 +80,8 @@ se = tr.get('sync_every')
 print(k, '' if gmu is None else float(gmu), '' if se is None else int(se))
 ")
 
-echo "═══════════════════════════════════════════════════════════════════════"
-echo "WebShop SOTA — HGPO-Progress (Method C) v1 (seed=${SEED}, eps=${EPS_PER_ROUND}, T=${ROLLOUT_TEMP})"
+echo "========================================"
+echo "WebShop SOTA - HGPO-Progress (Method C) v1 (seed=${SEED}, eps=${EPS_PER_ROUND}, T=${ROLLOUT_TEMP})"
 echo "  config             : ${CONFIG}"
 echo "  sft_adapter (R0)   : ${SFT_ADAPTER}"
 echo "  run-name-prefix    : ${RUN_PREFIX}"
@@ -113,10 +107,10 @@ echo "                       was validated at mean=0.0384 on click_option turns"
 echo "                       and Pearson r=0.9651 vs final reward; see"
 echo "                       infra/app_webshop_sft_gen.py::validate_dense_signal.)"
 echo "  Driver             : per-round \`modal run\` loop (no TurnRD orchestrator;"
-echo "                       decomposer='progress' is zero-parameter — no separate"
+echo "                       decomposer='progress' is zero-parameter - no separate"
 echo "                       trainer step per round)."
-echo "  Parallel-safe      : YES — disjoint task ranges + adapter run-name prefix."
-echo "═══════════════════════════════════════════════════════════════════════"
+echo "  Parallel-safe      : YES - disjoint task ranges + adapter run-name prefix."
+echo "========================================"
 
 # In-bash per-round driver. Adapter chaining mirrors run_turnrd_modal.py's
 # carry-policy mode: R0 loads ${SFT_ADAPTER}; R_N>0 loads R_{N-1}'s saved
@@ -139,7 +133,7 @@ run_rounds () {
 
         # Build the modal run command. `_to_container_path` analog: the
         # local repo gets mounted at /workspace inside the container, so
-        # `configs/foo.json` → `/workspace/configs/foo.json`.
+        # `configs/foo.json` -> `/workspace/configs/foo.json`.
         local config_container="/workspace/${CONFIG}"
         local cmd=(
             modal run --detach
@@ -164,11 +158,11 @@ run_rounds () {
         fi
 
         echo ""
-        echo "┌── Round ${round_idx}/${ROUNDS} (offset=${task_offset}, load=${load_adapter##*/}, save=${save_adapter##*/})"
-        echo "│  $ ${cmd[*]}"
+        echo "-- Round ${round_idx}/${ROUNDS} (offset=${task_offset}, load=${load_adapter##*/}, save=${save_adapter##*/})"
+        echo "   $ ${cmd[*]}"
         "${cmd[@]}"
         rc=$?
-        echo "└── Round ${round_idx} exit=${rc}"
+        echo "-- Round ${round_idx} exit=${rc}"
         if [[ ${rc} -ne 0 ]]; then
             echo "ERROR: round ${round_idx} exited ${rc}. Aborting; restart with START_ROUND=${round_idx}." >&2
             return ${rc}
@@ -199,6 +193,6 @@ echo "  PID: $PIDFILE"
 echo "  ETA: ~2.5-3 hours, ~\$15"
 echo ""
 echo "Tail the log with:   tail -f $LOG"
-echo "Pass criterion       : final-round eval ≥ 0.40 (matches flatGRPO target; if Method C wins"
-echo "                        meaningfully — e.g. ≥ 0.45 — the dense signal is doing real"
+echo "Pass criterion       : final-round eval >= 0.40 (matches flatGRPO target; if Method C wins"
+echo "                        meaningfully - e.g. >= 0.45 - the dense signal is doing real"
 echo "                        per-turn credit work and validates the WebShop adapter fixes)."

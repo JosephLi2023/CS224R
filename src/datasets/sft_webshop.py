@@ -37,7 +37,7 @@ class SFTExample:
     final_reward: float
 
 
-# --------- URL parsing ----------------------------------------------------
+# URL parsing
 
 
 def _path_segments(url: str) -> list[str]:
@@ -51,7 +51,7 @@ def _path_segments(url: str) -> list[str]:
 
 def _decode_query_list(encoded: str) -> list[str]:
     """The URL-encoded query is a python-list-literal like
-    ``%5B%27red%27%2C%20%27dress%27%5D`` → ``['red', 'dress']``. Decode
+    ``%5B%27red%27%2C%20%27dress%27%5D`` -> ``['red', 'dress']``. Decode
     + ast.literal_eval.
     """
     try:
@@ -65,26 +65,23 @@ def _decode_query_list(encoded: str) -> list[str]:
 
 
 def _action_from_url_transition(prev_url: str, next_url: str) -> str | None:
-    """Infer the WebShop ReAct action from `prev_url` → `next_url`.
+    """Infer the WebShop ReAct action from `prev_url` -> `next_url`.
 
     Diffs the two URLs to disambiguate transitions that look superficially
-    identical but represent different agent actions (review item A8):
+    identical but represent different agent actions:
 
-      * index → search_results              → search[<query>]
-      * search_results page=N → page=N+1, same query → click[Next >]
-      * search_results page=N → page=N-1, same query → click[< Prev]
-      * search_results → search_results, different query → search[<new>]
-      * search_results → item_page          → click[<asin>]
-      * item_page → item_page, same asin, mutated options dict
-                                            → click[<new option value>]
-      * item_page → item_page, same asin, page suffix (Description/Features/
-                    Reviews/Attributes)     → click[<tab name>]
-      * item_page → search_results          → click[Back to Search]
-      * item_page → done                    → click[Buy Now]
+      * index -> search_results -> search[<query>]
+      * search_results page=N -> page=N+1, same query -> click[Next >]
+      * search_results page=N -> page=N-1, same query -> click[< Prev]
+      * search_results -> search_results, different query -> search[<new>]
+      * search_results -> item_page -> click[<asin>]
+      * item_page -> item_page, same asin, mutated options -> click[<value>]
+      * item_page -> item_page, same asin, page suffix -> click[<tab name>]
+      * item_page -> search_results -> click[Back to Search]
+      * item_page -> done -> click[Buy Now]
 
-    Returns None for any transition that doesn't match a known pattern.
-    Callers (trajectory_to_sft_examples) ABORT the whole trajectory in that
-    case so the rendered prompt history can't desync (review item A7).
+    Returns None for any unrecognized transition; callers abort the whole
+    trajectory in that case so the prompt history can't desync.
     """
     next_segs = _path_segments(next_url)
     prev_segs = _path_segments(prev_url)
@@ -96,7 +93,7 @@ def _action_from_url_transition(prev_url: str, next_url: str) -> str | None:
     if page == "done":
         return "click[Buy Now]"
 
-    # search_results — could be initial search, pagination, or a re-search
+    # search_results - could be initial search, pagination, or a re-search
     if page == "search_results" and len(next_segs) >= 4:
         next_query = _decode_query_list(next_segs[2])
         next_page_idx_raw = next_segs[3]
@@ -116,7 +113,7 @@ def _action_from_url_transition(prev_url: str, next_url: str) -> str | None:
                 if next_page_idx == prev_page_idx - 1:
                     return "click[< Prev]"
                 return None
-            # Different query → fresh search.
+            # Different query -> fresh search.
             return f"search[{' '.join(next_query) if next_query else ''}]"
         if prev_segs and prev_segs[0] == "item_page":
             # On item page, navigated back to search results.
@@ -124,11 +121,11 @@ def _action_from_url_transition(prev_url: str, next_url: str) -> str | None:
         # From index (or unknown).
         return f"search[{' '.join(next_query) if next_query else ''}]"
 
-    # item_page — could be ASIN click, option click, or tab click
+    # item_page - could be ASIN click, option click, or tab click
     if page == "item_page" and len(next_segs) >= 3:
         next_asin = next_segs[2]
         # URL layout: /item_page/<task>/<asin>/<query>/<page>/<options>/<tab?>
-        # → segs[3]=query, segs[4]=page, segs[5]=options, segs[6]=tab(optional)
+        # -> segs[3]=query, segs[4]=page, segs[5]=options, segs[6]=tab(optional)
         next_tab: str | None = None
         if len(next_segs) >= 7 and next_segs[6] in {
             "Description", "Features", "Reviews", "Attributes",
@@ -143,18 +140,18 @@ def _action_from_url_transition(prev_url: str, next_url: str) -> str | None:
             }:
                 prev_tab = prev_segs[6]
             prev_options = prev_segs[5] if len(prev_segs) >= 6 else "%7B%7D"
-            # Tab change → click[<tab>]
+            # Tab change -> click[<tab>]
             if next_tab is not None and next_tab != prev_tab:
                 return f"click[{next_tab}]"
-            # Options changed → click[<new option value>]
+            # Options changed -> click[<new option value>]
             if next_options != prev_options:
                 opt = _diff_options(prev_options, next_options)
                 if opt is None:
                     return None
                 return f"click[{opt}]"
-            # Same asin, same options, same tab → not a meaningful action.
+            # Same asin, same options, same tab -> not a meaningful action.
             return None
-        # Coming from search_results or index → click on the listing.
+        # Coming from search_results or index -> click on the listing.
         return f"click[{next_asin}]"
 
     return None
@@ -181,14 +178,14 @@ def _diff_options(prev_encoded: str, next_encoded: str) -> str | None:
     return str(new_pairs[0][1])
 
 
-# --------- Default ReAct prompt renderer ---------------------------------
+# Default ReAct prompt renderer
 
 
 def _action_to_thought(action: str) -> str:
     """Heuristic: synthesize a one-sentence ReAct 'Thought' from an action.
 
     Used by `synthesize_sft_target` so the SFT label is a full
-    `Thought: <reason>\nAction: <body>` block — matching the runtime ReAct
+    `Thought: <reason>\nAction: <body>` block matching the runtime ReAct
     template exactly. The original WebShop human-trajectory JSONL does not
     record human thoughts, so we synthesize one consistent with each action
     type.
@@ -224,26 +221,11 @@ def default_render_prompt(
 
     Adapts the SFT-side `(instruction, [(obs, act), ...], current_obs)`
     shape into the runtime renderer's `(state, history)` shape via
-    lightweight `SimpleNamespace` shims, then calls
+    `SimpleNamespace` shims, then calls
     `src.envs.prompts.react_webshop.render_webshop_turn_prompt` so the
-    SFT prompt is byte-identical to the prompt the model sees during
-    GRPO rollouts.
-
-    The runtime renderer is the single source of truth for:
-      * the system prompt (including the `Action: think[...]` action),
-      * the per-turn history format (`Observation:` + `Action:` only,
-        no synthesized `Thought:` lines — the runtime collector parses
-        Thoughts away after generation, so the model never sees them in
-        history at rollout time),
-      * history truncation (`max_history_turns=3`) with the
-        `... (N earlier turns omitted) ...` marker, and
-      * the trailing `Thought:` token that conditions the model to emit
-        the next ReAct block.
-
-    Diverging templates here was the root cause of the v3 SFT-warm GRPO
-    run returning R=0; this thin shim guarantees zero drift going
-    forward (matches the AlfWorld pattern in `sft_alfworld.py` which
-    imports `render_alfworld_turn_prompt` directly).
+    SFT prompt is byte-identical to the prompt seen during GRPO rollouts.
+    Using a single renderer avoids the template drift that previously sent
+    post-SFT reward to zero.
     """
     from types import SimpleNamespace
 
@@ -253,13 +235,9 @@ def default_render_prompt(
         observation_text=current_observation,
         instruction=instruction,
         # SFT data (downloaded human trajectories) does not record the env's
-        # `valid_actions` whitelist, so we pass an empty list — matching the
+        # `valid_actions` whitelist, so we pass an empty list - matching the
         # runtime renderer's behavior of omitting the `Valid actions:` line
-        # when the whitelist is unavailable. The model thus sees identical
-        # prompts at SFT and rollout time when valid_actions is unset; when
-        # rollout supplies a valid_actions list, the extra line is treated
-        # as additional context the SFT model handles via its base-model
-        # generalization.
+        # when the whitelist is unavailable.
         valid_actions=[],
     )
     history_objs = [
@@ -272,7 +250,7 @@ def default_render_prompt(
 def synthesize_sft_target(action: str) -> str:
     """Build the multi-line SFT label matching the prompt's `Thought:` ending.
 
-    Returns the string the model should emit AFTER the prompt ends — i.e.
+    Returns the string the model should emit AFTER the prompt ends - i.e.
     ` <synthesized thought>\\nAction: <action body>`. The leading space is
     deliberate so it concatenates cleanly with the prompt's trailing
     `Thought:` (which has no trailing whitespace).
@@ -280,7 +258,7 @@ def synthesize_sft_target(action: str) -> str:
     return f" {_action_to_thought(action)}\nAction: {action}"
 
 
-# --------- Trajectory parsing --------------------------------------------
+# Trajectory parsing
 
 
 def _row_observation_text(row: dict[str, Any]) -> str:
@@ -344,7 +322,7 @@ def trajectory_to_sft_examples(
             # Trajectory contains an un-recognised URL transition (e.g. an
             # action type the loader doesn't understand yet). Aborting the
             # WHOLE trajectory rather than skipping this single step keeps
-            # the prompt history aligned with the action labels — skipping
+            # the prompt history aligned with the action labels - skipping
             # would silently desync subsequent (obs, action) pairs and teach
             # mis-grounded supervision. (Review item A7.)
             return []
@@ -364,7 +342,7 @@ def trajectory_to_sft_examples(
     return examples
 
 
-# --------- Directory loader ----------------------------------------------
+# Directory loader
 
 
 def load_jsonl_trajectory(path: str) -> list[dict[str, Any]]:
@@ -391,27 +369,10 @@ def load_sft_examples_from_jsonl(
 
     Mirrors `src/datasets/sft_alfworld.py::load_sft_examples_from_jsonl`
     and is the consumer side of the schema written by
-    `infra/app_webshop_sft_gen.py` (one row per turn):
-
-        {"prompt": str, "action": str, "instruction": str,
-         "step_idx": int, "trajectory_id": str, "final_reward": float}
-
-    Unlike `load_sft_examples_from_directory` (which parses raw
-    upstream WebShop human-trajectory JSONLs and renders prompts at
-    load time), this loader expects rows whose `prompt` is already
-    rendered by the runtime ReAct renderer at gen time — so SFT
-    prompts are byte-identical to the prompts the model sees during
-    GRPO rollouts.
-
-    Args:
-        path: path to the JSONL file.
-        min_reward: drop rows with `final_reward < min_reward`.
-                    Default 0.0 keeps everything.
-
-    Returns:
-        List of SFTExample. Malformed rows (JSON decode failure or
-        missing required keys) are silently skipped — matches the
-        defensive pattern in `load_jsonl_trajectory`.
+    `infra/app_webshop_sft_gen.py` (one row per turn). Rows are
+    pre-rendered by the runtime ReAct renderer so SFT prompts are
+    byte-identical to the GRPO rollout prompts. Drops rows with
+    `final_reward < min_reward`; malformed rows are skipped.
     """
     out: list[SFTExample] = []
     with open(path) as fh:

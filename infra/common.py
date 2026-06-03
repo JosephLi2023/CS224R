@@ -1,13 +1,13 @@
 """Shared Modal infrastructure: Volume + Secrets.
 
 Volume layout:
-  /vol/cache/judge.sqlite          — judge cache (shared across runs)
-  /vol/cache/turnrd_replay.jsonl   — TurnRD replay buffer
-  /vol/data/webshop/               — baked WebShop product index
-  /vol/data/alfworld/              — ALFWorld task data
-  /vol/checkpoints/<run>/          — per-run LoRA adapter snapshots
-  /vol/manifests/<run>/            — train_log.json, eval_log.json, config_snapshot.json
-  /vol/hf_cache/                   — huggingface model + tokenizer cache (Qwen weights)
+  /vol/cache/judge.sqlite          - judge cache (shared across runs)
+  /vol/cache/turnrd_replay.jsonl   - TurnRD replay buffer
+  /vol/data/webshop/               - baked WebShop product index
+  /vol/data/alfworld/              - ALFWorld task data
+  /vol/checkpoints/<run>/          - per-run LoRA adapter snapshots
+  /vol/manifests/<run>/            - train_log.json, eval_log.json, config_snapshot.json
+  /vol/hf_cache/                   - huggingface model + tokenizer cache (Qwen weights)
 """
 
 from __future__ import annotations
@@ -41,12 +41,12 @@ OPENAI_SECRET_REQUIRED_KEYS = ["OPENAI_API_KEY"]
 def maybe_openai_secret() -> list[modal.Secret]:
     """Return `[Secret]` referencing `openai-secret`, or `[]` if opted out.
 
-    Important: `modal.Secret.from_name(...)` is **lazy** — it returns a
+    Important: `modal.Secret.from_name(...)` is **lazy** - it returns a
     reference and never raises here even if the secret is missing on the
     workspace. The actual lookup happens at function-deploy / invocation
     time, which means a missing secret surfaces as Modal's
-    `NotFoundError` ("Secret 'openai-secret' not found …") with a clear
-    message — not a silent failure inside `OpenAIJudge.score_turns`.
+    `NotFoundError` ("Secret 'openai-secret' not found ...") with a clear
+    message - not a silent failure inside `OpenAIJudge.score_turns`.
 
     `required_keys=["OPENAI_API_KEY"]` makes Modal additionally validate
     that the secret payload contains the expected key, so a misnamed
