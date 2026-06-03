@@ -1,12 +1,10 @@
-"""F7: FiLM offline mechanism evidence (3-panel summary).
+"""F7: FiLM offline mechanism evidence (3-panel summary figure).
 
-Panel A: γ/β disable → V-head output perturbation magnitude (39.7%)
-Panel B: goal_emb shuffle → MSE delta (+3.16%) + % of samples worse-when-shuffled (57.6%)
-Panel C: γ-β norm growth across rounds (compact version of F5)
+Panel A: gamma/beta disable vs V-head output perturbation magnitude.
+Panel B: goal_emb shuffle vs MSE delta + fraction of samples worse-when-shuffled.
+Panel C: gamma/beta norm growth across rounds.
 
-Numbers from sota_R13_goalcondFiLM.md + film_eval_summary (offline test).
-
-Output: reports/poster_paloalto/figures/F7_film_mechanism.pdf
+Numbers are precomputed (offline test); writes a PDF figure.
 """
 from __future__ import annotations
 
@@ -18,20 +16,20 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-# --- Panel A: perturbation magnitude (γ/β disable) ---
+# Panel A: perturbation magnitude (gamma/beta disabled)
 PERTURB_LABELS = ["FiLM\nactive", "FiLM\ndisabled (γ=0,β=0)"]
 # Median V-head output magnitude (in arbitrary units, normalized to baseline = 1.0)
 PERTURB_VALUES = [1.000, 1.0 - 0.397]  # 39.7% decrease when FiLM disabled
 PERTURB_LABEL_PCT = 39.7
 
-# --- Panel B: goal-shuffle ---
+# Panel B: goal-shuffle
 SHUFFLE_LABELS = ["Original\ngoal_emb", "Shuffled\ngoal_emb"]
 # Mean V-head MSE relative to baseline (normalized to baseline = 1.0)
 SHUFFLE_MSE = [1.0000, 1.0316]
 SHUFFLE_PCT_DELTA = 3.16
 SHUFFLE_FRAC_WORSE = 57.6
 
-# --- Panel C: γ/β growth (compact, 3-point) ---
+# Panel C: gamma/beta growth (compact, 3-point)
 GROWTH_ROUNDS = [0, 4, 9, 12]
 GAMMA_NORM = [0.341, 0.468, 0.781, 0.829]
 BETA_NORM  = [0.330, 0.399, 0.773, 0.900]
@@ -71,7 +69,7 @@ def main(out_path: Path) -> None:
     ax.grid(axis="y", alpha=0.3)
     ax.set_axisbelow(True)
 
-    # Panel C: γ/β growth
+    # Panel C: gamma/beta growth
     ax = axes[2]
     ax.plot(GROWTH_ROUNDS, GAMMA_NORM, "o-", lw=2.5, ms=9,
             label=r"$\|\gamma\|_F$", color="#8c1515")

@@ -120,5 +120,5 @@
   "logging": {
     "print_every": 10
   },
-  "_notes": "SFTOnly variant for rank-32 MLP+attn LoRA SFT eval. Identical to SFTOnly_alfworld.json except policy block has rank=32 + the 7 module list. Used by the chain plan ~/.llms/plans/alfworld_8round_mlp_rank32_restart.plan.md to compute pure SFT eval before R0 of the 8-round."
+  "_notes": "SFTOnly variant for rank-32 MLP+attn LoRA SFT eval. Identical to SFTOnly_alfworld.json except policy block has rank=32 + the 7 module list. Used to compute pure SFT eval before R0 of the 8-round run."
 }

@@ -667,7 +667,7 @@ def _train_turnrd_cmd(cfg: OrchestrationConfig, round_idx: int = 0) -> list[str]
         ("--recency-decay-half-life", "recency_decay_half_life", None),
         ("--legacy-decay-weight", "legacy_decay_weight", None),
         ("--min-batch-weight", "min_batch_weight", None),
-        # LR schedule + fresh-emphasis (plan: turnrd_v2_continual_larger).
+        # LR schedule + fresh-emphasis knobs.
         # Forwarded only when present; legacy default is constant LR.
         ("--warmup-steps", "warmup_steps", None),
         ("--lr-schedule", "lr_schedule", None),
