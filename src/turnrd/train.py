@@ -91,21 +91,11 @@ def train_turnrd(
     lambda_rank: float = 0.1,
     lambda_progress: float = 0.01,
     rank_margin: float = 0.1,
-    # ---- LR schedule (plan: turnrd_v2_continual_larger). When
-    # `lr_schedule="warmup_cosine"`, wrap AdamW with a LambdaLR that does
-    # linear warmup for `warmup_steps` then cosine decay to 0 over the
-    # remaining total step count (main pass + fresh-emphasis pass). The
-    # default `lr_schedule="constant"` preserves byte-for-byte legacy
-    # behaviour (no scheduler, flat LR).
+    # Optional learning-rate schedule. The default constant schedule preserves
+    # the original optimizer behavior.
     warmup_steps: int = 0,
     lr_schedule: str = "constant",
-    # ---- Fresh-emphasis pass (plan: turnrd_v2_continual_larger). After
-    # the main training loop, run a SECOND pass over only the last
-    # `fresh_emphasis_window_rounds` rounds of records for
-    # `fresh_emphasis_n_epochs` epochs. The fresh pass does NOT apply
-    # recency decay (those rows are already the freshest); it just gives
-    # the optimizer extra gradient steps on the most-recent slice of data.
-    # Both default 0 = disabled = byte-for-byte legacy behaviour.
+    # Optional extra pass over recent replay rows. Disabled by default.
     fresh_emphasis_window_rounds: int = 0,
     fresh_emphasis_n_epochs: int = 0,
     # Optional replay-buffer **recency decay**. When set to H > 0, each
@@ -243,12 +233,7 @@ def train_turnrd(
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(lr))
 
-    # ---- LR schedule setup (plan: turnrd_v2_continual_larger). ----------
-    # `lr_schedule="warmup_cosine"` wraps the optimizer with a LambdaLR
-    # that does linear warmup over `warmup_steps` then cosine decay to 0
-    # over the remaining total step count (main + fresh-emphasis). Default
-    # `"constant"` is a no-op so legacy callers preserve their flat-LR
-    # behaviour.
+    # Learning-rate schedule setup. The constant schedule is a no-op.
     _n_batches_per_epoch = max(1, (len(dataset) + int(batch_size) - 1) // int(batch_size))
     _total_steps_main = int(n_epochs) * _n_batches_per_epoch
     _total_steps_fresh_est = 0
@@ -299,14 +284,7 @@ def train_turnrd(
             final_reward = collated["final_reward"].to(target_device)
 
             optimizer.zero_grad(set_to_none=True)
-            # FiLM goal-conditioned V-head plumbing (plan
-            # `turnrd_goal_conditioned_v_head` Step 5). When the model
-            # was built with `cfg.goal_conditioned_value_head=True` AND
-            # the batch carries a `goal_emb` tensor (per-row masking via
-            # `goal_emb_mask`), pass them into the forward so the V-head
-            # sees FiLM-modulated hiddens. Falls through silently when
-            # either condition fails (legacy ckpts + legacy replay rows
-            # round-trip byte-identically).
+            # Pass goal embeddings when the model and replay batch both provide them.
             _flag_goal_cond = bool(
                 getattr(getattr(model, "cfg", None), "goal_conditioned_value_head", False)
             )
@@ -337,7 +315,7 @@ def train_turnrd(
                 # v2 loss mix: identifiable R-prediction + within-batch
                 # ranking hinge + KL pull toward the progress prior +
                 # (when lambda_value > 0) per-turn value-head MSE against
-                # the env-side progress signal (Tier-3 Phase A: collector
+                # the environment-side progress signal (collector
                 # emits `progress` per turn; pad_collate forwards; this
                 # loop prefers it over the legacy R/T_i fallback target).
                 pred_loss = loss_v2_pred(out, final_reward)
@@ -532,7 +510,7 @@ def train_turnrd(
                     flush=True,
                 )
 
-    # ---- Fresh-emphasis pass (plan: turnrd_v2_continual_larger). --------
+    # Optional fresh-emphasis pass.
     # After the main loop, optionally run a SECOND pass over only the last
     # `fresh_emphasis_window_rounds` rounds of records, for
     # `fresh_emphasis_n_epochs` epochs. Recency decay is INTENTIONALLY
@@ -592,7 +570,7 @@ def train_turnrd(
                         out = model(turn_embeds, attention_mask)
                     # v2-only loss (matches main loop's v2 branch; we don't
                     # support fresh-emphasis on v1/mode-2 paths since the
-                    # plan targets the goalcondFiLM-on-v2 SOTA).
+                    # the target model uses TurnRDv2 with FiLM conditioning).
                     if version_norm != "v2":
                         raise RuntimeError(
                             "train_turnrd: fresh_emphasis pass only supports "

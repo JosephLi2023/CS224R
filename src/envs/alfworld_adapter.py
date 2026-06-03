@@ -324,15 +324,9 @@ class ALFWorldAdapter:
                 wrapped = meta.init_env(batch_size=1, request_infos=env_infos)
                 self._tw_registration_succeeded = True
             except TypeError:
-                # Tier 2: attribute set, then bare init.
-                # Wrap setattr and init_env separately so that an
-                # init-time failure (e.g. TypeError/RuntimeError raised
-                # by an env that doesn't accept the now-set
-                # `request_infos` attribute) still drops into Tier 3
-                # with the loud warning, matching the documented 3-tier
-                # defensive contract. Only AttributeError on setattr is
-                # the "Tier-2-not-supported" signal; any other failure
-                # in init must escalate to Tier 3.
+                # Fallback: set request_infos as an attribute, then call init_env.
+                # AttributeError means this fallback is unsupported; init-time
+                # failures are handled by the final fallback below.
                 tier2_ok = False
                 try:
                     setattr(meta, "request_infos", env_infos)

@@ -20,16 +20,11 @@ class LoRAMergeNonFiniteError(RuntimeError):
     """Raised by `iter_merged_weights` when a merged LoRA weight contains
     non-finite entries (inf/NaN).
 
-    This is a distinct subclass of `RuntimeError` so callers can catch it
-    by type and escalate (vs. silently swallowing it as a transient
-    per-episode crash). In particular, the per-episode try/except in
-    `infra/app_train_loop.py` re-raises this class to fail the entire
-    round, because a partial vLLM `load_weights` leaves the engine in a
-    half-updated "split-brain" state where the first N layers carry the
-    new (bad) weights and the remaining layers carry stale weights —
-    every subsequent rollout in the round would then run against a
-    corrupted policy. Failing fast lets `app_aggregate_alfworld` skip the
-    round cleanly via the missing-eval-block path.
+    This subclass lets callers distinguish invalid merged weights from
+    transient per-episode environment failures. A partial vLLM
+    `load_weights` can leave the runtime policy inconsistent across
+    layers, so callers should fail the round rather than continue with a
+    partially updated model.
     """
 
 
@@ -261,32 +256,12 @@ class LoRAPolicy:
     def save_adapter(self, path: str) -> None:
         """Save the LoRA adapter to `path`.
 
-        Hardened against the R4 CUDA-illegal-memory bug seen during the
-        AlfWorld SOTA 8-round run (TurnRDV2_alfworld_SOTA_8round, 2026-05-20):
-        after 4 carry-policy rounds of merge-then-load LoRA, the default
-        `model.save_pretrained` path crashes at
-            safetensors.torch._tobytes → tensor.to("cpu")
-        with `CUDA error: an illegal memory access was encountered`.
-
-        The crash is async-reported (the real fault happened earlier in the
-        round), so we:
-          1. `torch.cuda.synchronize()` first — surfaces the real op that
-             corrupted CUDA state in the traceback instead of the .to("cpu")
-             at save time. (No effect if CUDA is clean.)
-          2. `torch.cuda.empty_cache()` — releases inactive blocks; can
-             defuse memory pressure that may be feeding the bug.
-          3. Try `model.save_pretrained(path)` first (fast, the normal path).
-          4. On CUDA failure, fall back to manually moving each LoRA
-             parameter to CPU one-by-one with explicit
-             `.detach().cpu().contiguous().clone()` and write a temporary
-             CPU-only PeftModel state_dict via safetensors directly. This
-             bypasses the bulk-tensor `_flatten` call that triggers the bug.
-
-        The fallback is best-effort: if the underlying CUDA context is
-        actually corrupted (not just memory-pressed), the per-tensor copy
-        will also fail and the original exception is re-raised so the
-        orchestrator's crash-detection patch can fail loudly instead of
-        silently cascading to the next round (the bug we hit twice on R5+).
+        Save the LoRA adapter with a CUDA-safe fallback path. The standard
+        PEFT save path is attempted first. If CUDA reports an error during
+        that path, trainable LoRA tensors are copied to CPU one by one and
+        written directly with safetensors. If the CUDA context is already
+        invalid, the original error is re-raised rather than writing a
+        partial adapter directory.
         """
         import torch  # local import: torch is heavy and only present in the runtime image
 
@@ -294,9 +269,7 @@ class LoRAPolicy:
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
         except Exception:
-            # Synchronize itself can raise the deferred CUDA error here —
-            # that's actually the desired diagnostic. Re-raise so the
-            # caller sees the real source.
+            # Re-raise deferred CUDA errors at the synchronization site.
             raise
 
         try:
@@ -328,9 +301,7 @@ class LoRAPolicy:
                         param.data.detach().clone().contiguous().cpu()
                     )
                 except RuntimeError as e:
-                    # If this also fails, the CUDA context is truly cooked.
-                    # Re-raise so the orchestrator gets a clean failure
-                    # instead of writing a half-baked adapter dir.
+                    # Re-raise rather than writing a partial adapter directory.
                     raise RuntimeError(
                         f"[save_adapter] fallback per-tensor copy also "
                         f"failed at param '{name}': {e!r}"
@@ -341,10 +312,8 @@ class LoRAPolicy:
         _st_save_file(cpu_state, adapter_file)
 
         # Write adapter_config.json so peft.load_adapter() recognizes the
-        # directory as a LoRA adapter (not an HF Hub repo id — which is
-        # exactly the cascading failure mode that bit R5..R7).
-        # peft writes this via PeftConfig.save_pretrained; we mimic the
-        # JSON-only path here without touching CUDA again.
+        # directory as a local LoRA adapter. PEFT normally writes this via
+        # PeftConfig.save_pretrained; this path avoids additional CUDA use.
         try:
             self.model.peft_config["default"].save_pretrained(path)
         except Exception as e:

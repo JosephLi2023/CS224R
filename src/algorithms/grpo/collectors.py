@@ -117,9 +117,8 @@ class RolloutCollector:
         # canonical "Your task is to: ..." pattern. Default False
         # preserves byte-for-byte legacy producer output.
         turnrd_emit_goal_text: bool = False,
-        # FiLM goal-conditioned V-head (plan
-        # `turnrd_goal_conditioned_v_head`). When True AND
-        # `turnrd_emit_goal_text=True`, the producer additionally calls
+        # Optional FiLM goal embedding. When True and goal text emission is
+        # enabled, the producer additionally calls
         # `turnrd_embedder` on a synthetic single-turn trajectory whose
         # observation_text is the parsed `goal_text`, taking the
         # resulting `[1, D]` row 0 as a `[D]` per-trajectory goal
@@ -476,12 +475,9 @@ class RolloutCollector:
                     goal_text_v = extract_goal_text(
                         traj.turns[0].observation_text or ""
                     )
-                    # FiLM goal-conditioned V-head input (plan
-                    # `turnrd_goal_conditioned_v_head` Step 2). Compute
-                    # a per-trajectory goal embedding via the SAME
-                    # `turnrd_embedder` callable used for per-turn
-                    # embeddings — synthesize a single-turn trajectory
-                    # whose observation_text IS the parsed goal_text,
+                    # Compute a per-trajectory goal embedding with the same
+                    # embedder used for per-turn embeddings. Use a synthetic
+                    # single-turn trajectory whose observation is the parsed goal,
                     # call the embedder, and take row 0. This keeps the
                     # V-head's inputs in a consistent representation
                     # space without introducing a separate text-encoder

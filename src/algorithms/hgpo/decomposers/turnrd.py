@@ -99,24 +99,15 @@ class TurnRDDecomposer:
             self._model_dtype: torch.dtype = next(self.model.parameters()).dtype
         except StopIteration:
             self._model_dtype = torch.float32
-        # Plan `turnrd_goal_conditioned_v_head` Step 6: when the model
-        # was built with `cfg.goal_conditioned_value_head=True`, every
-        # forward needs a per-trajectory `goal_emb: [K, input_dim]`.
-        # We compute it on the fly here from the Turn 0 observation
-        # using the SAME embedder used for turn embeddings (synthetic
-        # single-turn trajectory whose observation_text IS the parsed
-        # goal_text). Cached by goal_text WITHIN a decompose() call (one
-        # group typically shares a single task → same goal across K).
-        # When the flag is off we never enter this path → saves the per-
-        # trajectory embedder call for non-goal-conditioned configs.
+        # When goal conditioning is enabled, compute one goal embedding per
+        # trajectory from the parsed task text. The cache is local to one
+        # decompose call because a rollout group usually shares a task goal.
         self._goal_emb_enabled: bool = bool(
             getattr(getattr(self.model, "cfg", None), "goal_conditioned_value_head", False)
         )
-        # Tier-4 logging: stash the most recent eval-mode α tensor (cls_attn_weights)
-        # + alignment metadata so the trainer can compute alpha_* statistics
-        # unconditionally — even when `lambda_consistency == 0.0` and the
-        # gradient-tracking decompose_with_grad() path is never invoked.
-        # Populated at the end of every `decompose()` call. Shape:
+        # Stash the most recent eval-mode attention tensor and alignment
+        # metadata so the trainer can compute alpha diagnostics even when
+        # the gradient-tracking path is not invoked. Shape:
         #   _last_alpha:              CPU torch.Tensor [K_real, T_max], detached
         #   _last_alpha_mask:         CPU torch.Tensor [K_real, T_max], 0/1
         #   _last_alpha_traj_indices: list[int] mapping K_real rows back to
@@ -321,14 +312,8 @@ class TurnRDDecomposer:
         # Defensive: zero padded slots so any tiny float drift doesn't sneak in.
         per_turn = per_turn * attn_mask.to(dtype=per_turn.dtype)
 
-        # Tier-4 logging stash: the trainer's alpha_* metrics were previously
-        # gated behind `lambda_consistency != 0.0` (only that branch called
-        # decompose_with_grad and could see α). With cls_attn_weights[K_real,
-        # T_max] available here (the renormalized α distribution from the
-        # eval-mode forward), expose it on `self._last_alpha` so the trainer
-        # can compute alpha_mean / alpha_var / alpha_max / alpha_entropy /
-        # alpha_progress_corr unconditionally. Detach + move to CPU since
-        # this is for stats only — never re-enters the autograd graph.
+        # Expose the eval-mode attention weights for trainer diagnostics.
+        # Detach and move to CPU because these values are used only for stats.
         self._last_alpha = out.cls_attn_weights.detach().to(
             dtype=torch.float32, device=torch.device("cpu")
         )
@@ -485,11 +470,8 @@ class TurnRDDecomposer:
             stacked[row, :T_i] = e.to(device=target_device, dtype=target_dtype)
             attn_mask[row, :T_i] = 1
 
-        # NOTE: no torch.no_grad(), no eval() — we WANT grad through the
-        # model. The trainer is responsible for putting the model in
-        # train() mode before calling this.
-        # FiLM goal-conditioning: same path as `decompose` — compute
-        # goal_emb once for the K_real rows. The goal extractor + the
+        # Keep gradients through the decomposer; the trainer controls train/eval mode.
+        # FiLM goal-conditioning uses the same goal embedding path as `decompose`.
         # embedder runs in no_grad context (the embedder loop above
         # already does this), so the FiLM modulation introduces a
         # gradient path through `goal_proj/goal_gamma/goal_beta` but

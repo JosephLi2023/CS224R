@@ -110,7 +110,7 @@ class TrainStepStats:
     alpha_max: float = 0.0           # max α weight in the group
     alpha_entropy: float = 0.0       # mean H(α); uniform on T turns ⇒ log(T); peaked ⇒ small
     alpha_progress_corr: float = 0.0 # mean Pearson corr(α, env raw_env_reward) over trajectories
-    # ----- Tier-4 real-signal columns -----
+    # Diagnostics for gradient-bearing signal magnitude.
     # The legacy `mean_traj_adv` / `mean_turn_adv` columns are mathematically
     # zero by construction (mean over centered values within a K-group).
     # The columns below carry the actual gradient-bearing signal magnitude.
@@ -610,7 +610,7 @@ class HGPOTrainer:
         traj_adv: list[float] = adv["traj_adv"]
         flat_turn_adv: list[float] = [v for row in adv["turn_adv"] for v in row]
 
-        # ----- Tier-4 real-signal stats (computed alongside traj_adv) -----
+        # Signal diagnostics computed alongside trajectory advantages.
         # mean_traj_adv / mean_turn_adv are zero by construction (mean of
         # centered values within a K-group). These columns instead capture
         # whether the trainer is actually receiving gradient signal:
@@ -639,23 +639,11 @@ class HGPOTrainer:
 
         device = next(self.policy.model.parameters()).device
 
-        # ----- Tier-2 skip-dead-K guard -----
-        # When all K final rewards in the group are equal, the trajectory
-        # advantages are identically zero and the policy gradient on this
-        # group is zero by construction (regardless of α). Short-circuit
-        # BEFORE the 3 expensive padded forwards in `_batched_logprobs`
-        # (one new + one ref pass dominates per-step wallclock at K=8).
-        # Per the Tier-2 plan we only skip the OPTIMIZER STEP — the
-        # decomposer's `__call__` (above, via `build_advantages`) already
-        # ran so the per-turn rewards are computed and the rollout's
-        # external replay-buffer emission (in app_train_loop.py, after
-        # train_step returns) sees identical inputs to the non-dead path.
-        # The Tier-4 alpha_*/cls_query_norm logging path is preserved so
-        # downstream train_log columns stay meaningful for dead groups too.
+        # Skip optimizer work for groups with no reward variation. The
+        # decomposer has already run through `build_advantages`, so replay
+        # emission and diagnostics still see the same inputs as live groups.
         if _dead_K_group:
-            # Recover alpha_* from the eval-mode α tensor stashed by
-            # turnrd's `decompose()` (Tier-4 path). Only meaningful when
-            # the decomposer is learnable and stashed `_last_alpha`.
+            # Recover alpha statistics from the latest decomposer call when available.
             _alpha_mean = 0.0
             _alpha_var = 0.0
             _alpha_max = 0.0
@@ -720,8 +708,7 @@ class HGPOTrainer:
                 except Exception:
                     # Stats path must never break training.
                     pass
-            # cls_query_norm — same normalization as the live-grad path
-            # (divide by sqrt(hidden_size) for cross-arch comparability).
+            # Normalize by hidden size for comparability across decomposer widths.
             _cls_query_norm = 0.0
             if self._decomposer_learnable:
                 try:
@@ -732,9 +719,7 @@ class HGPOTrainer:
                     _cls_query_norm = _raw / max(1.0, _hidden ** 0.5)
                 except AttributeError:  # pragma: no cover
                     _cls_query_norm = 0.0
-            # Build a zero loss WITHOUT requires_grad so train_step can
-            # detect via `stats.dead_K_group == 1` and skip backward()
-            # entirely (cleaner than backward()ing through a no-grad zero).
+            # Return a no-grad zero loss so the caller can skip backward().
             zero = torch.zeros((), device=device, dtype=torch.float32)
             stats = TrainStepStats(
                 policy_loss=0.0,
@@ -766,13 +751,9 @@ class HGPOTrainer:
         all_new_lp: list[torch.Tensor] = []
         all_old_lp: list[torch.Tensor] = []
         all_ref_lp: list[torch.Tensor] = []
-        # NOTE: all_adv assembly is DEFERRED until after the grad
-        # block runs and the V-head override has had a chance to mutate
-        # `combined`. An earlier version snapshotted `combined[i][t]` into
-        # `adv_vec` BEFORE the V-head override at L806 ran, making the
-        # override dead code (mutated `combined` was never re-read).
-        # Collect all (prompt, action) pairs first; the heavy forward passes
-        # (one new, one ref) happen ONCE per group via _batched_logprobs (M6).
+        # Assemble advantages after decomposer updates so any per-turn value
+        # projection is reflected in the policy loss. The model forward
+        # passes are batched once per group for efficiency.
         pa_pairs: list[tuple[list[int], list[int]]] = []
         per_turn_meta: list[tuple[int, int]] = []  # (i_traj, t_turn)
         for i, traj in enumerate(group.trajectories):
@@ -813,13 +794,9 @@ class HGPOTrainer:
         ref_lp_t = torch.cat(all_ref_lp).to(torch.float32)
 
         cons = float(adv["consistency"])
-        # Consistency reg has zero gradient for Methods A/C (the pure-Python
-        # `consistency_loss` returns a Python float, not a torch leaf, so the
-        # original C3 fix removed it from `total`). For Method B (TurnRD),
-        # which IS learnable, we re-add the regulariser as a torch tensor
-        # built from the model's grad-tracking α weights — this gives it a
-        # real gradient path back to TurnRD parameters per the C3 follow-up
-        # note in `MEDIUM_FIXES.md::C3`.
+        # Consistency regularization has no gradient for pure-Python
+        # decomposers. For learnable TurnRD, construct a tensor-valued loss
+        # from grad-tracking attention weights so gradients can reach TurnRD.
         cons_loss_t: "torch.Tensor | None" = None
         # TurnRD diagnostics (populated alongside cons_loss_t when learnable).
         _alpha_mean: float = 0.0
@@ -1040,15 +1017,9 @@ class HGPOTrainer:
                     _alpha_corr_sum / _alpha_corr_n if _alpha_corr_n > 0 else 0.0
                 )
 
-        # ----- Tier-4: lift alpha_* logging out of the lambda_consistency gate -----
-        # When `lambda_consistency == 0.0` the gradient block above is skipped
-        # and the alpha_* locals stay at 0.0, even though TurnRD's eval-mode
-        # `decompose()` already ran and produced an α tensor (stashed on the
-        # decomposer as `_last_alpha` by the Tier-4 patch in turnrd.py).
-        # Recompute the same stats here from the eval-mode α so the train_log
-        # column is meaningful regardless of `lambda_consistency`. Only runs
-        # when the gated block did NOT already populate them (so we don't
-        # double-write under the lambda_consistency>0 codepath).
+        # Populate alpha diagnostics from the eval-mode decomposition when
+        # the gradient-tracking path is skipped by lambda_consistency == 0.
+        # Only run when the gated block did not already populate them.
         if (
             self._decomposer_learnable
             and _alpha_mean == 0.0
@@ -1112,9 +1083,7 @@ class HGPOTrainer:
             all_adv.append(adv_vec)
         adv_t = torch.cat(all_adv).to(torch.float32)
 
-        # Tier-4: scalar magnitude of the per-token advantage that actually
-        # gates policy_loss (= -E[adv_t * log_prob_ratio_clipped]). This is
-        # the column to watch when wondering "is RL receiving signal?".
+        # Scalar magnitude of the token-level advantage used in the policy loss.
         _mean_abs_adv_token: float = (
             float(adv_t.abs().mean().detach().item()) if adv_t.numel() > 0 else 0.0
         )
@@ -1275,10 +1244,9 @@ class HGPOTrainer:
 
         loss, stats = self.compute_loss(group)
         if stats.dead_K_group:
-            # Tier-2 skip-dead-K: zero policy gradient by construction.
-            # `compute_loss` already short-circuited before _batched_logprobs;
-            # here we just refuse to backward through the no-grad zero loss
-            # and skip the optimizer step. Per-turn rewards from
+            # Zero policy gradient by construction. `compute_loss` already
+            # short-circuited before _batched_logprobs; skip backward and the
+            # optimizer step. Per-turn rewards from
             # `build_advantages` were still computed, so the rollout's
             # external replay-buffer emission is unaffected.
             #

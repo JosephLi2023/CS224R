@@ -191,10 +191,7 @@ def _build_turnrd_branch(
                         "progress_prior_strength", v2_defaults.progress_prior_strength
                     )
                 ),
-                # Plan `turnrd_goal_conditioned_v_head`: opt-in FiLM
-                # goal-conditioned V-head. Default False preserves all
-                # existing TurnRDv2 configs byte-for-byte; v1 doesn't
-                # support this knob.
+                # Optional FiLM goal conditioning for TurnRDv2.
                 goal_conditioned_value_head=bool(
                     turnrd_cfg.get(
                         "goal_conditioned_value_head",
@@ -225,13 +222,7 @@ def _build_turnrd_branch(
     # via the constructor null check).
     ckpt_path = turnrd_cfg.get("ckpt_path")
     refresh_fn: Callable[[], None] | None = None
-    # Tier-4 observability: stash the outcome of the most recent refresh
-    # attempt on the decomposer object so app_train_loop.py can include
-    # it in train_log.json's `config` block. Without this, there's no way
-    # to verify post-hoc whether the trained TurnRD ckpt from round N-1
-    # actually reached round N's container (the existing
-    # `logger.info("TurnRD refresh: loaded %s", ...)` lives only in the
-    # Modal container's stdout, not in the persisted train_log).
+    # Store the most recent checkpoint-refresh status for run manifests.
     decomposer._last_refresh_status = None  # type: ignore[attr-defined]
     if ckpt_path:
         ckpt_path_resolved = Path(ckpt_path)
@@ -270,13 +261,9 @@ def _build_turnrd_branch(
                 map_location=next(decomposer.model.parameters()).device,
                 weights_only=True,
             )
-            # Plan `turnrd_goal_conditioned_v_head` Step 11: load with
-            # strict=False so legacy ckpts (no FiLM params) load cleanly
-            # into a goal-conditioned model — the new
-            # `goal_proj/goal_gamma/goal_beta` start from their zero-init
-            # state (γ ≈ 1, β ≈ 0 → identity modulation), so first-round
-            # behavior matches the unconditioned ckpt. PyTorch's
-            # IncompatibleKeys return value reports any missing /
+            # Load with strict=False so checkpoints with different FiLM
+            # settings can be inspected without failing the run. PyTorch's
+            # IncompatibleKeys return value reports any missing or
             # unexpected keys; surface a one-line warning so the
             # operator can spot accidental schema mismatches.
             _load_result = decomposer.load_state_dict(sd, strict=False)

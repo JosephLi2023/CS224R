@@ -20,44 +20,20 @@ class VLLMRunnerConfig:
     model_name: str = "Qwen/Qwen2.5-1.5B-Instruct"
     dtype: str = "bfloat16"
     max_model_len: int = 4096
-    gpu_memory_utilization: float = 0.20  # H2 v11: was 0.50 — vLLM was over-reserving KV cache (which it never returns), pushing steady-state past A100-80 cap. K=8 with max_tokens=48 doesn't need much KV; the orchestrator typically passes 0.20 explicitly anyway.
+    gpu_memory_utilization: float = 0.20  # Conservative KV-cache reservation for K=8 rollout workloads.
     seed: int = 0
     enforce_eager: bool = False
     download_dir: str | None = None  # HF download cache; align with LoRAPolicy.cache_dir
-    # vLLM CPU swap space in GiB. Default vLLM value is 4 GiB. We override
-    # to 0 to disable CPU↔GPU KV-block swapping entirely. Rationale:
-    # vLLM 0.6.3.post1 has a known bug where `blocks_to_swap_in` can
-    # contain a non-int element under race conditions during weight
-    # syncs / KV preemption, causing
-    #   `RuntimeError: unknown parameter type` inside
-    #   `worker.prepare_worker_input → torch.tensor(blocks_to_swap_in)`
-    # This bug reliably fires after ~30 weight-sync cycles in our
-    # heavy-rollout protocols (CF, TurnRDv2). Setting swap_space=0
-    # means the KV scheduler never swaps blocks → the buggy code path
-    # is never entered. Safe for our workload (K≤8, max_tokens≤48,
-    # gpu_memory_utilization≤0.30 leaves >50% GPU headroom for KV).
+    # Disable CPU/GPU KV-block swapping. This avoids swap-path instability in
+    # vLLM 0.6.3.post1 during repeated weight synchronization and is safe for
+    # our rollout sizes (K <= 8, max generated tokens <= 48).
     swap_space_gib: int = 0
-    # Cap concurrent sequences in vLLM scheduler. Default vLLM = 256.
-    # At K=8 with 40 episodes per round, vLLM's scheduler can put 8+
-    # concurrent sequences in flight, which exposes another flavor of
-    # the same state-corruption bug class: "CUDA error: illegal memory
-    # access" during `prepare_model_input` after multiple rounds. Capping
-    # to 8 (matches our K=8) forces vLLM to serialize batch processing
-    # → reduces concurrent KV cache pressure → bypasses the bug.
+    # Cap scheduler concurrency to match the rollout group size and keep KV
+    # cache pressure stable across repeated weight-sync cycles.
     max_num_seqs: int = 8
-    # Optional hard-override for vLLM's KV-cache block count. When set,
-    # vLLM SKIPS its `determine_num_available_blocks()` memory profile
-    # and uses this number directly. Needed to work around the
-    # vLLM 0.6.3.post1 assertion `peak_memory > 0`
-    # (vllm/worker/worker.py:232) that fires whenever
-    # `torch.cuda.mem_get_info()` reports the same `free` value before
-    # and after the profile-time fake forward — exactly the state the
-    # allocator ends up in when booting a fresh vLLM right after a
-    # shutdown + merge_and_unload + save_pretrained sequence (the
-    # train→eval handoff in `app_train_loop._train_loop_impl`).
-    # Sizing: blocks × 16 tokens/block × ~3.5 KB/token ≈ 56 KB per
-    # block; 8000 blocks = 128k tokens of KV cache, ample for greedy
-    # eval with serial 100-episode rollouts at max_model_len=2048.
+    # Optional hard override for vLLM's KV-cache block count. When set,
+    # vLLM skips memory profiling and uses this value directly, avoiding
+    # allocator-profile failures after repeated train/eval handoffs.
     num_gpu_blocks_override: int | None = None
 
 
@@ -233,9 +209,7 @@ class VLLMRunner:
         try:
             torch.cuda.synchronize()
         except Exception:
-            # Synchronize itself can raise the deferred CUDA error here —
-            # that's the desired diagnostic. Re-raise so the caller sees
-            # the real source.
+            # Re-raise deferred CUDA errors at the synchronization site.
             raise
         worker = self._get_driver_worker()
         model_runner = worker.model_runner  # type: ignore[attr-defined]

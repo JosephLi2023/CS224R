@@ -66,7 +66,7 @@ def build_decomposer(
     - "turnrd":        requires `model` (a `TurnRD` nn.Module) + `embedder` (a
       `Callable[[Trajectory], torch.Tensor]` returning per-turn embeddings of
       shape `[T_i, D]`); returns a callable wrapping
-      `TurnRDDecomposer.decompose`. See `MEDIUM_FIXES.md::M1`.
+      `TurnRDDecomposer.decompose`.
     - "counterfactual": requires `runner`, `env_factory`, `prompt_renderer`,
       `action_parser`, and `sampling_factory`. Returns a
       `CounterFactualDecomposer` instance whose `__call__` matches the

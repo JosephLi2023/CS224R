@@ -1,10 +1,9 @@
 """TurnRD model — learned per-turn reward decomposer (Method B).
 
 Architecture:
-- `input_proj`: learned linear `[input_dim → hidden_size]` so we can run
-  TurnRD natively at `hidden_size=256` even when the upstream policy hidden
-  state is wider (e.g. 1536 for Qwen2.5-1.5B). See `MEDIUM_FIXES.md::M1`
-  "open design question" — the default.
+- `input_proj`: learned linear `[input_dim -> hidden_size]` so TurnRD can
+  run with a compact internal width even when the upstream policy hidden
+  state is wider (e.g. 1536 for Qwen2.5-1.5B).
 - `pos_embed`: learned positional embedding for turn index `0..max_turns-1`.
 - `encoder`: stacked self-attention layers over the turn sequence (turn↔turn
   mixing). The encoder does NOT contain a [CLS] token; the [CLS] role is
@@ -40,14 +39,9 @@ import torch.nn.functional as F
 class TurnRDConfig:
     """Hyperparameters for the TurnRD model.
 
-    Defaults match `MEDIUM_FIXES.md::M1`. They size a small Transformer
-    (~1–2 M params at hidden_size=256) that can train comfortably on a
-    single A100 alongside the LoRA policy.
-
-    Improvements (post-WebShop-attempt):
-    - `causal=True`: self-attn is causal so turn-t's α can only depend on
-      h_0..h_t. Bidirectional attention encourages "focus on the
-      high-info turn regardless of position" rather than "this turn
+    Defaults size a small Transformer that can train alongside the LoRA
+    policy on a single A100. Causal attention can be enabled for ablations;
+    the default model uses bidirectional attention over completed trajectories.
       caused that downstream success" — a credit-assignment red flag.
     - `value_head=True`: adds an auxiliary `V(h_t) → scalar` head trained
       against the discounted future return γ^(T-t-1)·R per turn. Gives
@@ -474,22 +468,15 @@ class TurnRDv2Config:
     n_heads: int = 4
     max_turns: int = 64
     dropout: float = 0.1
-    # NOTE: causal defaults to False here — see module-level comment block.
+    # Non-causal attention is the default because TurnRD analyzes completed trajectories.
     causal: bool = False
-    # Strength of the progress-prior init bias on the score head's final
-    # bias term. Larger ⇒ untrained α more strongly resembles softmax(t/T).
-    # 0 disables (random init like v1). Default 1.0 produces a roughly
-    # 2:1 last-vs-first turn weighting at T=4 — comparable to Method C
-    # without committing fully.
+    # Strength of the progress-prior initialization bias on the score head.
+    # A value of 0 disables the prior.
     progress_prior_strength: float = 1.0
-    # FiLM goal-conditioned V-head (plan
-    # `turnrd_goal_conditioned_v_head`). When True, the model accepts
-    # an optional per-trajectory `goal_emb: [B, input_dim]` in
-    # `forward(...)` and uses it to compute FiLM (γ, β) modulators on
-    # the encoder output BEFORE the value head: ``h_cond = γ·h + β``,
-    # so v_t is a learnable function of (h_t, goal). Adds 3 small Linear
-    # layers (≈ 3·H² extra params, ~100k at H=128). γ, β are zero-init
-    # so γ outputs ≈ 1 and β ≈ 0 at construction — initial behavior is
+    # Optional FiLM goal conditioning. When enabled, `forward(...)` accepts
+    # a per-trajectory goal embedding and uses it to modulate encoder states
+    # before the value and score heads. The FiLM layers are zero-initialized
+    # so the initial behavior is
     # byte-identical to the unconditioned path, then the model learns to
     # modulate. Default False keeps every existing checkpoint + config
     # byte-for-byte unchanged.
@@ -568,29 +555,14 @@ class TurnRDv2(nn.Module):
         # Buffering it as a register would couple to max_turns; computing
         # at forward time is O(T) and free.
 
-        # ---- FiLM goal-conditioning (plan turnrd_goal_conditioned_v_head)
-        # When enabled, the model accepts an optional per-trajectory
-        # `goal_emb: [B, input_dim]` (in the same representation space as
-        # `turn_embeds`, produced by the producer-side `turnrd_embedder`
-        # callable) and uses it to modulate the encoder output before the
-        # value head. γ/β are zero-init so the initial behavior matches
-        # the unconditioned path byte-for-byte (γ ≈ 1 via the +1 offset
-        # below, β ≈ 0). All three layers exist only when the flag is on
-        # so legacy checkpoints load cleanly with strict=False (no
-        # missing-keys when the flag is off; only "unexpected keys" when
-        # loading a goal-conditioned ckpt into a plain config — which we
-        # don't do in practice).
+        # Optional FiLM goal conditioning. The FiLM layers exist only when
+        # enabled, and zero initialization makes the conditioned path start
+        # as the unconditioned model.
         if cfg.goal_conditioned_value_head:
             self.goal_proj = nn.Linear(input_dim, cfg.hidden_size)
             self.goal_gamma = nn.Linear(cfg.hidden_size, cfg.hidden_size)
             self.goal_beta = nn.Linear(cfg.hidden_size, cfg.hidden_size)
-            # Zero-init the FiLM projector weights AND biases so γ/β
-            # outputs are ≈ 0 at init; the forward path then adds the +1
-            # offset to γ so the modulation is `1·h + 0` (identity) at
-            # construction. This makes the augmented model start out as a
-            # strict superset of the unconditioned model — the V-head
-            # learns to deviate from "ignore the goal" rather than from
-            # noise.
+            # Zero initialization makes the initial FiLM modulation an identity.
             with torch.no_grad():
                 nn.init.zeros_(self.goal_gamma.weight)
                 nn.init.zeros_(self.goal_gamma.bias)
@@ -677,13 +649,8 @@ class TurnRDv2(nn.Module):
         )  # [B, T, H]
 
         # 4. Per-turn scores → α via masked softmax.
-        # FiLM goal-conditioning (plan turnrd_goal_conditioned_v_head):
-        # Apply FiLM modulation BEFORE the score head so α is a learnable
-        # function of (h_t, goal), not just h_t. This makes the per-turn
-        # rewards r̂_t = α_t · R goal-aware at the policy-gradient level.
-        # Previously only the value head was conditioned; α remained
-        # goal-blind, so the credit decomposition itself didn't benefit
-        # from goal information.
+        # Apply FiLM before the score head so attention weights can depend
+        # on both the turn representation and the task goal.
         if (
             self.cfg.goal_conditioned_value_head
             and goal_emb is not None
